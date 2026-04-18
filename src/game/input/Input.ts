@@ -17,6 +17,22 @@ export interface InputCallbacks {
   tapEmpty: () => void;
   dragCommit: (sourcePlanet: number, targetPlanet: number) => void;
   dragPreview: (sourcePlanet: number | null, targetPlanet: number | null) => void;
+  /** Called continuously while a lasso-drag is in progress (world-space coords). */
+  lassoUpdate: (
+    startX: number,
+    startY: number,
+    curX: number,
+    curY: number,
+  ) => void;
+  /** Called once the lasso-drag ends, with final world-space rectangle. */
+  lassoCommit: (
+    startX: number,
+    startY: number,
+    endX: number,
+    endY: number,
+  ) => void;
+  /** Called when a lasso-drag is cancelled (e.g. pinch started). */
+  lassoCancel: () => void;
   pan: (dx: number, dy: number) => void;
   zoom: (scale: number, anchorX: number, anchorY: number) => void;
 }
@@ -32,6 +48,8 @@ export class Input {
   private pointers = new Map<number, PointerState>();
   private lastPinchDist = 0;
   private lastPanMid: { x: number; y: number } | null = null;
+  private lassoActive = false;
+  private lassoStart: { x: number; y: number } | null = null;
 
   constructor(el: HTMLElement, renderer: Renderer, world: World, cb: InputCallbacks) {
     this.el = el;
@@ -89,7 +107,12 @@ export class Input {
     if (moved) p.moved = true;
 
     if (this.pointers.size >= 2) {
-      // Pinch + two-finger pan
+      // Pinch + two-finger pan — cancel any in-progress lasso.
+      if (this.lassoActive) {
+        this.lassoActive = false;
+        this.lassoStart = null;
+        this.cb.lassoCancel();
+      }
       const dist = this.currentPinchDistance();
       const mid = this.currentPinchMidpoint();
       if (this.lastPinchDist > 0) {
@@ -109,6 +132,19 @@ export class Input {
     if (p.sourcePlanet !== null && p.moved) {
       const hover = this.planetAtScreen(x, y);
       this.cb.dragPreview(p.sourcePlanet, hover);
+      return;
+    }
+
+    // Drag began on empty space — treat as a lasso selection.
+    if (p.sourcePlanet === null && p.moved) {
+      if (!this.lassoActive) {
+        this.lassoActive = true;
+        this.lassoStart = this.renderer.screenToWorld(p.startX, p.startY);
+      }
+      if (this.lassoStart) {
+        const w = this.renderer.screenToWorld(x, y);
+        this.cb.lassoUpdate(this.lassoStart.x, this.lassoStart.y, w.x, w.y);
+      }
     }
   };
 
@@ -134,6 +170,11 @@ export class Input {
       if (hover !== null && hover !== p.sourcePlanet) {
         this.cb.dragCommit(p.sourcePlanet, hover);
       }
+    } else if (this.lassoActive && this.lassoStart) {
+      const end = this.renderer.screenToWorld(p.x, p.y);
+      this.cb.lassoCommit(this.lassoStart.x, this.lassoStart.y, end.x, end.y);
+      this.lassoActive = false;
+      this.lassoStart = null;
     }
     this.cb.dragPreview(null, null);
   };

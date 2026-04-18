@@ -1,5 +1,5 @@
 import { dist, norm, sub, vec, type Vec2 } from '../../util/math.js';
-import type { Planet } from './Planet.js';
+import { BASE_PRODUCTION, type Planet, type PlanetType } from './Planet.js';
 import type { Player } from './Player.js';
 import { ShipPool } from './Ship.js';
 import { createStream, type ShipStream } from './Stream.js';
@@ -12,6 +12,7 @@ export interface MapSpec {
     radius: number;
     owner: number | null;
     garrison: number;
+    type?: PlanetType;
   }>;
   edges: Array<[number, number]>;
 }
@@ -22,8 +23,8 @@ export interface WorldEvents {
   onGameOver?: (winner: number | null) => void;
 }
 
-export const SHIP_SPEED = 70;
-export const DEFAULT_EMIT_INTERVAL = 0.28;
+export const SHIP_SPEED = 48;
+export const DEFAULT_EMIT_INTERVAL = 0.12;
 
 export class World {
   players: Player[];
@@ -45,16 +46,20 @@ export class World {
     this.width = map.width;
     this.height = map.height;
     this.events = events;
-    this.planets = map.planets.map((p, i) => ({
-      id: i,
-      pos: { ...p.pos },
-      radius: p.radius,
-      owner: p.owner,
-      garrison: p.garrison,
-      productionRate: p.radius / 22,
-      productionAcc: 0,
-      capturePulse: 0,
-    }));
+    this.planets = map.planets.map((p, i) => {
+      const type: PlanetType = p.type ?? 0;
+      return {
+        id: i,
+        pos: { ...p.pos },
+        radius: p.radius,
+        owner: p.owner,
+        garrison: p.garrison,
+        type,
+        productionRate: BASE_PRODUCTION[type],
+        productionAcc: 0,
+        capturePulse: 0,
+      };
+    });
     this.edges = new Set();
     this.neighbors = new Map();
     for (let i = 0; i < this.planets.length; i++) this.neighbors.set(i, []);
@@ -69,28 +74,34 @@ export class World {
     return this.edges.has(edgeKey(a, b));
   }
 
-  /** Route ships from source -> target, expanding path along constellation edges. */
-  openStream(owner: number, source: number, target: number): void {
+  /**
+   * Send a one-shot wave of ships from source -> target along constellation edges.
+   * If `count` is omitted, the entire current garrison of the source is launched.
+   * Streams no longer auto-refill from production — callers must tap/drag again.
+   */
+  openStream(owner: number, source: number, target: number, count?: number): void {
     if (source === target) return;
     const src = this.planets[source];
     if (src.owner !== owner) return;
     const path = this.findPath(source, target);
     if (path.length < 2) return;
     const nextHop = path[1];
+    const remaining = count === undefined ? src.garrison : Math.min(count, src.garrison);
+    if (remaining <= 0) return;
     this.cancelStreamsFrom(source, owner);
-    this.streams.push(createStream(owner, source, nextHop, DEFAULT_EMIT_INTERVAL));
+    this.streams.push(createStream(owner, source, nextHop, DEFAULT_EMIT_INTERVAL, remaining));
     if (nextHop !== target) {
-      this.queueDownstream(owner, path);
+      this.queueDownstream(owner, path, remaining);
     }
   }
 
-  private queueDownstream(owner: number, path: number[]): void {
+  private queueDownstream(owner: number, path: number[], remaining: number): void {
     for (let i = 1; i < path.length - 1; i++) {
       const s = path[i];
       const t = path[i + 1];
       if (this.planets[s].owner === owner) {
         this.cancelStreamsFrom(s, owner);
-        this.streams.push(createStream(owner, s, t, DEFAULT_EMIT_INTERVAL));
+        this.streams.push(createStream(owner, s, t, DEFAULT_EMIT_INTERVAL, remaining));
       }
     }
   }
@@ -146,17 +157,18 @@ export class World {
       }
     }
 
-    // Stream emission
+    // Stream emission (one-shot: drains `remaining` and then removes itself)
     for (const s of this.streams) {
       const src = this.planets[s.source];
-      if (src.owner !== s.owner || src.garrison <= 0) {
+      if (src.owner !== s.owner || src.garrison <= 0 || s.remaining <= 0) {
         s.emitAcc = 0;
         continue;
       }
       s.emitAcc += dt;
-      while (s.emitAcc >= s.emitInterval && src.garrison > 0) {
+      while (s.emitAcc >= s.emitInterval && src.garrison > 0 && s.remaining > 0) {
         s.emitAcc -= s.emitInterval;
         src.garrison -= 1;
+        s.remaining -= 1;
         const tgt = this.planets[s.target];
         const dir = norm(sub(tgt.pos, src.pos));
         const spawnPos = vec(
@@ -168,8 +180,10 @@ export class World {
       }
     }
 
-    // Drop streams whose source is no longer owned by the streamer
-    this.streams = this.streams.filter((s) => this.planets[s.source].owner === s.owner);
+    // Drop finished streams and any whose source is no longer owned by the streamer.
+    this.streams = this.streams.filter(
+      (s) => s.remaining > 0 && this.planets[s.source].owner === s.owner,
+    );
 
     // Ship movement + arrival
     const ships = this.ships.all;

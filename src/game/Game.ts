@@ -98,7 +98,8 @@ export class Game {
       tapPlanet: (id) => {
         const p = this.world.planets[id];
         if (p.owner === 0) {
-          this.selection.toggle(id);
+          // Tapping an owned planet selects only it (replaces any prior selection).
+          this.selection.set(id);
         } else if (this.selection.ids.size > 0) {
           this.selection.routeTo(id);
         }
@@ -111,6 +112,12 @@ export class Game {
       dragPreview: () => {
         // Could render a preview arrow; skipped for v1 to keep visuals clean.
       },
+      lassoUpdate: (x0, y0, x1, y1) => this.renderer.setLasso(x0, y0, x1, y1),
+      lassoCommit: (x0, y0, x1, y1) => {
+        this.selection.selectInRect(x0, y0, x1, y1);
+        this.renderer.clearLasso();
+      },
+      lassoCancel: () => this.renderer.clearLasso(),
       pan: (dx, dy) => this.renderer.panBy(dx, dy),
       zoom: (scale, ax, ay) => this.renderer.setZoom(scale, ax, ay),
     });

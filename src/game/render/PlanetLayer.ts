@@ -1,5 +1,6 @@
 import { Application, Container, Graphics, Sprite, Text, Texture } from 'pixi.js';
 import { paletteFor } from '../../util/color.js';
+import { RING_THRESHOLDS, type PlanetType } from '../sim/Planet.js';
 import type { World } from '../sim/World.js';
 import {
   makePlanetBodyTexture,
@@ -8,14 +9,16 @@ import {
 } from './textures.js';
 
 const MAX_ORBITERS = 48;
-const ORBIT_BAND_INNER = 1.35; // × planet radius
-const ORBIT_BAND_OUTER = 1.7;
+const ORBIT_BAND_INNER = 1.55; // × planet radius (outside ring art)
+const ORBIT_BAND_OUTER = 1.9;
 const ORBIT_SPEED_MIN = 0.5; // rad/s
 const ORBIT_SPEED_MAX = 1.1;
 
-/** Visual tier of a planet based on garrison. */
-const planetLevel = (garrison: number): number => (garrison >= 50 ? 2 : garrison >= 20 ? 1 : 0);
-const LEVEL_SCALE = [1.0, 1.22, 1.48];
+/** Extra scale added per filled ring. */
+const RING_GROWTH = 0.28;
+
+/** Cumulative display scale for a given set of filled rings. */
+const scaleForFilled = (filled: number): number => 1 + filled * RING_GROWTH;
 
 interface Orbiter {
   sprite: Sprite;
@@ -31,13 +34,15 @@ interface PlanetView {
   halo: Sprite;
   body: Sprite;
   ring: Graphics;
+  rings: Graphics; // capacity rings (type 1 / 2)
   count: Text;
   orbitRoot: Container;
   orbiters: Orbiter[];
   lastOwner: number | null;
-  lastLevel: number;
   displayScale: number;
   baseRadius: number;
+  type: PlanetType;
+  swirlPhase: number;
 }
 
 export class PlanetLayer extends Container {
@@ -67,6 +72,7 @@ export class PlanetLayer extends Container {
       body.anchor.set(0.5);
 
       const ring = new Graphics();
+      const rings = new Graphics();
 
       const orbitRoot = new Container();
 
@@ -83,7 +89,7 @@ export class PlanetLayer extends Container {
       });
       count.anchor.set(0.5);
 
-      container.addChild(halo, ring, body, orbitRoot, count);
+      container.addChild(halo, ring, rings, body, orbitRoot, count);
       this.addChild(container);
 
       this.views.push({
@@ -92,13 +98,15 @@ export class PlanetLayer extends Container {
         halo,
         body,
         ring,
+        rings,
         count,
         orbitRoot,
         orbiters: [],
         lastOwner: planet.owner,
-        lastLevel: planetLevel(planet.garrison),
-        displayScale: LEVEL_SCALE[planetLevel(planet.garrison)],
+        displayScale: 1,
         baseRadius: planet.radius,
+        type: planet.type,
+        swirlPhase: Math.random() * Math.PI * 2,
       });
     }
   }
@@ -121,27 +129,69 @@ export class PlanetLayer extends Container {
         v.lastOwner = p.owner;
       }
 
-      // Level / size growth on reinforcement.
-      const level = planetLevel(p.garrison);
-      if (level !== v.lastLevel) v.lastLevel = level;
-      const targetScale = LEVEL_SCALE[level];
-      // Ease toward target scale.
-      const ease = 1 - Math.exp(-dt * 4);
+      // Growth: each filled capacity ring grows the planet wider. Partial
+      // progress shows in the ring fill but not in scale until the ring closes.
+      const thresholds = RING_THRESHOLDS[v.type];
+      let filled = 0;
+      for (const t of thresholds) if (p.garrison >= t) filled++;
+      const targetScale = scaleForFilled(filled);
+      const ease = 1 - Math.exp(-dt * 3);
       v.displayScale += (targetScale - v.displayScale) * ease;
+
+      // Subtle swirl once any ring is filled.
+      v.swirlPhase += dt * (0.6 + filled * 0.35);
+      const swirlWobble = filled > 0 ? 1 + Math.sin(v.swirlPhase) * 0.015 * filled : 1;
+
       const pulse = 1 + p.capturePulse * 0.2;
-      v.body.scale.set(v.displayScale * pulse);
+      v.body.scale.set(v.displayScale * pulse * swirlWobble);
+      v.body.rotation = filled > 0 ? Math.sin(v.swirlPhase * 0.5) * 0.08 : 0;
       v.halo.scale.set(v.displayScale * pulse);
 
       // Count readout sits just below the planet.
       v.count.text = String(p.garrison);
-      v.count.y = v.baseRadius * v.displayScale + 10;
+      v.count.y = v.baseRadius * v.displayScale + 16;
 
-      // Selection ring.
       const pal = paletteFor(p.owner);
+
+      // Capacity rings (type 1 / 2): one or two concentric progress arcs.
+      v.rings.clear();
+      if (thresholds.length > 0) {
+        let prevThreshold = 0;
+        for (let k = 0; k < thresholds.length; k++) {
+          const cap = thresholds[k];
+          const progress = Math.max(
+            0,
+            Math.min(1, (p.garrison - prevThreshold) / (cap - prevThreshold)),
+          );
+          const r = v.baseRadius * v.displayScale + 10 + k * 8;
+          // Background ring (dim).
+          v.rings.circle(0, 0, r).stroke({
+            width: 2,
+            color: pal.ring,
+            alpha: 0.18,
+          });
+          // Filled progress arc.
+          if (progress > 0) {
+            const sweep = Math.PI * 2 * progress;
+            const start = -Math.PI / 2;
+            v.rings
+              .arc(0, 0, r, start, start + sweep)
+              .stroke({ width: 2.5, color: pal.ring, alpha: 0.9 });
+          }
+          prevThreshold = cap;
+        }
+      }
+
+      // Selection ring (pulsing) sits outside the capacity rings.
       v.ring.clear();
       if (this.selectedSources.has(p.id)) {
-        const r = v.baseRadius * v.displayScale + 8 + Math.sin(this.time * 4) * 1.6;
-        v.ring.circle(0, 0, r).stroke({ width: 2.5, color: pal.ring, alpha: 0.95 });
+        const outer =
+          v.baseRadius * v.displayScale +
+          10 +
+          thresholds.length * 8 +
+          8 +
+          Math.sin(this.time * 4) * 1.6;
+        v.ring.circle(0, 0, outer).stroke({ width: 2.5, color: pal.ring, alpha: 0.95 });
       }
 
       // Orbiters: represent garrison (up to cap) as floating ships.

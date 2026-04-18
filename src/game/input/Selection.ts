@@ -21,6 +21,13 @@ export class Selection {
     else this.selected.add(planetId);
   }
 
+  set(planetId: number): void {
+    const p = this.world.planets[planetId];
+    if (p.owner !== this.playerId) return;
+    this.selected.clear();
+    this.selected.add(planetId);
+  }
+
   clear(): void {
     this.selected.clear();
   }
@@ -32,6 +39,21 @@ export class Selection {
     }
   }
 
+  /** Replace selection with every owned planet whose center lies inside the rect. */
+  selectInRect(x0: number, y0: number, x1: number, y1: number): void {
+    const lx = Math.min(x0, x1);
+    const rx = Math.max(x0, x1);
+    const ty = Math.min(y0, y1);
+    const by = Math.max(y0, y1);
+    this.selected.clear();
+    for (const p of this.world.planets) {
+      if (p.owner !== this.playerId) continue;
+      if (p.pos.x >= lx && p.pos.x <= rx && p.pos.y >= ty && p.pos.y <= by) {
+        this.selected.add(p.id);
+      }
+    }
+  }
+
   routeTo(targetId: number): void {
     if (this.selected.has(targetId)) {
       // Target is one of the selected sources — drop it so we don't stream to self.
@@ -40,6 +62,8 @@ export class Selection {
     for (const src of this.selected) {
       this.world.openStream(this.playerId, src, targetId);
     }
+    // After issuing the order, clear selection so units don't keep being sent.
+    this.selected.clear();
   }
 
   /** Remove lost planets from selection. */

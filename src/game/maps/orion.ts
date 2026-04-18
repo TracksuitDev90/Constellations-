@@ -9,18 +9,20 @@ import type { MapSpec } from '../sim/World.js';
  *          2 — 3 — 4   (belt)
  *
  *   5 (left foot)              6 (right foot)
+ *
+ * Planet types: 0 Regular, 1 Large (1 ring), 2 Extra Large (2 rings).
  */
 export const ORION_MAP: MapSpec = {
   width: 1600,
   height: 1000,
   planets: [
-    { pos: { x: 350, y: 260 }, radius: 34, owner: 0, garrison: 30 }, // 0 player start (left shoulder)
-    { pos: { x: 1250, y: 260 }, radius: 34, owner: 1, garrison: 30 }, // 1 AI start (right shoulder)
-    { pos: { x: 650, y: 520 }, radius: 22, owner: null, garrison: 14 }, // 2 belt left
-    { pos: { x: 800, y: 540 }, radius: 26, owner: null, garrison: 18 }, // 3 belt center (biggest)
-    { pos: { x: 950, y: 520 }, radius: 22, owner: null, garrison: 14 }, // 4 belt right
-    { pos: { x: 420, y: 800 }, radius: 24, owner: null, garrison: 16 }, // 5 left foot
-    { pos: { x: 1180, y: 800 }, radius: 24, owner: null, garrison: 16 }, // 6 right foot
+    { pos: { x: 350, y: 260 }, radius: 18, owner: 0, garrison: 12, type: 0 },   // 0 player start (regular)
+    { pos: { x: 1250, y: 260 }, radius: 18, owner: 1, garrison: 12, type: 0 },  // 1 AI start (regular)
+    { pos: { x: 650, y: 520 }, radius: 22, owner: null, garrison: 10, type: 1 }, // 2 belt left (large)
+    { pos: { x: 800, y: 540 }, radius: 28, owner: null, garrison: 14, type: 2 }, // 3 belt center (XL)
+    { pos: { x: 950, y: 520 }, radius: 22, owner: null, garrison: 10, type: 1 }, // 4 belt right (large)
+    { pos: { x: 420, y: 800 }, radius: 22, owner: null, garrison: 10, type: 1 }, // 5 left foot (large)
+    { pos: { x: 1180, y: 800 }, radius: 22, owner: null, garrison: 10, type: 1 }, // 6 right foot (large)
   ],
   edges: [
     [0, 2], // left shoulder -> belt left

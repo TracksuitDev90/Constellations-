@@ -8,9 +8,9 @@ export interface AIConfig {
 }
 
 export const NORMAL_AI: AIConfig = {
-  tickInterval: 0.9,
-  aggression: 1.0,
-  reserveFrac: 0.35,
+  tickInterval: 2.8,
+  aggression: 0.45,
+  reserveFrac: 0.55,
 };
 
 export class BasicAI {
@@ -65,36 +65,46 @@ export class BasicAI {
     for (const p of myPlanets) {
       const threat = this.incomingThreat(p.id);
       const friendly = this.incomingFriendly(p.id);
-      if (threat - friendly <= p.garrison) continue;
-      // Find nearest friendly with enough garrison to help.
+      const deficit = threat - friendly - p.garrison;
+      if (deficit <= 0) continue;
       let best: { id: number; d: number } | null = null;
       for (const q of myPlanets) {
         if (q.id === p.id) continue;
-        if (q.garrison < 3) continue;
+        if (q.garrison < 4) continue;
         const d = dist(q.pos, p.pos);
         if (!best || d < best.d) best = { id: q.id, d };
       }
-      if (best) this.world.openStream(me, best.id, p.id);
+      if (best) {
+        const src = this.world.planets[best.id];
+        const count = Math.min(src.garrison - 1, deficit + 2);
+        if (count > 0) this.world.openStream(me, best.id, p.id, count);
+      }
     }
 
-    // Offense: each remaining owned planet streams toward the best target.
-    for (const p of myPlanets) {
-      const minReserve = Math.floor(p.garrison * this.cfg.reserveFrac);
-      if (p.garrison - minReserve < 4) continue;
+    // Offense: send at most ONE attack wave this tick, from the strongest planet.
+    const reserve = this.cfg.reserveFrac;
+    const sortedByGarrison = [...myPlanets].sort((a, b) => b.garrison - a.garrison);
+    for (const p of sortedByGarrison) {
+      const available = p.garrison - Math.ceil(p.garrison * reserve);
+      if (available < 6) continue;
       let best: { id: number; score: number } | null = null;
       for (const tgt of this.world.planets) {
         if (tgt.owner === me) continue;
-        const threat = this.incomingFriendly(tgt.id);
-        const effective = tgt.garrison - threat;
-        if (effective < 0 && tgt.owner === null) continue;
+        const incomingMine = this.incomingFriendly(tgt.id);
+        const effective = tgt.garrison - incomingMine;
+        // Only attack if our wave can plausibly take it.
+        if (available <= effective) continue;
         const d = Math.max(60, dist(p.pos, tgt.pos));
-        const neutralBonus = tgt.owner === null ? 1.2 : 1.0;
+        const neutralBonus = tgt.owner === null ? 1.3 : 1.0;
         const score =
-          ((tgt.radius * neutralBonus) / (Math.max(1, effective) * d)) *
+          ((tgt.radius * neutralBonus) / (Math.max(1, effective + 1) * d)) *
           this.cfg.aggression;
         if (!best || score > best.score) best = { id: tgt.id, score };
       }
-      if (best) this.world.openStream(me, p.id, best.id);
+      if (best) {
+        this.world.openStream(me, p.id, best.id, available);
+        break; // one wave per think tick keeps the AI measured.
+      }
     }
   }
 }

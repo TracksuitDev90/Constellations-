@@ -156,9 +156,8 @@ export class Game {
       this.selection.sync();
       this.accumulator -= FIXED_DT;
     }
-    this.renderer.update(frameMs / 1000);
     this.renderer.planetLayer.setSelection(this.selection.ids);
-    this.renderer.planetLayer.update(frameMs / 1000);
+    this.renderer.update(frameMs / 1000);
     this.hud.update(this.world);
   };
 

@@ -1,7 +1,6 @@
 import { Application, Container } from 'pixi.js';
 import type { World } from '../sim/World.js';
 import { BackgroundLayer } from './BackgroundLayer.js';
-import { LinkLayer } from './LinkLayer.js';
 import { PlanetLayer } from './PlanetLayer.js';
 import { ShipLayer } from './ShipLayer.js';
 
@@ -10,7 +9,6 @@ export class Renderer {
   world: World;
   bg: BackgroundLayer;
   worldLayer: Container;
-  linkLayer: LinkLayer;
   planetLayer: PlanetLayer;
   shipLayer: ShipLayer;
 
@@ -30,11 +28,9 @@ export class Renderer {
     this.worldLayer = new Container();
     app.stage.addChild(this.worldLayer);
 
-    this.linkLayer = new LinkLayer(world);
     this.shipLayer = new ShipLayer(app, world);
     this.planetLayer = new PlanetLayer(app, world);
 
-    this.worldLayer.addChild(this.linkLayer);
     this.worldLayer.addChild(this.shipLayer);
     this.worldLayer.addChild(this.planetLayer);
 

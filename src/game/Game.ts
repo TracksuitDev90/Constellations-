@@ -47,7 +47,12 @@ export class Game {
           onClick: () => {
             this.audio.unlock();
             this.dismissOverlay();
-            this.startMatch();
+            try {
+              this.startMatch();
+            } catch (err) {
+              console.error('startMatch failed', err);
+              this.showError(err);
+            }
           },
         },
       ],
@@ -194,4 +199,43 @@ export class Game {
     window.removeEventListener('resize', this.onResize);
     this.hud?.destroy();
   }
+
+  private showError(err: unknown): void {
+    const msg = err instanceof Error ? (err.stack ?? err.message) : String(err);
+    this.activeOverlay = showOverlay(
+      this.ui,
+      'Something went wrong',
+      `The match failed to start.<br/><br/><code style="font-size:12px;opacity:0.8">${escapeHtml(msg)}</code>`,
+      [
+        {
+          label: 'Retry',
+          onClick: () => {
+            this.dismissOverlay();
+            try {
+              this.startMatch();
+            } catch (e) {
+              console.error('retry failed', e);
+              this.showError(e);
+            }
+          },
+        },
+      ],
+    );
+  }
 }
+
+const escapeHtml = (s: string): string =>
+  s.replace(/[&<>"']/g, (c) => {
+    switch (c) {
+      case '&':
+        return '&amp;';
+      case '<':
+        return '&lt;';
+      case '>':
+        return '&gt;';
+      case '"':
+        return '&quot;';
+      default:
+        return '&#39;';
+    }
+  });

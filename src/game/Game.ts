@@ -119,7 +119,8 @@ export class Game {
       },
       lassoUpdate: (x0, y0, x1, y1) => this.renderer.setLasso(x0, y0, x1, y1),
       lassoCommit: (x0, y0, x1, y1) => {
-        this.selection.selectInRect(x0, y0, x1, y1);
+        const radius = Math.hypot(x1 - x0, y1 - y0);
+        this.selection.selectInCircle(x0, y0, radius);
         this.renderer.clearLasso();
       },
       lassoCancel: () => this.renderer.clearLasso(),

@@ -43,6 +43,8 @@ interface PlanetView {
   baseRadius: number;
   type: PlanetType;
   swirlPhase: number;
+  /** Eased progress per capacity ring (0..1). */
+  ringProgress: number[];
 }
 
 export class PlanetLayer extends Container {
@@ -107,6 +109,7 @@ export class PlanetLayer extends Container {
         baseRadius: planet.radius,
         type: planet.type,
         swirlPhase: Math.random() * Math.PI * 2,
+        ringProgress: RING_THRESHOLDS[planet.type].map(() => 0),
       });
     }
   }
@@ -153,31 +156,86 @@ export class PlanetLayer extends Container {
 
       const pal = paletteFor(p.owner);
 
-      // Capacity rings (type 1 / 2): one or two concentric progress arcs.
+      // Capacity rings (type 1 / 2): thick concentric bands that smoothly
+      // fill with the owner's ring color as garrison accumulates. Not every
+      // planet has rings (type 0 has zero).
       v.rings.clear();
+      const RING_WIDTH = Math.max(4, v.baseRadius * 0.35);
+      const RING_GAP = Math.max(3, v.baseRadius * 0.12);
+      const RING_INSET = Math.max(6, v.baseRadius * 0.22);
       if (thresholds.length > 0) {
         let prevThreshold = 0;
         for (let k = 0; k < thresholds.length; k++) {
           const cap = thresholds[k];
-          const progress = Math.max(
+          const target = Math.max(
             0,
             Math.min(1, (p.garrison - prevThreshold) / (cap - prevThreshold)),
           );
-          const r = v.baseRadius * v.displayScale + 10 + k * 8;
-          // Background ring (dim).
-          v.rings.circle(0, 0, r).stroke({
-            width: 2,
+          // Smoothly ease the displayed fill so the ring visibly fills up.
+          const prog = v.ringProgress[k] ?? 0;
+          const eased = 1 - Math.exp(-dt * 4);
+          v.ringProgress[k] = prog + (target - prog) * eased;
+          const progress = v.ringProgress[k];
+
+          const rMid =
+            v.baseRadius * v.displayScale +
+            RING_INSET +
+            RING_WIDTH / 2 +
+            k * (RING_WIDTH + RING_GAP);
+
+          // Dim empty band (two-tone rails + faint fill).
+          const railInner = rMid - RING_WIDTH / 2;
+          const railOuter = rMid + RING_WIDTH / 2;
+          v.rings.circle(0, 0, railInner).stroke({
+            width: 1,
             color: pal.ring,
-            alpha: 0.18,
+            alpha: 0.28,
           });
-          // Filled progress arc.
-          if (progress > 0) {
+          v.rings.circle(0, 0, railOuter).stroke({
+            width: 1,
+            color: pal.ring,
+            alpha: 0.28,
+          });
+          v.rings.circle(0, 0, rMid).stroke({
+            width: RING_WIDTH - 1.5,
+            color: pal.ring,
+            alpha: 0.08,
+          });
+
+          // Filled progress arc — thick band, from top, clockwise.
+          if (progress > 0.001) {
             const sweep = Math.PI * 2 * progress;
             const start = -Math.PI / 2;
-            v.rings
-              .arc(0, 0, r, start, start + sweep)
-              .stroke({ width: 2.5, color: pal.ring, alpha: 0.9 });
+            // Outer soft glow under the fill.
+            v.rings.arc(0, 0, rMid, start, start + sweep).stroke({
+              width: RING_WIDTH + 3,
+              color: pal.glow,
+              alpha: 0.35,
+            });
+            // Core filled band.
+            v.rings.arc(0, 0, rMid, start, start + sweep).stroke({
+              width: RING_WIDTH - 1,
+              color: pal.ring,
+              alpha: 0.95,
+            });
+            // Bright inner sheen line.
+            v.rings.arc(0, 0, rMid - RING_WIDTH * 0.2, start, start + sweep).stroke({
+              width: Math.max(1, RING_WIDTH * 0.18),
+              color: 0xffffff,
+              alpha: 0.55 * progress,
+            });
           }
+
+          // When a ring closes, add a gentle outer pulse.
+          if (progress > 0.995) {
+            const pulseR = railOuter + 1 + Math.sin(this.time * 3 + k * 0.8) * 1.2;
+            v.rings.circle(0, 0, pulseR).stroke({
+              width: 1.5,
+              color: pal.glow,
+              alpha: 0.5,
+            });
+          }
+
           prevThreshold = cap;
         }
       }
@@ -185,10 +243,15 @@ export class PlanetLayer extends Container {
       // Selection ring (pulsing) sits outside the capacity rings.
       v.ring.clear();
       if (this.selectedSources.has(p.id)) {
+        const ringsOuter =
+          thresholds.length > 0
+            ? RING_INSET +
+              thresholds.length * (RING_WIDTH + RING_GAP) -
+              RING_GAP
+            : 8;
         const outer =
           v.baseRadius * v.displayScale +
-          10 +
-          thresholds.length * 8 +
+          ringsOuter +
           8 +
           Math.sin(this.time * 4) * 1.6;
         v.ring.circle(0, 0, outer).stroke({ width: 2.5, color: pal.ring, alpha: 0.95 });

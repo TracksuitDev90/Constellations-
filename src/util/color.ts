@@ -41,3 +41,25 @@ export const PLAYER_PALETTES: PlayerPalette[] = [
 
 export const paletteFor = (ownerId: number | null): PlayerPalette =>
   ownerId === null ? NEUTRAL : PLAYER_PALETTES[ownerId % PLAYER_PALETTES.length];
+
+/** Multiply each RGB channel by factor; clamp to [0,255]. <1 darkens, >1 lightens. */
+export const adjustColor = (color: number, factor: number): number => {
+  const r = Math.min(255, Math.max(0, Math.round(((color >> 16) & 0xff) * factor)));
+  const g = Math.min(255, Math.max(0, Math.round(((color >> 8) & 0xff) * factor)));
+  const b = Math.min(255, Math.max(0, Math.round((color & 0xff) * factor)));
+  return (r << 16) | (g << 8) | b;
+};
+
+/** Blend toward white by t in [0,1]. */
+export const toward = (color: number, target: number, t: number): number => {
+  const r0 = (color >> 16) & 0xff;
+  const g0 = (color >> 8) & 0xff;
+  const b0 = color & 0xff;
+  const r1 = (target >> 16) & 0xff;
+  const g1 = (target >> 8) & 0xff;
+  const b1 = target & 0xff;
+  const r = Math.round(r0 + (r1 - r0) * t);
+  const g = Math.round(g0 + (g1 - g0) * t);
+  const b = Math.round(b0 + (b1 - b0) * t);
+  return (r << 16) | (g << 8) | b;
+};

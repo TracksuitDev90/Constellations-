@@ -1,4 +1,4 @@
-import { Application, Container } from 'pixi.js';
+import { Application, Container, Graphics } from 'pixi.js';
 import type { World } from '../sim/World.js';
 import { BackgroundLayer } from './BackgroundLayer.js';
 import { PlanetLayer } from './PlanetLayer.js';
@@ -11,6 +11,7 @@ export class Renderer {
   worldLayer: Container;
   planetLayer: PlanetLayer;
   shipLayer: ShipLayer;
+  lasso: Graphics;
 
   // Camera / viewport state.
   viewX = 0;
@@ -30,11 +31,29 @@ export class Renderer {
 
     this.shipLayer = new ShipLayer(app, world);
     this.planetLayer = new PlanetLayer(app, world);
+    this.lasso = new Graphics();
 
     this.worldLayer.addChild(this.shipLayer);
     this.worldLayer.addChild(this.planetLayer);
+    this.worldLayer.addChild(this.lasso);
 
     this.fitToScreen();
+  }
+
+  setLasso(x0: number, y0: number, x1: number, y1: number): void {
+    const lx = Math.min(x0, x1);
+    const rx = Math.max(x0, x1);
+    const ty = Math.min(y0, y1);
+    const by = Math.max(y0, y1);
+    this.lasso.clear();
+    this.lasso
+      .rect(lx, ty, rx - lx, by - ty)
+      .fill({ color: 0xaee5ff, alpha: 0.08 })
+      .stroke({ width: 1.5 / this.viewScale, color: 0xaee5ff, alpha: 0.8 });
+  }
+
+  clearLasso(): void {
+    this.lasso.clear();
   }
 
   fitToScreen(): void {

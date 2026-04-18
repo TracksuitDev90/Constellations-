@@ -54,6 +54,18 @@ export class Selection {
     }
   }
 
+  /** Replace selection with every owned planet whose center lies in the disc. */
+  selectInCircle(cx: number, cy: number, radius: number): void {
+    const r2 = radius * radius;
+    this.selected.clear();
+    for (const p of this.world.planets) {
+      if (p.owner !== this.playerId) continue;
+      const dx = p.pos.x - cx;
+      const dy = p.pos.y - cy;
+      if (dx * dx + dy * dy <= r2) this.selected.add(p.id);
+    }
+  }
+
   routeTo(targetId: number): void {
     if (this.selected.has(targetId)) {
       // Target is one of the selected sources — drop it so we don't stream to self.

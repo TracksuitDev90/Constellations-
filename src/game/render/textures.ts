@@ -48,10 +48,30 @@ export const makeShipTexture = (app: Application): Texture => {
   });
 };
 
+export type PlanetArchetype =
+  | 'terrestrial'
+  | 'gasGiant'
+  | 'icy'
+  | 'molten'
+  | 'alien';
+
+/** Pick a stable archetype from a planet's seed. */
+export const archetypeForSeed = (seed: number): PlanetArchetype => {
+  const h = Math.abs(Math.imul(seed + 0x9e3779b9, 2654435761)) >>> 0;
+  const list: PlanetArchetype[] = [
+    'terrestrial',
+    'gasGiant',
+    'icy',
+    'molten',
+    'alien',
+  ];
+  return list[h % list.length];
+};
+
 /**
- * Build a planet body texture that reads as a 3D-lit sphere: a dark terminator,
- * a bright lit side, and a small amount of procedural surface detail seeded per
- * planet so each star in the constellation feels distinct.
+ * Build a planet body texture that reads as a 3D-lit sphere with archetype-
+ * specific surface features. The seed both picks the archetype and perturbs
+ * the details so each star in the constellation feels distinct.
  */
 export const makePlanetBodyTexture = (
   app: Application,
@@ -59,7 +79,8 @@ export const makePlanetBodyTexture = (
   radius: number,
   seed: number,
 ): Texture => {
-  const key = `planet-body:${ownerId ?? 'n'}:${Math.round(radius)}:${seed}`;
+  const archetype = archetypeForSeed(seed);
+  const key = `planet-body:${archetype}:${ownerId ?? 'n'}:${Math.round(radius)}:${seed}`;
   return makeGlowTexture(app, key, (g) => {
     const pal = paletteFor(ownerId);
     const pad = 2;
@@ -68,63 +89,374 @@ export const makePlanetBodyTexture = (
     const r = radius;
     const rng = mulberry32(seed * 1337 + ((ownerId ?? -1) + 11) * 97 + Math.round(radius) * 7);
 
-    // Build up a lit sphere with stacked, offset circles from dark -> light.
-    const darkSide = adjustColor(pal.core, 0.25);
-    const baseColor = pal.core;
-    const litColor = toward(pal.core, 0xffffff, 0.45);
+    drawArchetype(g, archetype, cx, cy, r, pal.core, rng);
 
-    const STEPS = 18;
-    for (let i = 0; i < STEPS; i++) {
-      const t = i / (STEPS - 1);
-      const rr = r * (1 - t * 0.55);
-      const ox = -r * 0.28 * t;
-      const oy = -r * 0.28 * t;
-      const col =
-        t < 0.5
-          ? toward(darkSide, baseColor, t * 2)
-          : toward(baseColor, litColor, (t - 0.5) * 2);
-      g.circle(cx + ox, cy + oy, rr).fill({ color: col, alpha: 1 });
-    }
-
-    // Small surface speckle ("continents" / craters) — kept fully inside disc.
-    const specks = 7;
-    for (let i = 0; i < specks; i++) {
-      const a = rng() * Math.PI * 2;
-      const maxD = r * 0.72;
-      const d = Math.sqrt(rng()) * maxD;
-      const blobR = r * (0.08 + rng() * 0.16);
-      if (d + blobR > r * 0.92) continue; // keep inside disc
-      const sx = cx + Math.cos(a) * d;
-      const sy = cy + Math.sin(a) * d;
-      const dark = rng() < 0.55;
-      const color = dark ? adjustColor(pal.core, 0.55) : toward(pal.core, 0xffffff, 0.3);
-      g.circle(sx, sy, blobR).fill({ color, alpha: 0.35 });
-    }
-
-    // Specular highlight near the lit pole.
+    // Specular highlight near the lit pole (shared across all archetypes).
     g.circle(cx - r * 0.38, cy - r * 0.4, r * 0.22).fill({
       color: 0xffffff,
-      alpha: 0.4,
+      alpha: 0.35,
     });
-    g.circle(cx - r * 0.42, cy - r * 0.45, r * 0.1).fill({
+    g.circle(cx - r * 0.44, cy - r * 0.46, r * 0.1).fill({
       color: 0xffffff,
-      alpha: 0.7,
+      alpha: 0.65,
     });
 
-    // Crisp rim highlight (thin bright edge on the lit side).
+    // Crisp rim highlight on the lit side.
     g.arc(cx, cy, r * 0.98, Math.PI * 1.1, Math.PI * 1.75).stroke({
-      width: Math.max(1, r * 0.04),
-      color: toward(pal.core, 0xffffff, 0.6),
-      alpha: 0.5,
+      width: Math.max(1, r * 0.045),
+      color: toward(pal.core, 0xffffff, 0.65),
+      alpha: 0.55,
     });
 
-    // Faint atmospheric ring on the dark limb.
+    // Faint atmosphere on the dark limb.
     g.arc(cx, cy, r * 0.99, Math.PI * 0.15, Math.PI * 0.9).stroke({
-      width: Math.max(1, r * 0.03),
+      width: Math.max(1, r * 0.035),
       color: toward(pal.core, 0x000000, 0.4),
       alpha: 0.35,
     });
   });
+};
+
+type Rng = () => number;
+
+const drawArchetype = (
+  g: Graphics,
+  type: PlanetArchetype,
+  cx: number,
+  cy: number,
+  r: number,
+  core: number,
+  rng: Rng,
+): void => {
+  switch (type) {
+    case 'terrestrial':
+      return drawTerrestrial(g, cx, cy, r, core, rng);
+    case 'gasGiant':
+      return drawGasGiant(g, cx, cy, r, core, rng);
+    case 'icy':
+      return drawIcy(g, cx, cy, r, core, rng);
+    case 'molten':
+      return drawMolten(g, cx, cy, r, core, rng);
+    case 'alien':
+      return drawAlien(g, cx, cy, r, core, rng);
+  }
+};
+
+/** Stacked, offset circles produce a cheap lit-sphere gradient. */
+const drawLitSphere = (
+  g: Graphics,
+  cx: number,
+  cy: number,
+  r: number,
+  dark: number,
+  base: number,
+  lit: number,
+  steps = 18,
+): void => {
+  for (let i = 0; i < steps; i++) {
+    const t = i / (steps - 1);
+    const rr = r * (1 - t * 0.55);
+    const ox = -r * 0.28 * t;
+    const oy = -r * 0.28 * t;
+    const col =
+      t < 0.5
+        ? toward(dark, base, t * 2)
+        : toward(base, lit, (t - 0.5) * 2);
+    g.circle(cx + ox, cy + oy, rr).fill({ color: col, alpha: 1 });
+  }
+};
+
+// ─── Terrestrial (earth-like): oceans, continents, polar caps, clouds ──────
+const drawTerrestrial = (
+  g: Graphics,
+  cx: number,
+  cy: number,
+  r: number,
+  core: number,
+  rng: Rng,
+): void => {
+  const ocean = toward(core, 0x0a1a2e, 0.2);
+  const deep = toward(core, 0x000814, 0.55);
+  const shallow = toward(core, 0xffffff, 0.35);
+  drawLitSphere(g, cx, cy, r, deep, ocean, shallow);
+
+  // Continents — irregular blobs made from overlapping darker circles.
+  const landColor = adjustColor(toward(core, 0x3d2b14, 0.55), 0.9);
+  const landLight = toward(landColor, 0xffffff, 0.25);
+  const continents = 3 + Math.floor(rng() * 3);
+  for (let c = 0; c < continents; c++) {
+    const a = rng() * Math.PI * 2;
+    const d = rng() * r * 0.55;
+    const bx = cx + Math.cos(a) * d;
+    const by = cy + Math.sin(a) * d;
+    const blobs = 5 + Math.floor(rng() * 5);
+    for (let i = 0; i < blobs; i++) {
+      const off = rng() * r * 0.28;
+      const aa = rng() * Math.PI * 2;
+      const px = bx + Math.cos(aa) * off;
+      const py = by + Math.sin(aa) * off;
+      const pr = r * (0.07 + rng() * 0.13);
+      // Only if inside the disc.
+      if (Math.hypot(px - cx, py - cy) + pr > r * 0.93) continue;
+      const col = rng() < 0.3 ? landLight : landColor;
+      g.circle(px, py, pr).fill({ color: col, alpha: 0.85 });
+    }
+  }
+
+  // Polar ice caps.
+  g.ellipse(cx, cy - r * 0.88, r * 0.55, r * 0.18).fill({
+    color: 0xf2f8ff,
+    alpha: 0.75,
+  });
+  g.ellipse(cx, cy + r * 0.88, r * 0.5, r * 0.15).fill({
+    color: 0xf2f8ff,
+    alpha: 0.65,
+  });
+
+  // Thin cloud streaks — soft white arcs.
+  for (let i = 0; i < 4; i++) {
+    const cy2 = cy + (rng() - 0.5) * r * 1.2;
+    const rx = r * (0.7 + rng() * 0.25);
+    const ry = r * (0.05 + rng() * 0.08);
+    g.ellipse(cx + (rng() - 0.5) * r * 0.2, cy2, rx, ry).fill({
+      color: 0xffffff,
+      alpha: 0.12 + rng() * 0.12,
+    });
+  }
+};
+
+// ─── Gas Giant: horizontal bands + great storm ─────────────────────────────
+const drawGasGiant = (
+  g: Graphics,
+  cx: number,
+  cy: number,
+  r: number,
+  core: number,
+  rng: Rng,
+): void => {
+  const dark = toward(core, 0x1a0c1f, 0.35);
+  const base = core;
+  const lit = toward(core, 0xffe8bf, 0.45);
+  drawLitSphere(g, cx, cy, r, dark, base, lit);
+
+  // Horizontal cloud bands — ellipses squashed to the disc to imply rotation.
+  const bandCount = 7 + Math.floor(rng() * 3);
+  for (let i = 0; i < bandCount; i++) {
+    const t = (i + 0.5) / bandCount; // 0..1 top→bottom
+    const y = cy + (t - 0.5) * 2 * r * 0.9;
+    // Narrowing ellipse width near the poles for spherical foreshortening.
+    const wFactor = Math.sqrt(1 - Math.pow(t * 2 - 1, 2));
+    const bw = r * 0.98 * wFactor;
+    const bh = r * (0.045 + rng() * 0.06);
+    const tint =
+      i % 2 === 0
+        ? toward(core, 0xffe4b8, 0.35 + rng() * 0.15)
+        : toward(core, 0x2a1410, 0.35 + rng() * 0.2);
+    g.ellipse(cx, y, bw, bh).fill({ color: tint, alpha: 0.55 });
+
+    // Turbulent streaks — thinner offset ellipses for swirl detail.
+    if (rng() < 0.7) {
+      const sw = bw * (0.4 + rng() * 0.4);
+      const sh = bh * 0.55;
+      const sx = cx + (rng() - 0.5) * (bw - sw);
+      const stint = toward(tint, 0xffffff, 0.4);
+      g.ellipse(sx, y + (rng() - 0.5) * bh * 0.4, sw, sh).fill({
+        color: stint,
+        alpha: 0.4,
+      });
+    }
+  }
+
+  // A "great storm" oval.
+  if (rng() < 0.85) {
+    const sa = rng() * Math.PI * 2;
+    const sd = rng() * r * 0.35;
+    const sx = cx + Math.cos(sa) * sd;
+    const sy = cy + Math.sin(sa) * sd * 0.4; // keep roughly on equator
+    const sr = r * (0.16 + rng() * 0.1);
+    const stormColor = toward(core, 0xff4a3b, 0.55);
+    g.ellipse(sx, sy, sr, sr * 0.55).fill({ color: stormColor, alpha: 0.65 });
+    g.ellipse(sx, sy, sr * 0.7, sr * 0.35).fill({
+      color: toward(stormColor, 0xffffff, 0.45),
+      alpha: 0.7,
+    });
+  }
+};
+
+// ─── Icy: pale surface with frost cracks and bright caps ───────────────────
+const drawIcy = (
+  g: Graphics,
+  cx: number,
+  cy: number,
+  r: number,
+  core: number,
+  rng: Rng,
+): void => {
+  const paleBase = toward(core, 0xf0faff, 0.55);
+  const dark = toward(core, 0x0b1a2a, 0.4);
+  const lit = toward(paleBase, 0xffffff, 0.55);
+  drawLitSphere(g, cx, cy, r, dark, paleBase, lit);
+
+  // Frost cracks — thin chord-like strokes.
+  const cracks = 6 + Math.floor(rng() * 5);
+  const crackColor = toward(core, 0x1a2a3a, 0.55);
+  for (let i = 0; i < cracks; i++) {
+    const a0 = rng() * Math.PI * 2;
+    const a1 = a0 + (rng() - 0.5) * 1.6;
+    const r0 = r * (0.3 + rng() * 0.55);
+    const r1 = r * (0.3 + rng() * 0.55);
+    const x0 = cx + Math.cos(a0) * r0;
+    const y0 = cy + Math.sin(a0) * r0;
+    const x1 = cx + Math.cos(a1) * r1;
+    const y1 = cy + Math.sin(a1) * r1;
+    const mx = (x0 + x1) / 2 + (rng() - 0.5) * r * 0.2;
+    const my = (y0 + y1) / 2 + (rng() - 0.5) * r * 0.2;
+    g.moveTo(x0, y0)
+      .quadraticCurveTo(mx, my, x1, y1)
+      .stroke({
+        width: Math.max(0.8, r * 0.025),
+        color: crackColor,
+        alpha: 0.45,
+      });
+  }
+
+  // Bright polar caps — larger than terrestrial.
+  g.ellipse(cx, cy - r * 0.82, r * 0.8, r * 0.28).fill({
+    color: 0xffffff,
+    alpha: 0.8,
+  });
+  g.ellipse(cx, cy + r * 0.82, r * 0.75, r * 0.25).fill({
+    color: 0xffffff,
+    alpha: 0.7,
+  });
+
+  // Subtle sheen spots on ice (cool highlights).
+  for (let i = 0; i < 4; i++) {
+    const a = rng() * Math.PI * 2;
+    const d = rng() * r * 0.6;
+    const px = cx + Math.cos(a) * d;
+    const py = cy + Math.sin(a) * d;
+    const pr = r * (0.06 + rng() * 0.08);
+    if (Math.hypot(px - cx, py - cy) + pr > r * 0.92) continue;
+    g.circle(px, py, pr).fill({ color: 0xc9e8ff, alpha: 0.35 });
+  }
+};
+
+// ─── Molten / Venus-like: warm swirling cloud cover with glowing cracks ────
+const drawMolten = (
+  g: Graphics,
+  cx: number,
+  cy: number,
+  r: number,
+  core: number,
+  rng: Rng,
+): void => {
+  const warmBase = toward(core, 0xd86a1f, 0.35);
+  const dark = toward(warmBase, 0x1a0300, 0.55);
+  const lit = toward(warmBase, 0xfff0c0, 0.45);
+  drawLitSphere(g, cx, cy, r, dark, warmBase, lit);
+
+  // Swirly cloud bands — curved arc strokes.
+  const swirls = 9 + Math.floor(rng() * 5);
+  for (let i = 0; i < swirls; i++) {
+    const cy2 = cy + (rng() - 0.5) * r * 1.5;
+    const rx = r * (0.6 + rng() * 0.35);
+    const ry = r * (0.05 + rng() * 0.09);
+    const hueMix = rng();
+    const tint =
+      hueMix < 0.5
+        ? toward(warmBase, 0xffe4a0, 0.45 + rng() * 0.2)
+        : toward(warmBase, 0x3a0a00, 0.35 + rng() * 0.25);
+    const rot = (rng() - 0.5) * 0.4;
+    g.ellipse(cx, cy2, rx, ry).fill({ color: tint, alpha: 0.45 + rng() * 0.25 });
+    // Offset sibling ellipse fakes a rotated highlight.
+    g.ellipse(cx + Math.cos(rot) * r * 0.2, cy2 + Math.sin(rot) * r * 0.06, rx * 0.7, ry * 0.6)
+      .fill({ color: toward(tint, 0xffffff, 0.3), alpha: 0.3 });
+  }
+
+  // Glowing lava cracks peeking through the clouds.
+  const cracks = 4 + Math.floor(rng() * 4);
+  const glow = toward(core, 0xffdd66, 0.5);
+  for (let i = 0; i < cracks; i++) {
+    const a0 = rng() * Math.PI * 2;
+    const a1 = a0 + (rng() - 0.5) * 1.2;
+    const r0 = r * (0.2 + rng() * 0.6);
+    const r1 = r * (0.2 + rng() * 0.6);
+    const x0 = cx + Math.cos(a0) * r0;
+    const y0 = cy + Math.sin(a0) * r0;
+    const x1 = cx + Math.cos(a1) * r1;
+    const y1 = cy + Math.sin(a1) * r1;
+    const mx = (x0 + x1) / 2 + (rng() - 0.5) * r * 0.3;
+    const my = (y0 + y1) / 2 + (rng() - 0.5) * r * 0.3;
+    g.moveTo(x0, y0)
+      .quadraticCurveTo(mx, my, x1, y1)
+      .stroke({
+        width: Math.max(0.8, r * 0.035),
+        color: glow,
+        alpha: 0.7,
+      });
+  }
+
+  // Keep poles — dim dusty caps instead of ice.
+  g.ellipse(cx, cy - r * 0.9, r * 0.45, r * 0.14).fill({
+    color: toward(warmBase, 0x000000, 0.55),
+    alpha: 0.5,
+  });
+  g.ellipse(cx, cy + r * 0.9, r * 0.45, r * 0.14).fill({
+    color: toward(warmBase, 0x000000, 0.55),
+    alpha: 0.5,
+  });
+};
+
+// ─── Alien / exotic: neon swirls and glowing patches ───────────────────────
+const drawAlien = (
+  g: Graphics,
+  cx: number,
+  cy: number,
+  r: number,
+  core: number,
+  rng: Rng,
+): void => {
+  const base = toward(core, 0x3b0a4a, 0.25);
+  const dark = toward(base, 0x02000a, 0.65);
+  const lit = toward(core, 0xd98bff, 0.5);
+  drawLitSphere(g, cx, cy, r, dark, base, lit);
+
+  // Neon swirl arcs — multiple curved strokes running around the disc.
+  const swirls = 5 + Math.floor(rng() * 4);
+  for (let i = 0; i < swirls; i++) {
+    const a0 = rng() * Math.PI * 2;
+    const sweep = Math.PI * (0.3 + rng() * 0.7);
+    const rr = r * (0.35 + rng() * 0.55);
+    const tint =
+      rng() < 0.5
+        ? toward(core, 0x00ffe0, 0.55)
+        : toward(core, 0xff5cf0, 0.5);
+    g.arc(cx, cy, rr, a0, a0 + sweep).stroke({
+      width: Math.max(1, r * (0.04 + rng() * 0.04)),
+      color: tint,
+      alpha: 0.55,
+    });
+  }
+
+  // Glowing plasma patches.
+  const patches = 5 + Math.floor(rng() * 4);
+  for (let i = 0; i < patches; i++) {
+    const a = rng() * Math.PI * 2;
+    const d = rng() * r * 0.65;
+    const px = cx + Math.cos(a) * d;
+    const py = cy + Math.sin(a) * d;
+    const pr = r * (0.08 + rng() * 0.12);
+    if (Math.hypot(px - cx, py - cy) + pr > r * 0.93) continue;
+    const color =
+      rng() < 0.5
+        ? toward(core, 0x00f0ff, 0.6)
+        : toward(core, 0xff40c0, 0.55);
+    // Halo under the patch for glow.
+    g.circle(px, py, pr * 1.4).fill({ color, alpha: 0.12 });
+    g.circle(px, py, pr).fill({ color, alpha: 0.55 });
+    g.circle(px, py, pr * 0.55).fill({ color: 0xffffff, alpha: 0.4 });
+  }
 };
 
 /** Large soft halo behind a planet, tinted to owner glow. */

@@ -1,4 +1,5 @@
 import { Application, Container, Graphics } from 'pixi.js';
+import { PLAYER_PALETTES } from '../../util/color.js';
 import type { World } from '../sim/World.js';
 import { BackgroundLayer } from './BackgroundLayer.js';
 import { PlanetLayer } from './PlanetLayer.js';
@@ -41,15 +42,32 @@ export class Renderer {
   }
 
   setLasso(x0: number, y0: number, x1: number, y1: number): void {
-    const lx = Math.min(x0, x1);
-    const rx = Math.max(x0, x1);
-    const ty = Math.min(y0, y1);
-    const by = Math.max(y0, y1);
+    // Circular selection centered at the drag origin. Radius tracks the
+    // current drag distance, giving a clean planet-like disc.
+    const radius = Math.hypot(x1 - x0, y1 - y0);
+    if (radius < 1) {
+      this.lasso.clear();
+      return;
+    }
+    const pal = PLAYER_PALETTES[0];
+    const stroke = Math.max(1.5, 2.5 / this.viewScale);
     this.lasso.clear();
+    // Soft outer glow ring.
+    this.lasso.circle(x0, y0, radius + stroke * 1.5).stroke({
+      width: stroke * 2,
+      color: pal.glow,
+      alpha: 0.35,
+    });
+    // Filled disc + crisp rim.
     this.lasso
-      .rect(lx, ty, rx - lx, by - ty)
-      .fill({ color: 0xaee5ff, alpha: 0.08 })
-      .stroke({ width: 1.5 / this.viewScale, color: 0xaee5ff, alpha: 0.8 });
+      .circle(x0, y0, radius)
+      .fill({ color: pal.core, alpha: 0.1 })
+      .stroke({ width: stroke, color: pal.core, alpha: 0.85 });
+    // Small marker pip at the drag origin so the anchor reads clearly.
+    this.lasso.circle(x0, y0, Math.max(2, 3 / this.viewScale)).fill({
+      color: pal.ship,
+      alpha: 0.9,
+    });
   }
 
   clearLasso(): void {

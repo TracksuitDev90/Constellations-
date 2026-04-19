@@ -4,7 +4,7 @@ import { Audio } from './audio/Audio.js';
 import { Input } from './input/Input.js';
 import { Selection } from './input/Selection.js';
 import { ORION_MAP } from './maps/orion.js';
-import { RING_THRESHOLDS, type Planet } from './sim/Planet.js';
+import { RING_CAPACITY_FOR_SIZE, type Planet } from './sim/Planet.js';
 import { loadPlanetAssets } from './render/planetAssets.js';
 import { Renderer } from './render/Renderer.js';
 import { World } from './sim/World.js';
@@ -46,9 +46,10 @@ export class Game {
       'Constellations',
       `A meditative real-time strategy game inspired by <em>Auralux</em>.<br/>
        Tap a planet you own, then any planet to send a wave. Selection sticks,
-       so keep tapping targets to redirect. Send units back to your own ringed
-       worlds to fill the rings — every ring you close upgrades the planet and
-       speeds its production.<br/>
+       so keep tapping targets to redirect. Tap a friendly ringed world (with
+       nothing else selected) to <em>absorb</em> its orbit units — they fill
+       the rings, and when every ring is full the planet explodes into a
+       bigger, faster size. Absorb also heals damage first.<br/>
        Pinch or scroll to zoom; drag with two fingers to pan. Capture every
        star to win.`,
       [
@@ -108,6 +109,12 @@ export class Game {
         onRingFilled: (_planetId, ringIndex, owner) => {
           if (owner !== 0) return;
           this.audio.ringFilled(ringIndex);
+        },
+        onPlanetEvolve: (_planetId, owner) => {
+          if (owner !== 0) return;
+          // Reuse the capture sting — evolving a planet is a comparably
+          // meaningful moment and the cue already reads as "good news".
+          this.audio.planetCaptured();
         },
         onPlanetCapture: () => {
           this.audio.planetCaptured();
@@ -291,14 +298,12 @@ export class Game {
 
 /** 0..1 progress toward filling the planet's next capacity ring. */
 const ringFillProgress = (planet: Planet): number => {
-  const thresholds = RING_THRESHOLDS[planet.type];
-  if (thresholds.length === 0) return 0;
-  let prev = 0;
-  for (const cap of thresholds) {
-    if (planet.garrison < cap) {
-      return Math.max(0, Math.min(1, (planet.garrison - prev) / (cap - prev)));
-    }
-    prev = cap;
+  if (planet.ringCount === 0) return 0;
+  const cap = RING_CAPACITY_FOR_SIZE[planet.type];
+  if (cap <= 0) return 0;
+  for (let i = 0; i < planet.ringCount; i++) {
+    const fill = planet.ringFillProgress[i] ?? 0;
+    if (fill < cap) return Math.max(0, Math.min(1, fill / cap));
   }
   return 1;
 };

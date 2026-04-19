@@ -1,12 +1,15 @@
 import { dist, vec, type Vec2 } from '../../util/math.js';
 import {
+  BASE_MAX_HEALTH,
   BASE_PRODUCTION,
   BASE_UNIT_CAPACITY,
-  UPGRADE_THRESHOLD,
-  filledRingCount,
-  productionMultiplier,
+  RING_CAPACITY_FOR_SIZE,
+  SIZE_RADIUS,
+  clampRingCount,
+  ringsComplete,
   type Planet,
   type PlanetType,
+  type RingCount,
 } from './Planet.js';
 import type { Player } from './Player.js';
 import { ShipPool, type Ship } from './Ship.js';
@@ -17,10 +20,19 @@ export interface MapSpec {
   height: number;
   planets: Array<{
     pos: Vec2;
-    radius: number;
+    /**
+     * Optional override; if omitted, the planet's radius is derived from
+     * `type` via `SIZE_RADIUS`, so map authors can just pick a size.
+     */
+    radius?: number;
     owner: number | null;
     garrison: number;
     type?: PlanetType;
+    /**
+     * Authored unfilled ring count. Clamped to `MAX_RING_COUNT[type]`. Rings
+     * fill from absorbed units; filling the last one evolves the planet.
+     */
+    ringCount?: number;
   }>;
   edges: Array<[number, number]>;
 }
@@ -30,10 +42,10 @@ export interface WorldEvents {
   onPlanetCapture?: (planetId: number, newOwner: number) => void;
   /** Fired when a ship lands. `friendly` = arrived at an owned planet. */
   onShipArrive?: (planetId: number, owner: number, friendly: boolean) => void;
-  /** Fired when garrison crosses a new ring threshold (or a ring opens up). */
+  /** Fired when a ring finishes filling with absorbed units. */
   onRingFilled?: (planetId: number, ringIndex: number, owner: number) => void;
-  /** Fired when an absorb consumption triggers a planet upgrade. */
-  onPlanetUpgrade?: (planetId: number, owner: number, level: number) => void;
+  /** Fired when a planet evolves to the next size (ring-fill complete). */
+  onPlanetEvolve?: (planetId: number, owner: number, newType: PlanetType) => void;
   onGameOver?: (winner: number | null) => void;
 }
 
@@ -83,26 +95,26 @@ export class World {
     this.events = events;
     this.planets = map.planets.map((p, i) => {
       const type: PlanetType = p.type ?? 0;
-      const planet: Planet = {
+      const ringCount: RingCount = clampRingCount(type, p.ringCount ?? 0);
+      const maxHealth = BASE_MAX_HEALTH[type];
+      return {
         id: i,
         pos: { ...p.pos },
-        radius: p.radius,
+        radius: p.radius ?? SIZE_RADIUS[type],
         owner: p.owner,
         garrison: p.garrison,
         type,
         productionRate: BASE_PRODUCTION[type],
         productionAcc: 0,
         capturePulse: 0,
-        ringsFilled: 0,
-        storedEnergy: 0,
-        upgradeThreshold: UPGRADE_THRESHOLD,
+        evolvePulse: 0,
+        ringCount,
+        ringFillProgress: new Array(ringCount).fill(0),
         maxUnitCapacity: BASE_UNIT_CAPACITY[type],
         absorbing: false,
-        health: 1,
-        maxHealth: 1,
+        health: maxHealth,
+        maxHealth,
       };
-      planet.ringsFilled = filledRingCount(planet);
-      return planet;
     });
     this.edges = new Set();
     this.neighbors = new Map();
@@ -246,22 +258,21 @@ export class World {
     if (this.gameOver) return;
     this.time += dt;
 
-    // Production. Output scales by how many of the planet's capacity rings are
-    // currently filled — this is the Auralux Constellations growth loop, where
-    // investing garrison in a ringed planet upgrades it into a faster source.
+    // Production. Bigger planets produce meaningfully faster; growth comes
+    // from evolving the planet via ring fill (Auralux: Constellations' "explode
+    // into a bigger size" mechanic), not from a ring-count multiplier.
     for (const p of this.planets) {
       if (p.capturePulse > 0) p.capturePulse = Math.max(0, p.capturePulse - dt);
+      if (p.evolvePulse > 0) p.evolvePulse = Math.max(0, p.evolvePulse - dt * 0.9);
       if (p.owner === null) continue;
       // Absorbing planets stall production so all focus is on consuming orbiters.
       if (p.absorbing) continue;
-      const mult = productionMultiplier(p);
-      p.productionAcc += p.productionRate * mult * dt;
+      p.productionAcc += p.productionRate * dt;
       while (p.productionAcc >= 1) {
         p.productionAcc -= 1;
         p.garrison += 1;
         // Spawn a physical orbit unit if we have capacity headroom.
         this.spawnOrbiter(p);
-        this.notifyRingChange(p);
       }
     }
 
@@ -491,23 +502,49 @@ export class World {
 
   private consumeAbsorbed(planet: Planet): void {
     if (planet.garrison > 0) planet.garrison -= 1;
-    // Health routing: if the planet has taken damage, heal first.
+    // Absorb has two jobs: heal first if the planet is damaged, then fill rings.
     if (planet.health < planet.maxHealth) {
       planet.health = Math.min(planet.maxHealth, planet.health + 1);
       return;
     }
-    // Otherwise, feed the upgrade meter.
-    planet.storedEnergy += 1;
-    if (planet.storedEnergy >= planet.upgradeThreshold) {
-      planet.storedEnergy = 0;
-      planet.productionRate *= 1.25;
-      planet.maxUnitCapacity += 10;
-      planet.capturePulse = 0.8; // reuse capture pulse for a visible flash
-      if (planet.owner !== null) {
-        this.events.onPlanetUpgrade?.(planet.id, planet.owner, planet.maxUnitCapacity);
+    if (planet.ringCount === 0) return; // nothing to grow into; orbiter is still spent.
+    const cap = RING_CAPACITY_FOR_SIZE[planet.type];
+    for (let i = 0; i < planet.ringCount; i++) {
+      const before = planet.ringFillProgress[i] ?? 0;
+      if (before >= cap) continue;
+      const after = before + 1;
+      planet.ringFillProgress[i] = after;
+      if (after >= cap && planet.owner !== null) {
+        this.events.onRingFilled?.(planet.id, i, planet.owner);
       }
+      break;
     }
-    this.notifyRingChange(planet);
+    if (ringsComplete(planet)) this.evolvePlanet(planet);
+  }
+
+  /**
+   * Grow a planet one tier. Called only when every ring has been filled by
+   * absorbed units; clears rings, scales radius/production/capacity up, and
+   * signals listeners so the renderer and audio can react.
+   */
+  private evolvePlanet(planet: Planet): void {
+    if (planet.type >= 3) return;
+    const newType: PlanetType = (planet.type + 1) as PlanetType;
+    planet.type = newType;
+    planet.radius = SIZE_RADIUS[newType];
+    planet.productionRate = BASE_PRODUCTION[newType];
+    planet.maxUnitCapacity = BASE_UNIT_CAPACITY[newType];
+    planet.maxHealth = BASE_MAX_HEALTH[newType];
+    planet.health = planet.maxHealth;
+    planet.ringCount = 0;
+    planet.ringFillProgress = [];
+    planet.evolvePulse = 1;
+    // Auto-stop absorb: there's nothing left to fill, and the player should
+    // re-opt-in if they want to heal a newly damaged XXL later.
+    planet.absorbing = false;
+    if (planet.owner !== null) {
+      this.events.onPlanetEvolve?.(planet.id, planet.owner, newType);
+    }
   }
 
   private stepTransit(idx: number, ship: Ship, dt: number, allShips: readonly Ship[]): void {
@@ -688,7 +725,6 @@ export class World {
         ship.vx = (-dy / d) * tangentSpeed;
         ship.vy = (dx / d) * tangentSpeed;
         this.events.onShipArrive?.(planet.id, ship.owner, friendly);
-        this.notifyRingChange(planet);
         return;
       }
     } else {
@@ -697,16 +733,17 @@ export class World {
         planet.owner = ship.owner;
         planet.garrison = 1;
         planet.capturePulse = 0.6;
-        planet.ringsFilled = 0;
-        planet.storedEnergy = 0;
+        // Reset ring fill — captured planets start with empty rings so the
+        // new owner must invest absorb to keep the growth path.
+        planet.ringFillProgress = new Array(planet.ringCount).fill(0);
         planet.absorbing = false;
+        planet.health = planet.maxHealth;
         // On capture, evict any leftover orbiters of the prior owner.
         this.evictOrbitersOf(planet.id, ship.owner);
         this.events.onPlanetCapture?.(planet.id, ship.owner);
       }
     }
     this.events.onShipArrive?.(planet.id, ship.owner, friendly);
-    this.notifyRingChange(planet);
     this.ships.kill(shipIdx);
   }
 
@@ -719,25 +756,6 @@ export class World {
       if (s.state !== 'orbiting' || s.parentPlanet !== planetId) continue;
       if (s.owner !== keepOwner) this.ships.kill(i);
     }
-  }
-
-  /**
-   * Detect ring threshold crossings (in either direction) and notify listeners.
-   * Crossing a threshold upward is an "upgrade" moment — the visible ring fills
-   * and production multiplies.
-   */
-  private notifyRingChange(planet: Planet): void {
-    if (planet.owner === null) {
-      planet.ringsFilled = 0;
-      return;
-    }
-    const filled = filledRingCount(planet);
-    if (filled > planet.ringsFilled) {
-      for (let k = planet.ringsFilled; k < filled; k++) {
-        this.events.onRingFilled?.(planet.id, k, planet.owner);
-      }
-    }
-    planet.ringsFilled = filled;
   }
 
   private checkGameOver(): void {

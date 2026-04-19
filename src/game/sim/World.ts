@@ -1,13 +1,15 @@
 import { dist, vec, type Vec2 } from '../../util/math.js';
 import {
   BASE_PRODUCTION,
+  BASE_UNIT_CAPACITY,
+  UPGRADE_THRESHOLD,
   filledRingCount,
   productionMultiplier,
   type Planet,
   type PlanetType,
 } from './Planet.js';
 import type { Player } from './Player.js';
-import { ShipPool } from './Ship.js';
+import { ShipPool, type Ship } from './Ship.js';
 import { createStream, type ShipStream } from './Stream.js';
 
 export interface MapSpec {
@@ -30,6 +32,8 @@ export interface WorldEvents {
   onShipArrive?: (planetId: number, owner: number, friendly: boolean) => void;
   /** Fired when garrison crosses a new ring threshold (or a ring opens up). */
   onRingFilled?: (planetId: number, ringIndex: number, owner: number) => void;
+  /** Fired when an absorb consumption triggers a planet upgrade. */
+  onPlanetUpgrade?: (planetId: number, owner: number, level: number) => void;
   onGameOver?: (winner: number | null) => void;
 }
 
@@ -42,6 +46,20 @@ export const SHIP_SPEED = 48;
 export const DEFAULT_EMIT_INTERVAL = 0.035;
 /** Max random exit-cone angle, in radians, around the direct line to target. */
 const EXIT_CONE = Math.PI / 3; // ±60°
+
+/** Target orbit radius around a planet, expressed as a multiple of planet radius. */
+const ORBIT_RADIUS_MULT = 1.75;
+/** How far (px) inside the orbit band counts as "settled into orbit". */
+const ORBIT_SETTLE_TOLERANCE = 3;
+/** How far (px) from planet center before an absorbing unit is consumed. */
+const ABSORB_CONSUME_DIST = 3;
+
+/** Boids tuning for transit swarms. Kept gentle — ships must still arrive. */
+const SEPARATION_RADIUS = 9;
+const SEPARATION_WEIGHT = 22;
+const COHESION_RADIUS = 38;
+const COHESION_WEIGHT = 4;
+const SEEK_WEIGHT = 60;
 
 export class World {
   players: Player[];
@@ -76,6 +94,12 @@ export class World {
         productionAcc: 0,
         capturePulse: 0,
         ringsFilled: 0,
+        storedEnergy: 0,
+        upgradeThreshold: UPGRADE_THRESHOLD,
+        maxUnitCapacity: BASE_UNIT_CAPACITY[type],
+        absorbing: false,
+        health: 1,
+        maxHealth: 1,
       };
       planet.ringsFilled = filledRingCount(planet);
       return planet;
@@ -162,6 +186,47 @@ export class World {
     return path;
   }
 
+  /**
+   * Toggle absorption mode on a friendly planet. While absorbing, orbit units
+   * are pulled into the center and consumed — feeding either health (if damaged)
+   * or the upgrade meter (which converts into permanent production gains).
+   */
+  triggerAbsorb(planetId: number, owner: number, enabled = true): void {
+    const p = this.planets[planetId];
+    if (!p || p.owner !== owner) return;
+    p.absorbing = enabled;
+  }
+
+  /**
+   * Command every selected unit (ships with isSelected) to break orbit and
+   * transit toward `targetPlanet`. Returns how many units received the order.
+   */
+  commandSelectedTo(owner: number, targetPlanet: number): number {
+    const tgt = this.planets[targetPlanet];
+    if (!tgt) return 0;
+    const ships = this.ships.all;
+    let n = 0;
+    for (let i = 0; i < ships.length; i++) {
+      const s = ships[i];
+      if (!s.active || !s.isSelected || s.owner !== owner) continue;
+      if (s.state !== 'orbiting' && s.state !== 'transit') continue;
+      // Break orbit: decrement parent garrison so accounting stays consistent.
+      if (s.state === 'orbiting' && s.parentPlanet >= 0) {
+        const parent = this.planets[s.parentPlanet];
+        if (parent && parent.owner === owner && parent.garrison > 0) {
+          parent.garrison -= 1;
+        }
+      }
+      s.state = 'transit';
+      s.parentPlanet = -1;
+      s.targetPlanet = targetPlanet;
+      s.age = 0;
+      this.events.onShipLaunch?.(owner);
+      n++;
+    }
+    return n;
+  }
+
   step(dt: number): void {
     if (this.gameOver) return;
     this.time += dt;
@@ -172,11 +237,15 @@ export class World {
     for (const p of this.planets) {
       if (p.capturePulse > 0) p.capturePulse = Math.max(0, p.capturePulse - dt);
       if (p.owner === null) continue;
+      // Absorbing planets stall production so all focus is on consuming orbiters.
+      if (p.absorbing) continue;
       const mult = productionMultiplier(p);
       p.productionAcc += p.productionRate * mult * dt;
       while (p.productionAcc >= 1) {
         p.productionAcc -= 1;
         p.garrison += 1;
+        // Spawn a physical orbit unit if we have capacity headroom.
+        this.spawnOrbiter(p);
         this.notifyRingChange(p);
       }
     }
@@ -193,36 +262,7 @@ export class World {
         s.emitAcc -= s.emitInterval;
         src.garrison -= 1;
         s.remaining -= 1;
-        const tgt = this.planets[s.target];
-        const dirX = tgt.pos.x - src.pos.x;
-        const dirY = tgt.pos.y - src.pos.y;
-        const baseAngle = Math.atan2(dirY, dirX);
-
-        // Random exit angle inside a wide cone facing the target — keeps
-        // departures organic instead of all single-file.
-        const exitAngle = baseAngle + (Math.random() - 0.5) * EXIT_CONE;
-        const exitR = src.radius + 2 + Math.random() * (src.radius * 0.25);
-        const spawnPos = vec(
-          src.pos.x + Math.cos(exitAngle) * exitR,
-          src.pos.y + Math.sin(exitAngle) * exitR,
-        );
-
-        // Initial heading: blends the exit angle with the direct line so
-        // ships immediately curve back toward the target rather than
-        // launching straight outward.
-        const headingAngle = baseAngle + (exitAngle - baseAngle) * 0.55;
-        const turnRate = 1.4 + Math.random() * 1.6; // rad/sec
-        const wobbleAmp = (Math.random() - 0.5) * 0.6; // signed lateral push
-        const wobblePhase = Math.random() * Math.PI * 2;
-
-        this.ships.spawn(s.owner, spawnPos, s.target, SHIP_SPEED, {
-          vx: Math.cos(headingAngle) * SHIP_SPEED,
-          vy: Math.sin(headingAngle) * SHIP_SPEED,
-          turnRate,
-          wobbleAmp,
-          wobblePhase,
-        });
-        this.events.onShipLaunch?.(s.owner);
+        this.emitStreamShip(s, src);
       }
     }
 
@@ -231,56 +271,314 @@ export class World {
       (s) => s.remaining > 0 && this.planets[s.source].owner === s.owner,
     );
 
-    // Ship movement + arrival.
-    // Each ship steers its velocity toward the target with a per-ship turn
-    // rate, plus a sinusoidal lateral wobble that fades as it nears the
-    // planet — together these give the swarm a flowing, non-linear look
-    // without any ship missing the target.
+    // Ship simulation. Each state runs its own steering pass.
     const ships = this.ships.all;
     for (let i = 0; i < ships.length; i++) {
       const ship = ships[i];
       if (!ship.active) continue;
       ship.age += dt;
-      const tgt = this.planets[ship.targetPlanet];
-      const dx = tgt.pos.x - ship.x;
-      const dy = tgt.pos.y - ship.y;
-      const d = Math.hypot(dx, dy);
-      if (d <= tgt.radius + 1) {
-        this.arrive(i, tgt);
-        continue;
-      }
-
-      // Steer current heading toward desired heading.
-      const desired = Math.atan2(dy, dx);
-      const current = Math.atan2(ship.vy, ship.vx);
-      let delta = desired - current;
-      // Wrap to [-PI, PI].
-      if (delta > Math.PI) delta -= Math.PI * 2;
-      else if (delta < -Math.PI) delta += Math.PI * 2;
-      const maxTurn = ship.turnRate * dt;
-      const turn = Math.max(-maxTurn, Math.min(maxTurn, delta));
-      let newAng = current + turn;
-
-      // Lateral wobble — a perpendicular nudge that decays near the target,
-      // so ships meander mid-flight but settle on a clean approach.
-      const approachFalloff = Math.min(1, d / 80);
-      const wobble =
-        Math.sin(this.time * 3.2 + ship.wobblePhase) * ship.wobbleAmp * approachFalloff;
-      newAng += wobble * dt * 4;
-
-      ship.vx = Math.cos(newAng) * ship.speed;
-      ship.vy = Math.sin(newAng) * ship.speed;
-
-      const step = ship.speed * dt;
-      if (step >= d) {
-        this.arrive(i, tgt);
-      } else {
-        ship.x += ship.vx * dt;
-        ship.y += ship.vy * dt;
-      }
+      if (ship.state === 'orbiting') this.stepOrbiting(i, ship, dt);
+      else if (ship.state === 'absorbing') this.stepAbsorbing(i, ship, dt);
+      else this.stepTransit(i, ship, dt, ships);
     }
 
     this.checkGameOver();
+  }
+
+  /** Spawn a new orbit unit emerging from the planet center. */
+  private spawnOrbiter(planet: Planet): void {
+    if (planet.owner === null) return;
+    const liveOrbiters = this.countOrbitersOf(planet.id);
+    if (liveOrbiters >= planet.maxUnitCapacity) return;
+    const angle = Math.random() * Math.PI * 2;
+    const outward = SHIP_SPEED * 0.8;
+    const orbitRadius = planet.radius * ORBIT_RADIUS_MULT + (Math.random() - 0.5) * 6;
+    this.ships.spawn(planet.owner, planet.pos, -1, SHIP_SPEED, {
+      vx: Math.cos(angle) * outward,
+      vy: Math.sin(angle) * outward,
+      turnRate: 2.2 + Math.random() * 1.6,
+      wobbleAmp: 0,
+      wobblePhase: 0,
+      state: 'orbiting',
+      parentPlanet: planet.id,
+      orbitRadius,
+      orbitDir: Math.random() < 0.5 ? 1 : -1,
+      wanderPhase: Math.random() * Math.PI * 2,
+    });
+  }
+
+  private countOrbitersOf(planetId: number): number {
+    const all = this.ships.all;
+    let n = 0;
+    for (const s of all) {
+      if (s.active && s.state === 'orbiting' && s.parentPlanet === planetId) n++;
+    }
+    return n;
+  }
+
+  /**
+   * Emit a single stream ship. Prefers repurposing an existing orbiter (so it
+   * visibly breaks orbit) over spawning a fresh one from the planet edge.
+   */
+  private emitStreamShip(stream: ShipStream, src: Planet): void {
+    const tgt = this.planets[stream.target];
+    const orbiterIdx = this.ships.findOrbiterOf(src.id, stream.owner);
+
+    if (orbiterIdx >= 0) {
+      const ship = this.ships.get(orbiterIdx);
+      ship.state = 'transit';
+      ship.parentPlanet = -1;
+      ship.targetPlanet = stream.target;
+      ship.age = 0;
+      // Point velocity roughly at the next-hop planet so the break looks intentional.
+      const dirX = tgt.pos.x - ship.x;
+      const dirY = tgt.pos.y - ship.y;
+      const m = Math.hypot(dirX, dirY) || 1;
+      ship.vx = (dirX / m) * SHIP_SPEED;
+      ship.vy = (dirY / m) * SHIP_SPEED;
+      ship.speed = SHIP_SPEED;
+      ship.turnRate = 1.4 + Math.random() * 1.6;
+      ship.wobbleAmp = (Math.random() - 0.5) * 0.6;
+      ship.wobblePhase = Math.random() * Math.PI * 2;
+      this.events.onShipLaunch?.(stream.owner);
+      return;
+    }
+
+    // Fallback: spawn a fresh transit ship from the planet edge (same as before).
+    const dirX = tgt.pos.x - src.pos.x;
+    const dirY = tgt.pos.y - src.pos.y;
+    const baseAngle = Math.atan2(dirY, dirX);
+    const exitAngle = baseAngle + (Math.random() - 0.5) * EXIT_CONE;
+    const exitR = src.radius + 2 + Math.random() * (src.radius * 0.25);
+    const spawnPos = vec(
+      src.pos.x + Math.cos(exitAngle) * exitR,
+      src.pos.y + Math.sin(exitAngle) * exitR,
+    );
+    const headingAngle = baseAngle + (exitAngle - baseAngle) * 0.55;
+    this.ships.spawn(stream.owner, spawnPos, stream.target, SHIP_SPEED, {
+      vx: Math.cos(headingAngle) * SHIP_SPEED,
+      vy: Math.sin(headingAngle) * SHIP_SPEED,
+      turnRate: 1.4 + Math.random() * 1.6,
+      wobbleAmp: (Math.random() - 0.5) * 0.6,
+      wobblePhase: Math.random() * Math.PI * 2,
+      state: 'transit',
+    });
+    this.events.onShipLaunch?.(stream.owner);
+  }
+
+  private stepOrbiting(idx: number, ship: Ship, dt: number): void {
+    const planet = this.planets[ship.parentPlanet];
+    if (!planet || planet.owner !== ship.owner) {
+      // Parent lost or stale — release into transit to the nearest friendly
+      // alternative, or just kill it to return to the pool.
+      this.ships.kill(idx);
+      return;
+    }
+    // If the planet is in absorb mode, switch the unit to absorbing state.
+    if (planet.absorbing) {
+      ship.state = 'absorbing';
+      return;
+    }
+
+    const dx = ship.x - planet.pos.x;
+    const dy = ship.y - planet.pos.y;
+    const d = Math.hypot(dx, dy) || 0.0001;
+    const radial = d - ship.orbitRadius;
+
+    // Radial component: gently pull/push toward the orbit band.
+    const radialForce = -radial * 4; // stiffness
+    // Tangential component: perpendicular unit vector scaled by desired speed.
+    const tx = -dy / d;
+    const ty = dx / d;
+    const tangentSpeed = SHIP_SPEED * 0.75 * ship.orbitDir;
+
+    // Small wander so the swarm vibrates rather than locking to perfect circles.
+    const wander = Math.sin(this.time * 2.3 + ship.wanderPhase) * 6;
+    const rx = dx / d;
+    const ry = dy / d;
+    // Separation from nearby orbiters of the same planet — prevents stacking.
+    const sep = this.orbitSeparation(ship);
+
+    let targetVx = tx * tangentSpeed + rx * radialForce + rx * wander + sep.x;
+    let targetVy = ty * tangentSpeed + ry * radialForce + ry * wander + sep.y;
+
+    // Smooth velocity toward target (lightweight steering).
+    const blend = Math.min(1, dt * 6);
+    ship.vx += (targetVx - ship.vx) * blend;
+    ship.vy += (targetVy - ship.vy) * blend;
+
+    // Cap speed.
+    const sp = Math.hypot(ship.vx, ship.vy);
+    const maxSp = SHIP_SPEED * 1.1;
+    if (sp > maxSp) {
+      ship.vx = (ship.vx / sp) * maxSp;
+      ship.vy = (ship.vy / sp) * maxSp;
+    }
+
+    ship.x += ship.vx * dt;
+    ship.y += ship.vy * dt;
+
+    if (Math.abs(radial) < ORBIT_SETTLE_TOLERANCE) {
+      // Nudge speed to match the orbit tangent exactly once settled.
+      ship.vx = tx * tangentSpeed;
+      ship.vy = ty * tangentSpeed;
+    }
+  }
+
+  private orbitSeparation(self: Ship): { x: number; y: number } {
+    const ships = this.ships.all;
+    let fx = 0;
+    let fy = 0;
+    for (const other of ships) {
+      if (other === self || !other.active) continue;
+      if (other.state !== 'orbiting' || other.parentPlanet !== self.parentPlanet) continue;
+      const dx = self.x - other.x;
+      const dy = self.y - other.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 === 0 || d2 > SEPARATION_RADIUS * SEPARATION_RADIUS) continue;
+      const d = Math.sqrt(d2);
+      const push = (SEPARATION_RADIUS - d) / SEPARATION_RADIUS;
+      fx += (dx / d) * push * SEPARATION_WEIGHT;
+      fy += (dy / d) * push * SEPARATION_WEIGHT;
+    }
+    return { x: fx, y: fy };
+  }
+
+  private stepAbsorbing(idx: number, ship: Ship, dt: number): void {
+    const planet = this.planets[ship.parentPlanet];
+    if (!planet || planet.owner !== ship.owner) {
+      this.ships.kill(idx);
+      return;
+    }
+    // If the planet has turned absorb off, fall back to orbit.
+    if (!planet.absorbing) {
+      ship.state = 'orbiting';
+      return;
+    }
+    const dx = planet.pos.x - ship.x;
+    const dy = planet.pos.y - ship.y;
+    const d = Math.hypot(dx, dy);
+    if (d <= ABSORB_CONSUME_DIST) {
+      this.consumeAbsorbed(planet);
+      this.ships.kill(idx);
+      return;
+    }
+    // Reverse-seek: high-speed straight pull toward the center.
+    const pullSpeed = SHIP_SPEED * 1.6;
+    ship.vx = (dx / d) * pullSpeed;
+    ship.vy = (dy / d) * pullSpeed;
+    ship.x += ship.vx * dt;
+    ship.y += ship.vy * dt;
+  }
+
+  private consumeAbsorbed(planet: Planet): void {
+    if (planet.garrison > 0) planet.garrison -= 1;
+    // Health routing: if the planet has taken damage, heal first.
+    if (planet.health < planet.maxHealth) {
+      planet.health = Math.min(planet.maxHealth, planet.health + 1);
+      return;
+    }
+    // Otherwise, feed the upgrade meter.
+    planet.storedEnergy += 1;
+    if (planet.storedEnergy >= planet.upgradeThreshold) {
+      planet.storedEnergy = 0;
+      planet.productionRate *= 1.25;
+      planet.maxUnitCapacity += 10;
+      planet.capturePulse = 0.8; // reuse capture pulse for a visible flash
+      if (planet.owner !== null) {
+        this.events.onPlanetUpgrade?.(planet.id, planet.owner, planet.maxUnitCapacity);
+      }
+    }
+    this.notifyRingChange(planet);
+  }
+
+  private stepTransit(idx: number, ship: Ship, dt: number, allShips: readonly Ship[]): void {
+    const tgt = this.planets[ship.targetPlanet];
+    if (!tgt) {
+      this.ships.kill(idx);
+      return;
+    }
+    const dx = tgt.pos.x - ship.x;
+    const dy = tgt.pos.y - ship.y;
+    const d = Math.hypot(dx, dy);
+    if (d <= tgt.radius + 1) {
+      this.arrive(idx, tgt);
+      return;
+    }
+
+    // Seek (Arrive): force toward the target, slowing near arrival.
+    const seekStrength = Math.min(1, d / 40);
+    const invD = 1 / (d || 1);
+    let fx = dx * invD * SEEK_WEIGHT * seekStrength;
+    let fy = dy * invD * SEEK_WEIGHT * seekStrength;
+
+    // Boids: separation (hard) + weak cohesion with nearby friendly transits.
+    let sepX = 0;
+    let sepY = 0;
+    let cohX = 0;
+    let cohY = 0;
+    let cohN = 0;
+    for (const other of allShips) {
+      if (other === ship || !other.active) continue;
+      if (other.state !== 'transit' || other.owner !== ship.owner) continue;
+      const ox = ship.x - other.x;
+      const oy = ship.y - other.y;
+      const d2 = ox * ox + oy * oy;
+      if (d2 === 0) continue;
+      if (d2 < SEPARATION_RADIUS * SEPARATION_RADIUS) {
+        const od = Math.sqrt(d2);
+        const push = (SEPARATION_RADIUS - od) / SEPARATION_RADIUS;
+        sepX += (ox / od) * push;
+        sepY += (oy / od) * push;
+      }
+      if (d2 < COHESION_RADIUS * COHESION_RADIUS && other.targetPlanet === ship.targetPlanet) {
+        cohX += other.x;
+        cohY += other.y;
+        cohN++;
+      }
+    }
+    fx += sepX * SEPARATION_WEIGHT;
+    fy += sepY * SEPARATION_WEIGHT;
+    if (cohN > 0) {
+      const avgX = cohX / cohN;
+      const avgY = cohY / cohN;
+      const cdx = avgX - ship.x;
+      const cdy = avgY - ship.y;
+      const cd = Math.hypot(cdx, cdy) || 1;
+      fx += (cdx / cd) * COHESION_WEIGHT;
+      fy += (cdy / cd) * COHESION_WEIGHT;
+    }
+
+    // Lateral wobble — keeps single-file flights looking organic. Fades on arrival.
+    const approachFalloff = Math.min(1, d / 80);
+    const wobble =
+      Math.sin(this.time * 3.2 + ship.wobblePhase) * ship.wobbleAmp * approachFalloff;
+    // Apply wobble as a perpendicular nudge to the current velocity direction.
+    const vMag = Math.hypot(ship.vx, ship.vy) || 1;
+    const perpX = -ship.vy / vMag;
+    const perpY = ship.vx / vMag;
+    fx += perpX * wobble * 12;
+    fy += perpY * wobble * 12;
+
+    // Steer velocity toward desired force.
+    const blend = Math.min(1, dt * 3);
+    ship.vx += (fx - ship.vx) * blend;
+    ship.vy += (fy - ship.vy) * blend;
+
+    // Cap speed to the ship's nominal speed.
+    const sp = Math.hypot(ship.vx, ship.vy);
+    if (sp > ship.speed) {
+      ship.vx = (ship.vx / sp) * ship.speed;
+      ship.vy = (ship.vy / sp) * ship.speed;
+    }
+
+    const step = Math.hypot(ship.vx, ship.vy) * dt;
+    if (step >= d) {
+      this.arrive(idx, tgt);
+    } else {
+      ship.x += ship.vx * dt;
+      ship.y += ship.vy * dt;
+    }
   }
 
   private arrive(shipIdx: number, planet: Planet): void {
@@ -288,6 +586,28 @@ export class World {
     const friendly = planet.owner === ship.owner;
     if (friendly) {
       planet.garrison += 1;
+      // Turn the arriving ship into an orbiter of its new home rather than
+      // returning it to the pool — matches the spec: "unit's state resets to
+      // Orbiting and it joins the target planet's list".
+      if (this.countOrbitersOf(planet.id) < planet.maxUnitCapacity) {
+        ship.state = 'orbiting';
+        ship.parentPlanet = planet.id;
+        ship.targetPlanet = -1;
+        ship.orbitRadius = planet.radius * ORBIT_RADIUS_MULT + (Math.random() - 0.5) * 6;
+        ship.orbitDir = Math.random() < 0.5 ? 1 : -1;
+        ship.wanderPhase = Math.random() * Math.PI * 2;
+        ship.isSelected = false;
+        // Seed velocity roughly tangential for a clean orbit entry.
+        const dx = ship.x - planet.pos.x;
+        const dy = ship.y - planet.pos.y;
+        const d = Math.hypot(dx, dy) || 1;
+        const tangentSpeed = SHIP_SPEED * 0.75 * ship.orbitDir;
+        ship.vx = (-dy / d) * tangentSpeed;
+        ship.vy = (dx / d) * tangentSpeed;
+        this.events.onShipArrive?.(planet.id, ship.owner, friendly);
+        this.notifyRingChange(planet);
+        return;
+      }
     } else {
       planet.garrison -= 1;
       if (planet.garrison < 0) {
@@ -295,12 +615,27 @@ export class World {
         planet.garrison = 1;
         planet.capturePulse = 0.6;
         planet.ringsFilled = 0;
+        planet.storedEnergy = 0;
+        planet.absorbing = false;
+        // On capture, evict any leftover orbiters of the prior owner.
+        this.evictOrbitersOf(planet.id, ship.owner);
         this.events.onPlanetCapture?.(planet.id, ship.owner);
       }
     }
     this.events.onShipArrive?.(planet.id, ship.owner, friendly);
     this.notifyRingChange(planet);
     this.ships.kill(shipIdx);
+  }
+
+  /** Kill every orbiter of `planetId` whose owner differs from `keepOwner`. */
+  private evictOrbitersOf(planetId: number, keepOwner: number): void {
+    const ships = this.ships.all;
+    for (let i = 0; i < ships.length; i++) {
+      const s = ships[i];
+      if (!s.active) continue;
+      if (s.state !== 'orbiting' || s.parentPlanet !== planetId) continue;
+      if (s.owner !== keepOwner) this.ships.kill(i);
+    }
   }
 
   /**
@@ -347,7 +682,9 @@ export class World {
   totalGarrison(owner: number): number {
     let t = 0;
     for (const p of this.planets) if (p.owner === owner) t += p.garrison;
-    for (const s of this.ships.all) if (s.active && s.owner === owner) t += 1;
+    for (const s of this.ships.all) {
+      if (s.active && s.owner === owner && s.state === 'transit') t += 1;
+    }
     return t;
   }
 }

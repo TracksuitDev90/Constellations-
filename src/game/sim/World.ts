@@ -119,15 +119,9 @@ export class World {
   }
 
   /**
-   * Open a stream of ships from source -> target along constellation edges.
-   *
-   * Semantics:
-   * - If `count` is undefined, the stream is *continuous* — it keeps emitting
-   *   whatever the source produces until the source is retargeted, cancelled,
-   *   or lost. This matches the Auralux feel where selecting a planet and
-   *   tapping a target makes it flow indefinitely.
-   * - If `count` is a number, it's a bounded one-shot wave (used by the AI
-   *   so it can commit exactly N ships and walk away).
+   * Send a one-shot wave of ships from source -> target along constellation edges.
+   * If `count` is omitted, the entire current garrison of the source is launched.
+   * Streams are discrete — the player taps again for another wave.
    */
   openStream(owner: number, source: number, target: number, count?: number): void {
     if (source === target) return;
@@ -136,31 +130,12 @@ export class World {
     const path = this.findPath(source, target);
     if (path.length < 2) return;
     const nextHop = path[1];
-    const remaining =
-      count === undefined ? Number.POSITIVE_INFINITY : Math.min(count, src.garrison);
+    const remaining = count === undefined ? src.garrison : Math.min(count, src.garrison);
     if (remaining <= 0) return;
     this.cancelStreamsFrom(source, owner);
     this.streams.push(createStream(owner, source, nextHop, DEFAULT_EMIT_INTERVAL, remaining));
     if (nextHop !== target) {
       this.queueDownstream(owner, path, remaining);
-    }
-    // Redirect any in-flight ships that came from this source to the new target.
-    // Matches Auralux Constellations: retapping a new target curves the whole
-    // wave mid-flight rather than making you wait for the next batch.
-    this.redirectInFlight(owner, source, nextHop);
-  }
-
-  /**
-   * Retarget every active transit ship owned by `owner` whose sourcePlanet
-   * matches `source`. Used when the player retargets a selected planet's stream.
-   */
-  private redirectInFlight(owner: number, source: number, newTarget: number): void {
-    const ships = this.ships.all;
-    for (const ship of ships) {
-      if (!ship.active || ship.owner !== owner) continue;
-      if (ship.state !== 'transit') continue;
-      if (ship.sourcePlanet !== source) continue;
-      ship.targetPlanet = newTarget;
     }
   }
 
@@ -223,20 +198,27 @@ export class World {
   }
 
   /**
-   * Command every selected unit (ships with isSelected) to break orbit and
-   * transit toward `targetPlanet`. Returns how many units received the order.
+   * Command every selected unit to break orbit and transit toward a target.
+   * `target` may be a planet id (non-negative) or a free-space point.
+   * Returns the number of units that received the order.
    */
-  commandSelectedTo(owner: number, targetPlanet: number): number {
-    const tgt = this.planets[targetPlanet];
-    if (!tgt) return 0;
+  commandSelectedTo(
+    owner: number,
+    target: { planetId: number } | { x: number; y: number },
+  ): number {
     const ships = this.ships.all;
+    const planetTarget = 'planetId' in target;
+    if (planetTarget && !this.planets[target.planetId]) return 0;
     let n = 0;
     for (let i = 0; i < ships.length; i++) {
       const s = ships[i];
       if (!s.active || !s.isSelected || s.owner !== owner) continue;
-      if (s.state !== 'orbiting' && s.state !== 'transit') continue;
-      // Break orbit: decrement parent garrison so accounting stays consistent.
-      // Also remember the source so future retargets can redirect this ship.
+      if (
+        s.state !== 'orbiting' &&
+        s.state !== 'transit' &&
+        s.state !== 'hovering'
+      )
+        continue;
       if (s.state === 'orbiting' && s.parentPlanet >= 0) {
         const parent = this.planets[s.parentPlanet];
         if (parent && parent.owner === owner && parent.garrison > 0) {
@@ -246,7 +228,13 @@ export class World {
       }
       s.state = 'transit';
       s.parentPlanet = -1;
-      s.targetPlanet = targetPlanet;
+      if (planetTarget) {
+        s.targetPlanet = target.planetId;
+      } else {
+        s.targetPlanet = -1;
+        s.targetX = target.x;
+        s.targetY = target.y;
+      }
       s.age = 0;
       this.events.onShipLaunch?.(owner);
       n++;
@@ -306,6 +294,7 @@ export class World {
       ship.age += dt;
       if (ship.state === 'orbiting') this.stepOrbiting(i, ship, dt);
       else if (ship.state === 'absorbing') this.stepAbsorbing(i, ship, dt);
+      else if (ship.state === 'hovering') this.stepHovering(ship, dt, ships);
       else this.stepTransit(i, ship, dt, ships);
     }
 
@@ -522,16 +511,24 @@ export class World {
   }
 
   private stepTransit(idx: number, ship: Ship, dt: number, allShips: readonly Ship[]): void {
-    const tgt = this.planets[ship.targetPlanet];
-    if (!tgt) {
+    // Transit can target a planet (targetPlanet >= 0) or a free-space point
+    // (targetPlanet === -1, using targetX/targetY). Planet-arrival hands off to
+    // arrive(); point-arrival hands off to hovering around the point.
+    const pointTarget = ship.targetPlanet < 0;
+    const tgt = pointTarget ? null : this.planets[ship.targetPlanet];
+    if (!pointTarget && !tgt) {
       this.ships.kill(idx);
       return;
     }
-    const dx = tgt.pos.x - ship.x;
-    const dy = tgt.pos.y - ship.y;
+    const targetX = tgt ? tgt.pos.x : ship.targetX;
+    const targetY = tgt ? tgt.pos.y : ship.targetY;
+    const arriveDist = tgt ? tgt.radius + 1 : 6;
+    const dx = targetX - ship.x;
+    const dy = targetY - ship.y;
     const d = Math.hypot(dx, dy);
-    if (d <= tgt.radius + 1) {
-      this.arrive(idx, tgt);
+    if (d <= arriveDist) {
+      if (tgt) this.arrive(idx, tgt);
+      else this.beginHover(ship);
       return;
     }
 
@@ -603,11 +600,67 @@ export class World {
 
     const step = Math.hypot(ship.vx, ship.vy) * dt;
     if (step >= d) {
-      this.arrive(idx, tgt);
+      if (tgt) this.arrive(idx, tgt);
+      else this.beginHover(ship);
     } else {
       ship.x += ship.vx * dt;
       ship.y += ship.vy * dt;
     }
+  }
+
+  private beginHover(ship: Ship): void {
+    ship.state = 'hovering';
+    ship.age = 0;
+    // Small orbit radius around the hover point so the units bob in a
+    // visible cluster rather than stacking on one pixel.
+    ship.orbitRadius = 10 + Math.random() * 6;
+    ship.orbitDir = Math.random() < 0.5 ? 1 : -1;
+    ship.wanderPhase = Math.random() * Math.PI * 2;
+  }
+
+  private stepHovering(ship: Ship, dt: number, allShips: readonly Ship[]): void {
+    const dx = ship.x - ship.targetX;
+    const dy = ship.y - ship.targetY;
+    const d = Math.hypot(dx, dy) || 0.0001;
+    const radial = d - ship.orbitRadius;
+    // Radial pull toward the hover band.
+    const radialForce = -radial * 3;
+    // Tangential drift around the hover point.
+    const tx = -dy / d;
+    const ty = dx / d;
+    const tangentSpeed = SHIP_SPEED * 0.35 * ship.orbitDir;
+    const wander = Math.sin(this.time * 1.8 + ship.wanderPhase) * 4;
+    const rx = dx / d;
+    const ry = dy / d;
+    // Simple separation pass so hovering units don't collide.
+    let sepX = 0;
+    let sepY = 0;
+    for (const other of allShips) {
+      if (other === ship || !other.active) continue;
+      if (other.state !== 'hovering' && other.state !== 'orbiting') continue;
+      if (other.owner !== ship.owner) continue;
+      const ox = ship.x - other.x;
+      const oy = ship.y - other.y;
+      const d2 = ox * ox + oy * oy;
+      if (d2 === 0 || d2 > SEPARATION_RADIUS * SEPARATION_RADIUS) continue;
+      const od = Math.sqrt(d2);
+      const push = (SEPARATION_RADIUS - od) / SEPARATION_RADIUS;
+      sepX += (ox / od) * push;
+      sepY += (oy / od) * push;
+    }
+    const targetVx = tx * tangentSpeed + rx * radialForce + rx * wander + sepX * SEPARATION_WEIGHT;
+    const targetVy = ty * tangentSpeed + ry * radialForce + ry * wander + sepY * SEPARATION_WEIGHT;
+    const blend = Math.min(1, dt * 4);
+    ship.vx += (targetVx - ship.vx) * blend;
+    ship.vy += (targetVy - ship.vy) * blend;
+    const sp = Math.hypot(ship.vx, ship.vy);
+    const maxSp = SHIP_SPEED * 0.6;
+    if (sp > maxSp) {
+      ship.vx = (ship.vx / sp) * maxSp;
+      ship.vy = (ship.vy / sp) * maxSp;
+    }
+    ship.x += ship.vx * dt;
+    ship.y += ship.vy * dt;
   }
 
   private arrive(shipIdx: number, planet: Planet): void {

@@ -25,8 +25,6 @@ export class Game {
   private accumulator = 0;
   private paused = false;
   private activeOverlay: HTMLDivElement | null = null;
-  /** Most recent (planetId, timestamp) for simple double-tap detection. */
-  private lastTap: { planetId: number; time: number } | null = null;
 
   constructor(app: Application, ui: HTMLElement) {
     this.app = app;
@@ -134,29 +132,38 @@ export class Game {
     new Input(this.app.canvas as unknown as HTMLCanvasElement, this.renderer, this.world, {
       tapPlanet: (id) => {
         const p = this.world.planets[id];
-        const now = performance.now();
+        const selectedIds = this.selection.ids;
+        const hasSelection = selectedIds.size > 0;
+        const isOnlySelected = selectedIds.size === 1 && selectedIds.has(id);
+
         if (p.owner === 0) {
-          // Double-tap a friendly planet → toggle absorb mode (heal / upgrade).
-          const isDouble =
-            this.lastTap !== null &&
-            this.lastTap.planetId === id &&
-            now - this.lastTap.time < 350;
-          if (isDouble) {
-            this.world.triggerAbsorb(id, 0, !p.absorbing);
-            this.lastTap = null;
-          } else {
-            // Tapping an owned planet selects only it (replaces any prior selection).
+          // Friendly planet. Three behaviors depending on current selection:
+          //   (a) No selection → select this planet.
+          //   (b) Selected other planets → reinforce this planet (route to it).
+          //   (c) This planet is the sole selection → toggle absorb (fills
+          //       rings / heals / feeds upgrade meter).
+          if (!hasSelection) {
             this.selection.set(id);
-            this.lastTap = { planetId: id, time: now };
+          } else if (isOnlySelected) {
+            this.world.triggerAbsorb(id, 0, !p.absorbing);
+          } else {
+            this.selection.routeTo(id);
           }
-        } else if (this.selection.ids.size > 0) {
+        } else if (hasSelection) {
+          // Enemy or neutral planet with selection → attack.
           this.selection.routeTo(id);
-          this.lastTap = { planetId: id, time: now };
-        } else {
-          this.lastTap = { planetId: id, time: now };
         }
       },
-      tapEmpty: () => this.selection.clear(),
+      tapEmpty: (wx, wy) => {
+        // With units selected, tap-empty sends them to that world point and
+        // they loiter there. Without a selection, tap-empty clears state.
+        if (this.selection.ids.size > 0) {
+          const sent = this.selection.routeToPoint(wx, wy);
+          if (sent === 0) this.selection.clear();
+        } else {
+          this.selection.clear();
+        }
+      },
       dragCommit: (src, tgt) => {
         if (this.world.planets[src].owner !== 0) return;
         this.world.openStream(0, src, tgt);

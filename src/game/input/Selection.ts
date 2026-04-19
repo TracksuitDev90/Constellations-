@@ -76,7 +76,12 @@ export class Selection {
     const touchedPlanets = new Set<number>();
     for (const s of ships) {
       if (!s.active || s.owner !== this.playerId) continue;
-      if (s.state !== 'orbiting' && s.state !== 'transit') continue;
+      if (
+        s.state !== 'orbiting' &&
+        s.state !== 'transit' &&
+        s.state !== 'hovering'
+      )
+        continue;
       const dx = s.x - cx;
       const dy = s.y - cy;
       if (dx * dx + dy * dy <= r2) {
@@ -103,28 +108,33 @@ export class Selection {
   }
 
   /**
-   * Route selected sources/units to a target planet.
-   *
-   * Always opens a continuous stream from every selected source to the target
-   * — this is what lets the player chain moves (A → B, then B → C, then C → D)
-   * and have each planet keep flowing its production onward. If any orbiters
-   * were flagged as selected, they also break orbit and transit directly,
-   * giving the immediate wave feel on top of the persistent stream. Already
-   * in-flight ships from the same source are redirected by openStream so the
-   * whole swarm curves to the new target rather than waiting for the next
-   * batch.
+   * Route selected sources/units to a target planet. Every tap is a fresh
+   * discrete wave — orbiters of selected planets break orbit and transit
+   * directly via boids flocking. Called for both enemy attacks and friendly
+   * reinforcement.
    */
   routeTo(targetId: number): void {
-    const commandedUnits = this.world.commandSelectedTo(this.playerId, targetId);
+    const commanded = this.world.commandSelectedTo(this.playerId, { planetId: targetId });
+    if (commanded > 0) {
+      this.clearUnitSelection();
+      return;
+    }
+    // Nothing selected at the unit level (or they all already left) — fall
+    // back to a classic stream-over-edges wave from every selected planet.
     for (const src of this.selected) {
       if (src === targetId) continue;
       this.world.openStream(this.playerId, src, targetId);
     }
-    if (commandedUnits > 0) {
-      // Clear per-unit selection flags now that they're in transit; selection
-      // of the source planet persists so future retargets still work.
-      this.clearUnitSelection();
-    }
+  }
+
+  /**
+   * Command selected units to fly to a free-space point and hold there.
+   * Used when the player taps empty space with units selected.
+   */
+  routeToPoint(x: number, y: number): number {
+    const n = this.world.commandSelectedTo(this.playerId, { x, y });
+    if (n > 0) this.clearUnitSelection();
+    return n;
   }
 
   /** Remove lost planets from selection. Also drops unit flags on lost ships. */

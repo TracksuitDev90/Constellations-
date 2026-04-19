@@ -6,6 +6,7 @@ import {
   Texture,
 } from 'pixi.js';
 import { adjustColor, paletteFor, toward } from '../../util/color.js';
+import { bakePlanetSphere, planetAssetsReady } from './planetAssets.js';
 
 const cache = new Map<string, Texture>();
 
@@ -55,6 +56,13 @@ export type PlanetArchetype =
   | 'molten'
   | 'alien';
 
+/**
+ * How large (in pixels) the baked sphere texture is for a given planet radius.
+ * Stays sharp under zoom while keeping GPU memory reasonable.
+ */
+export const bakedBodyDiameter = (radius: number): number =>
+  Math.max(128, Math.round(radius * 3));
+
 /** Pick a stable archetype from a planet's seed. */
 export const archetypeForSeed = (seed: number): PlanetArchetype => {
   const h = Math.abs(Math.imul(seed + 0x9e3779b9, 2654435761)) >>> 0;
@@ -80,6 +88,18 @@ export const makePlanetBodyTexture = (
   seed: number,
 ): Texture => {
   const archetype = archetypeForSeed(seed);
+
+  // Prefer the baked photographic sphere when the asset set is available.
+  // The baked texture does not depend on ownerId, so ownership is carried
+  // by the halo/rings/orbiters around the planet.
+  if (planetAssetsReady()) {
+    // Bake larger than the sim radius for crisper pixels under zoom. The
+    // PlanetLayer scales the sprite down via `bodyBaseScale` so the visible
+    // sphere radius still matches `radius`.
+    const diameter = bakedBodyDiameter(radius);
+    return bakePlanetSphere(archetype, seed, diameter);
+  }
+
   const key = `planet-body:${archetype}:${ownerId ?? 'n'}:${Math.round(radius)}:${seed}`;
   return makeGlowTexture(app, key, (g) => {
     const pal = paletteFor(ownerId);

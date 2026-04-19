@@ -3,10 +3,12 @@ import { paletteFor } from '../../util/color.js';
 import { RING_THRESHOLDS, type PlanetType } from '../sim/Planet.js';
 import type { World } from '../sim/World.js';
 import {
+  bakedBodyDiameter,
   makePlanetBodyTexture,
   makePlanetHaloTexture,
   makeShipTexture,
 } from './textures.js';
+import { planetAssetsReady } from './planetAssets.js';
 
 const MAX_ORBITERS = 48;
 const ORBIT_BAND_INNER = 1.55; // × planet radius (outside ring art)
@@ -19,6 +21,13 @@ const RING_GROWTH = 0.28;
 
 /** Cumulative display scale for a given set of filled rings. */
 const scaleForFilled = (filled: number): number => 1 + filled * RING_GROWTH;
+
+/** Map the baked body's pixel diameter back down to the planet's world radius. */
+const computeBodyBaseScale = (radius: number): number => {
+  if (!planetAssetsReady()) return 1; // procedural body already matches radius.
+  const diameter = bakedBodyDiameter(radius);
+  return (radius * 2) / diameter;
+};
 
 interface Orbiter {
   sprite: Sprite;
@@ -45,6 +54,12 @@ interface PlanetView {
   swirlPhase: number;
   /** Eased progress per capacity ring (0..1). */
   ringProgress: number[];
+  /**
+   * Scale that maps the body sprite's pixel diameter to the desired world
+   * radius. Lets us bake at a higher pixel resolution for crispness without
+   * inflating the on-screen size.
+   */
+  bodyBaseScale: number;
 }
 
 export class PlanetLayer extends Container {
@@ -110,6 +125,7 @@ export class PlanetLayer extends Container {
         type: planet.type,
         swirlPhase: Math.random() * Math.PI * 2,
         ringProgress: RING_THRESHOLDS[planet.type].map(() => 0),
+        bodyBaseScale: computeBodyBaseScale(planet.radius),
       });
     }
   }
@@ -124,9 +140,12 @@ export class PlanetLayer extends Container {
       const p = this.world.planets[i];
       const v = this.views[i];
 
-      // Owner change → regenerate body + halo textures.
+      // Owner change → halo re-tints. The body stays as the baked planet map
+      // (ownership is communicated by the halo + rings + orbiters).
       if (p.owner !== v.lastOwner) {
-        v.body.texture = makePlanetBodyTexture(this.app, p.owner, p.radius, p.id);
+        if (!planetAssetsReady()) {
+          v.body.texture = makePlanetBodyTexture(this.app, p.owner, p.radius, p.id);
+        }
         v.halo.texture = makePlanetHaloTexture(this.app, p.owner, p.radius);
         v.halo.tint = paletteFor(p.owner).glow;
         v.lastOwner = p.owner;
@@ -146,7 +165,7 @@ export class PlanetLayer extends Container {
       const swirlWobble = filled > 0 ? 1 + Math.sin(v.swirlPhase) * 0.015 * filled : 1;
 
       const pulse = 1 + p.capturePulse * 0.2;
-      v.body.scale.set(v.displayScale * pulse * swirlWobble);
+      v.body.scale.set(v.bodyBaseScale * v.displayScale * pulse * swirlWobble);
       v.body.rotation = filled > 0 ? Math.sin(v.swirlPhase * 0.5) * 0.08 : 0;
       v.halo.scale.set(v.displayScale * pulse);
 

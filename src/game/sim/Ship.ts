@@ -5,15 +5,39 @@ export interface Ship {
   owner: number;
   x: number;
   y: number;
+  /** Current velocity. Ships keep momentum and steer toward their target. */
+  vx: number;
+  vy: number;
   targetPlanet: number;
   speed: number;
+  /** Max turn rate (radians/sec) — varies per ship for organic arcs. */
+  turnRate: number;
+  /** Lateral wobble amplitude and phase — keeps the swarm flowing. */
+  wobbleAmp: number;
+  wobblePhase: number;
+  /** Seconds since launch; used for wobble and to scale early curvature. */
+  age: number;
+}
+
+export interface SpawnOptions {
+  vx: number;
+  vy: number;
+  turnRate: number;
+  wobbleAmp: number;
+  wobblePhase: number;
 }
 
 export class ShipPool {
   private ships: Ship[] = [];
   private freeList: number[] = [];
 
-  spawn(owner: number, pos: Vec2, targetPlanet: number, speed: number): number {
+  spawn(
+    owner: number,
+    pos: Vec2,
+    targetPlanet: number,
+    speed: number,
+    opts: SpawnOptions,
+  ): number {
     const idx = this.freeList.pop();
     if (idx !== undefined) {
       const s = this.ships[idx];
@@ -21,8 +45,14 @@ export class ShipPool {
       s.owner = owner;
       s.x = pos.x;
       s.y = pos.y;
+      s.vx = opts.vx;
+      s.vy = opts.vy;
       s.targetPlanet = targetPlanet;
       s.speed = speed;
+      s.turnRate = opts.turnRate;
+      s.wobbleAmp = opts.wobbleAmp;
+      s.wobblePhase = opts.wobblePhase;
+      s.age = 0;
       return idx;
     }
     const ship: Ship = {
@@ -30,8 +60,14 @@ export class ShipPool {
       owner,
       x: pos.x,
       y: pos.y,
+      vx: opts.vx,
+      vy: opts.vy,
       targetPlanet,
       speed,
+      turnRate: opts.turnRate,
+      wobbleAmp: opts.wobbleAmp,
+      wobblePhase: opts.wobblePhase,
+      age: 0,
     };
     this.ships.push(ship);
     return this.ships.length - 1;

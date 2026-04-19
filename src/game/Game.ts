@@ -4,6 +4,7 @@ import { Audio } from './audio/Audio.js';
 import { Input } from './input/Input.js';
 import { Selection } from './input/Selection.js';
 import { ORION_MAP } from './maps/orion.js';
+import { loadPlanetAssets } from './render/planetAssets.js';
 import { Renderer } from './render/Renderer.js';
 import { World } from './sim/World.js';
 import { Hud } from '../ui/Hud.js';
@@ -30,6 +31,11 @@ export class Game {
   }
 
   start(): void {
+    // Kick off texture loading immediately so it's likely done by the time
+    // the player clicks "Begin". Failures fall back to procedural textures.
+    loadPlanetAssets().catch((err) => {
+      console.warn('planet texture load failed, falling back to procedural', err);
+    });
     this.showMainMenu();
   }
 
@@ -44,8 +50,15 @@ export class Game {
       [
         {
           label: 'Begin',
-          onClick: () => {
+          onClick: async () => {
             this.audio.unlock();
+            try {
+              // Make sure textures have finished loading so planets render
+              // photographically on the very first frame.
+              await loadPlanetAssets();
+            } catch {
+              // Already logged above; procedural fallback will be used.
+            }
             this.dismissOverlay();
             try {
               this.startMatch();

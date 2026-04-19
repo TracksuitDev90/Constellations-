@@ -1,6 +1,6 @@
 import { Application, Container, Graphics, Sprite, Text, Texture } from 'pixi.js';
 import { paletteFor } from '../../util/color.js';
-import { RING_THRESHOLDS, type PlanetType } from '../sim/Planet.js';
+import { RING_CAPACITY_FOR_SIZE, type PlanetType } from '../sim/Planet.js';
 import type { World } from '../sim/World.js';
 import {
   bakedBodyDiameter,
@@ -16,11 +16,8 @@ const ORBIT_BAND_OUTER = 1.9;
 const ORBIT_SPEED_MIN = 0.5; // rad/s
 const ORBIT_SPEED_MAX = 1.1;
 
-/** Extra scale added per filled ring. */
-const RING_GROWTH = 0.28;
-
-/** Cumulative display scale for a given set of filled rings. */
-const scaleForFilled = (filled: number): number => 1 + filled * RING_GROWTH;
+/** Starting visual scale used when a planet evolves — it pops up from this. */
+const EVOLVE_POP_START = 0.72;
 
 /** Map the baked body's pixel diameter back down to the planet's world radius. */
 const computeBodyBaseScale = (radius: number): number => {
@@ -43,7 +40,8 @@ interface PlanetView {
   halo: Sprite;
   body: Sprite;
   ring: Graphics;
-  rings: Graphics; // capacity rings (type 1 / 2)
+  rings: Graphics; // capacity rings (per-planet ringCount)
+  shockwave: Graphics;
   count: Text;
   orbitRoot: Container;
   orbiters: Orbiter[];
@@ -51,13 +49,13 @@ interface PlanetView {
   displayScale: number;
   baseRadius: number;
   type: PlanetType;
+  ringCount: number;
   swirlPhase: number;
-  /** Eased progress per capacity ring (0..1). */
+  /** Eased progress per ring (0..1). */
   ringProgress: number[];
   /**
    * Scale that maps the body sprite's pixel diameter to the desired world
-   * radius. Lets us bake at a higher pixel resolution for crispness without
-   * inflating the on-screen size.
+   * radius. Rebuilt on size evolution so higher-res textures stay crisp.
    */
   bodyBaseScale: number;
 }
@@ -90,6 +88,7 @@ export class PlanetLayer extends Container {
 
       const ring = new Graphics();
       const rings = new Graphics();
+      const shockwave = new Graphics();
 
       const orbitRoot = new Container();
 
@@ -106,7 +105,7 @@ export class PlanetLayer extends Container {
       });
       count.anchor.set(0.5);
 
-      container.addChild(halo, ring, rings, body, orbitRoot, count);
+      container.addChild(halo, ring, rings, body, orbitRoot, shockwave, count);
       this.addChild(container);
 
       this.views.push({
@@ -116,6 +115,7 @@ export class PlanetLayer extends Container {
         body,
         ring,
         rings,
+        shockwave,
         count,
         orbitRoot,
         orbiters: [],
@@ -123,8 +123,9 @@ export class PlanetLayer extends Container {
         displayScale: 1,
         baseRadius: planet.radius,
         type: planet.type,
+        ringCount: planet.ringCount,
         swirlPhase: Math.random() * Math.PI * 2,
-        ringProgress: RING_THRESHOLDS[planet.type].map(() => 0),
+        ringProgress: new Array(planet.ringCount).fill(0),
         bodyBaseScale: computeBodyBaseScale(planet.radius),
       });
     }
@@ -140,6 +141,19 @@ export class PlanetLayer extends Container {
       const p = this.world.planets[i];
       const v = this.views[i];
 
+      // Evolution: when the planet's size changes, rebake the body texture at
+      // the new radius, reset ring state, and pop the visual scale so the
+      // planet visibly "explodes" into its larger form.
+      if (p.type !== v.type || p.radius !== v.baseRadius) {
+        v.type = p.type;
+        v.baseRadius = p.radius;
+        v.bodyBaseScale = computeBodyBaseScale(p.radius);
+        v.body.texture = makePlanetBodyTexture(this.app, p.owner, p.radius, p.id);
+        v.halo.texture = makePlanetHaloTexture(this.app, p.owner, p.radius);
+        v.displayScale = EVOLVE_POP_START;
+        v.count.style.fontSize = Math.max(13, Math.round(p.radius * 0.7));
+      }
+
       // Owner change → halo re-tints. The body stays as the baked planet map
       // (ownership is communicated by the halo + rings + orbiters).
       if (p.owner !== v.lastOwner) {
@@ -151,22 +165,25 @@ export class PlanetLayer extends Container {
         v.lastOwner = p.owner;
       }
 
-      // Growth: each filled capacity ring grows the planet wider. Partial
-      // progress shows in the ring fill but not in scale until the ring closes.
-      const thresholds = RING_THRESHOLDS[v.type];
-      let filled = 0;
-      for (const t of thresholds) if (p.garrison >= t) filled++;
-      const targetScale = scaleForFilled(filled);
+      // Ring count can change on evolution or capture. Resize the eased
+      // progress array to match the live planet.
+      if (p.ringCount !== v.ringCount) {
+        v.ringCount = p.ringCount;
+        v.ringProgress = new Array(p.ringCount).fill(0);
+      }
+
+      // Ease displayScale back to 1 after an evolution pop.
       const ease = 1 - Math.exp(-dt * 3);
-      v.displayScale += (targetScale - v.displayScale) * ease;
+      v.displayScale += (1 - v.displayScale) * ease;
 
-      // Subtle swirl once any ring is filled.
-      v.swirlPhase += dt * (0.6 + filled * 0.35);
-      const swirlWobble = filled > 0 ? 1 + Math.sin(v.swirlPhase) * 0.015 * filled : 1;
+      // Subtle swirl once the planet has at least one filled-ring fraction.
+      const anyRingActive = v.ringProgress.some((x) => x > 0.001);
+      v.swirlPhase += dt * (0.6 + (anyRingActive ? 0.35 : 0));
+      const swirlWobble = anyRingActive ? 1 + Math.sin(v.swirlPhase) * 0.012 : 1;
 
-      const pulse = 1 + p.capturePulse * 0.2;
+      const pulse = 1 + p.capturePulse * 0.2 + p.evolvePulse * 0.15;
       v.body.scale.set(v.bodyBaseScale * v.displayScale * pulse * swirlWobble);
-      v.body.rotation = filled > 0 ? Math.sin(v.swirlPhase * 0.5) * 0.08 : 0;
+      v.body.rotation = anyRingActive ? Math.sin(v.swirlPhase * 0.5) * 0.06 : 0;
       v.halo.scale.set(v.displayScale * pulse);
 
       // Count readout sits just below the planet.
@@ -175,22 +192,17 @@ export class PlanetLayer extends Container {
 
       const pal = paletteFor(p.owner);
 
-      // Capacity rings (type 1 / 2): thick concentric bands that smoothly
-      // fill with the owner's ring color as garrison accumulates. Not every
-      // planet has rings (type 0 has zero).
+      // Capacity rings: thick concentric bands that smoothly fill with the
+      // owner's ring color as absorbed units accumulate.
       v.rings.clear();
       const RING_WIDTH = Math.max(4, v.baseRadius * 0.35);
       const RING_GAP = Math.max(3, v.baseRadius * 0.12);
       const RING_INSET = Math.max(6, v.baseRadius * 0.22);
-      if (thresholds.length > 0) {
-        let prevThreshold = 0;
-        for (let k = 0; k < thresholds.length; k++) {
-          const cap = thresholds[k];
-          const target = Math.max(
-            0,
-            Math.min(1, (p.garrison - prevThreshold) / (cap - prevThreshold)),
-          );
-          // Smoothly ease the displayed fill so the ring visibly fills up.
+      if (p.ringCount > 0) {
+        const cap = RING_CAPACITY_FOR_SIZE[p.type];
+        for (let k = 0; k < p.ringCount; k++) {
+          const fill = p.ringFillProgress[k] ?? 0;
+          const target = cap > 0 ? Math.max(0, Math.min(1, fill / cap)) : 0;
           const prog = v.ringProgress[k] ?? 0;
           const eased = 1 - Math.exp(-dt * 4);
           v.ringProgress[k] = prog + (target - prog) * eased;
@@ -225,19 +237,16 @@ export class PlanetLayer extends Container {
           if (progress > 0.001) {
             const sweep = Math.PI * 2 * progress;
             const start = -Math.PI / 2;
-            // Outer soft glow under the fill.
             v.rings.arc(0, 0, rMid, start, start + sweep).stroke({
               width: RING_WIDTH + 3,
               color: pal.glow,
               alpha: 0.35,
             });
-            // Core filled band.
             v.rings.arc(0, 0, rMid, start, start + sweep).stroke({
               width: RING_WIDTH - 1,
               color: pal.ring,
               alpha: 0.95,
             });
-            // Bright inner sheen line.
             v.rings.arc(0, 0, rMid - RING_WIDTH * 0.2, start, start + sweep).stroke({
               width: Math.max(1, RING_WIDTH * 0.18),
               color: 0xffffff,
@@ -245,7 +254,6 @@ export class PlanetLayer extends Container {
             });
           }
 
-          // When a ring closes, add a gentle outer pulse.
           if (progress > 0.995) {
             const pulseR = railOuter + 1 + Math.sin(this.time * 3 + k * 0.8) * 1.2;
             v.rings.circle(0, 0, pulseR).stroke({
@@ -254,19 +262,31 @@ export class PlanetLayer extends Container {
               alpha: 0.5,
             });
           }
-
-          prevThreshold = cap;
         }
+      }
+
+      // Evolve shockwave: a fading ring that expands outward past the halo
+      // whenever a planet has just grown to a new tier.
+      v.shockwave.clear();
+      if (p.evolvePulse > 0.01) {
+        const t = 1 - p.evolvePulse; // 0 at spawn → 1 as it fades.
+        const baseR = v.baseRadius * v.displayScale;
+        const shockR = baseR * (1.2 + t * 2.4);
+        const alpha = p.evolvePulse * 0.85;
+        v.shockwave
+          .circle(0, 0, shockR)
+          .stroke({ width: 3 + p.evolvePulse * 4, color: pal.glow, alpha });
+        v.shockwave
+          .circle(0, 0, shockR * 0.72)
+          .stroke({ width: 2, color: pal.ring, alpha: alpha * 0.6 });
       }
 
       // Selection ring (pulsing) sits outside the capacity rings.
       v.ring.clear();
       if (this.selectedSources.has(p.id)) {
         const ringsOuter =
-          thresholds.length > 0
-            ? RING_INSET +
-              thresholds.length * (RING_WIDTH + RING_GAP) -
-              RING_GAP
+          p.ringCount > 0
+            ? RING_INSET + p.ringCount * (RING_WIDTH + RING_GAP) - RING_GAP
             : 8;
         const outer =
           v.baseRadius * v.displayScale +
@@ -281,7 +301,6 @@ export class PlanetLayer extends Container {
         this.syncOrbiters(v, Math.min(p.garrison, MAX_ORBITERS), p.owner);
         this.tickOrbiters(v, dt);
       } else {
-        // Neutral planets: no orbiters; fade out any leftover.
         if (v.orbiters.length > 0) this.clearOrbiters(v);
       }
     }
@@ -290,10 +309,8 @@ export class PlanetLayer extends Container {
   private syncOrbiters(v: PlanetView, target: number, owner: number): void {
     const shipTint = paletteFor(owner).ship;
 
-    // Update tint on existing (in case ownership flipped).
     for (const o of v.orbiters) o.sprite.tint = shipTint;
 
-    // Grow.
     while (v.orbiters.length < target) {
       const sprite = new Sprite(this.shipTex);
       sprite.anchor.set(0.5);
@@ -313,7 +330,6 @@ export class PlanetLayer extends Container {
       });
     }
 
-    // Shrink.
     while (v.orbiters.length > target) {
       const o = v.orbiters.pop()!;
       v.orbitRoot.removeChild(o.sprite);
@@ -328,7 +344,6 @@ export class PlanetLayer extends Container {
       const r = o.radius * scale;
       o.sprite.x = Math.cos(o.angle) * r;
       o.sprite.y = Math.sin(o.angle) * r;
-      // Gentle alpha pulse so the swarm feels alive.
       const a = 0.65 + 0.35 * Math.sin(this.time * 2.2 + o.phase);
       o.sprite.alpha = a;
     }

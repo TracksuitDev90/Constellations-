@@ -1,31 +1,65 @@
 import type { Vec2 } from '../../util/math.js';
 
-/** 0 = Regular (no ring), 1 = Large (1 ring), 2 = Extra Large (2 rings). */
-export type PlanetType = 0 | 1 | 2;
+/**
+ * Planet sizes. A planet evolves up the chain when the last of its rings is
+ * filled with absorbed units (Auralux: Constellations' "explode into a bigger
+ * size" mechanic). XXL is the cap.
+ */
+export type PlanetType = 0 | 1 | 2 | 3; // Small, Large, Extra Large, XXL
 
-/** Per-type ring thresholds. Each entry is the garrison required to fill that ring. */
-export const RING_THRESHOLDS: Record<PlanetType, number[]> = {
-  0: [],
-  1: [20],
-  2: [25, 60],
+/** Authored ring count per planet — independent of size, capped by the size. */
+export type RingCount = 0 | 1 | 2;
+
+/** World-space radius for each size. */
+export const SIZE_RADIUS: Record<PlanetType, number> = {
+  0: 18,
+  1: 26,
+  2: 34,
+  3: 44,
 };
 
-/** Base production rate per type (ships per second at base size, zero rings filled). */
+/** Base production rate (ships/sec) per size. Bigger = meaningfully faster. */
 export const BASE_PRODUCTION: Record<PlanetType, number> = {
   0: 0.8,
-  1: 1.1,
-  2: 1.4,
+  1: 1.3,
+  2: 1.9,
+  3: 2.6,
+};
+
+/** Soft cap on live orbit ships per size. */
+export const BASE_UNIT_CAPACITY: Record<PlanetType, number> = {
+  0: 40,
+  1: 70,
+  2: 110,
+  3: 160,
 };
 
 /**
- * Multiplier on base production once N rings are filled. Lets ringed planets
- * grow into significant powerhouses once a player invests garrison in them —
- * the Auralux Constellations "fill the rings to upgrade" loop.
+ * Absorbed-unit cost to fill one ring, by the planet's *current* size. A ring
+ * on a bigger starting planet costs more — the bigger the leap, the bigger
+ * the investment.
  */
-export const RING_PRODUCTION_BOOST: Record<PlanetType, number[]> = {
-  0: [1],
-  1: [1, 1.9],
-  2: [1, 1.7, 2.8],
+export const RING_CAPACITY_FOR_SIZE: Record<PlanetType, number> = {
+  0: 15, // Small → Large
+  1: 25, // Large → Extra Large (single ring)
+  2: 35, // Extra Large → XXL (2 rings)
+  3: 0, // XXL is terminal.
+};
+
+/** Max ring count the size is allowed to author. */
+export const MAX_RING_COUNT: Record<PlanetType, RingCount> = {
+  0: 1,
+  1: 1,
+  2: 2,
+  3: 0,
+};
+
+/** HP pool per size. Absorb heals before it fills rings. */
+export const BASE_MAX_HEALTH: Record<PlanetType, number> = {
+  0: 3,
+  1: 5,
+  2: 7,
+  3: 10,
 };
 
 export interface Planet {
@@ -38,45 +72,37 @@ export interface Planet {
   productionRate: number;
   productionAcc: number;
   capturePulse: number;
-  /** Highest ring index whose threshold the garrison has crossed (-1 = none). */
-  ringsFilled: number;
+  /** Flash intensity [0..1] on evolution; renderer decays it. */
+  evolvePulse: number;
+  /** Number of unfilled rings this planet carries (0..MAX_RING_COUNT[type]). */
+  ringCount: RingCount;
   /**
-   * Upgrade currency: consumed absorb units accumulate here. When it crosses
-   * `upgradeThreshold`, the planet's productionRate and maxUnitCapacity tick up
-   * permanently.
+   * Per-ring absorbed-unit counter, length == ringCount. Only increases while
+   * the planet is in absorb mode and not healing.
    */
-  storedEnergy: number;
-  upgradeThreshold: number;
-  /** Soft cap on live orbit ship entities. Garrison can exceed this briefly. */
+  ringFillProgress: number[];
   maxUnitCapacity: number;
   /** When true, orbit ships are pulled to the center and consumed on contact. */
   absorbing: boolean;
-  /** Current health for eventual HP-based capture; default matches garrison heuristic. */
+  /** HP for absorb-to-heal routing. */
   health: number;
   maxHealth: number;
 }
 
-/** Default upgrade threshold (absorbed units needed to trigger an upgrade). */
-export const UPGRADE_THRESHOLD = 50;
-
-/** Default max-unit capacity per planet type. Grows on ring/absorb upgrades. */
-export const BASE_UNIT_CAPACITY: Record<PlanetType, number> = {
-  0: 40,
-  1: 60,
-  2: 80,
+/** True when the planet has rings and every one is at capacity. */
+export const ringsComplete = (planet: Planet): boolean => {
+  if (planet.ringCount === 0) return false;
+  const cap = RING_CAPACITY_FOR_SIZE[planet.type];
+  for (let i = 0; i < planet.ringCount; i++) {
+    if ((planet.ringFillProgress[i] ?? 0) < cap) return false;
+  }
+  return true;
 };
 
-/** Count how many of this planet's ring thresholds are met by current garrison. */
-export const filledRingCount = (planet: Planet): number => {
-  const thresholds = RING_THRESHOLDS[planet.type];
-  let n = 0;
-  for (const t of thresholds) if (planet.garrison >= t) n++;
-  return n;
-};
-
-/** Production-rate multiplier reflecting how many rings are currently filled. */
-export const productionMultiplier = (planet: Planet): number => {
-  const table = RING_PRODUCTION_BOOST[planet.type];
-  const filled = Math.min(filledRingCount(planet), table.length - 1);
-  return table[filled];
+/** Clamp an authored ring count to the size's allowed max. */
+export const clampRingCount = (type: PlanetType, want: number): RingCount => {
+  const max = MAX_RING_COUNT[type];
+  if (want <= 0) return 0;
+  if (want >= max) return max;
+  return want as RingCount;
 };

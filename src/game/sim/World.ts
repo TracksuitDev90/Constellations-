@@ -1,4 +1,4 @@
-import { dist, norm, sub, vec, type Vec2 } from '../../util/math.js';
+import { dist, vec, type Vec2 } from '../../util/math.js';
 import { BASE_PRODUCTION, type Planet, type PlanetType } from './Planet.js';
 import type { Player } from './Player.js';
 import { ShipPool } from './Ship.js';
@@ -24,7 +24,14 @@ export interface WorldEvents {
 }
 
 export const SHIP_SPEED = 48;
-export const DEFAULT_EMIT_INTERVAL = 0.12;
+/**
+ * Interval between successive ships in a wave. Kept short on purpose —
+ * Auralux releases the selected ships as a quick burst rather than a
+ * continuous trickle, so a batch of ~20 drains in well under a second.
+ */
+export const DEFAULT_EMIT_INTERVAL = 0.035;
+/** Max random exit-cone angle, in radians, around the direct line to target. */
+const EXIT_CONE = Math.PI / 3; // ±60°
 
 export class World {
   players: Player[];
@@ -170,12 +177,34 @@ export class World {
         src.garrison -= 1;
         s.remaining -= 1;
         const tgt = this.planets[s.target];
-        const dir = norm(sub(tgt.pos, src.pos));
+        const dirX = tgt.pos.x - src.pos.x;
+        const dirY = tgt.pos.y - src.pos.y;
+        const baseAngle = Math.atan2(dirY, dirX);
+
+        // Random exit angle inside a wide cone facing the target — keeps
+        // departures organic instead of all single-file.
+        const exitAngle = baseAngle + (Math.random() - 0.5) * EXIT_CONE;
+        const exitR = src.radius + 2 + Math.random() * (src.radius * 0.25);
         const spawnPos = vec(
-          src.pos.x + dir.x * (src.radius + 2),
-          src.pos.y + dir.y * (src.radius + 2),
+          src.pos.x + Math.cos(exitAngle) * exitR,
+          src.pos.y + Math.sin(exitAngle) * exitR,
         );
-        this.ships.spawn(s.owner, spawnPos, s.target, SHIP_SPEED);
+
+        // Initial heading: blends the exit angle with the direct line so
+        // ships immediately curve back toward the target rather than
+        // launching straight outward.
+        const headingAngle = baseAngle + (exitAngle - baseAngle) * 0.55;
+        const turnRate = 1.4 + Math.random() * 1.6; // rad/sec
+        const wobbleAmp = (Math.random() - 0.5) * 0.6; // signed lateral push
+        const wobblePhase = Math.random() * Math.PI * 2;
+
+        this.ships.spawn(s.owner, spawnPos, s.target, SHIP_SPEED, {
+          vx: Math.cos(headingAngle) * SHIP_SPEED,
+          vy: Math.sin(headingAngle) * SHIP_SPEED,
+          turnRate,
+          wobbleAmp,
+          wobblePhase,
+        });
         this.events.onShipLaunch?.(s.owner);
       }
     }
@@ -185,21 +214,52 @@ export class World {
       (s) => s.remaining > 0 && this.planets[s.source].owner === s.owner,
     );
 
-    // Ship movement + arrival
+    // Ship movement + arrival.
+    // Each ship steers its velocity toward the target with a per-ship turn
+    // rate, plus a sinusoidal lateral wobble that fades as it nears the
+    // planet — together these give the swarm a flowing, non-linear look
+    // without any ship missing the target.
     const ships = this.ships.all;
     for (let i = 0; i < ships.length; i++) {
       const ship = ships[i];
       if (!ship.active) continue;
+      ship.age += dt;
       const tgt = this.planets[ship.targetPlanet];
       const dx = tgt.pos.x - ship.x;
       const dy = tgt.pos.y - ship.y;
       const d = Math.hypot(dx, dy);
+      if (d <= tgt.radius + 1) {
+        this.arrive(i, tgt);
+        continue;
+      }
+
+      // Steer current heading toward desired heading.
+      const desired = Math.atan2(dy, dx);
+      const current = Math.atan2(ship.vy, ship.vx);
+      let delta = desired - current;
+      // Wrap to [-PI, PI].
+      if (delta > Math.PI) delta -= Math.PI * 2;
+      else if (delta < -Math.PI) delta += Math.PI * 2;
+      const maxTurn = ship.turnRate * dt;
+      const turn = Math.max(-maxTurn, Math.min(maxTurn, delta));
+      let newAng = current + turn;
+
+      // Lateral wobble — a perpendicular nudge that decays near the target,
+      // so ships meander mid-flight but settle on a clean approach.
+      const approachFalloff = Math.min(1, d / 80);
+      const wobble =
+        Math.sin(this.time * 3.2 + ship.wobblePhase) * ship.wobbleAmp * approachFalloff;
+      newAng += wobble * dt * 4;
+
+      ship.vx = Math.cos(newAng) * ship.speed;
+      ship.vy = Math.sin(newAng) * ship.speed;
+
       const step = ship.speed * dt;
-      if (d <= tgt.radius + 1 || step >= d) {
+      if (step >= d) {
         this.arrive(i, tgt);
       } else {
-        ship.x += (dx / d) * step;
-        ship.y += (dy / d) * step;
+        ship.x += ship.vx * dt;
+        ship.y += ship.vy * dt;
       }
     }
 

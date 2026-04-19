@@ -54,7 +54,21 @@ export type PlanetArchetype =
   | 'gasGiant'
   | 'icy'
   | 'molten'
-  | 'alien';
+  | 'alien'
+  | 'crystalline'
+  | 'nebulaCore'
+  | 'bioOrganic';
+
+/**
+ * Procedural-only archetypes have no baked equirectangular source — they're
+ * always rendered through the procedural draw functions, so even when the
+ * photographic asset set is loaded, these planets stay visibly alien.
+ */
+export const PROCEDURAL_ONLY: ReadonlySet<PlanetArchetype> = new Set([
+  'crystalline',
+  'nebulaCore',
+  'bioOrganic',
+]);
 
 /**
  * How large (in pixels) the baked sphere texture is for a given planet radius.
@@ -63,7 +77,11 @@ export type PlanetArchetype =
 export const bakedBodyDiameter = (radius: number): number =>
   Math.max(128, Math.round(radius * 3));
 
-/** Pick a stable archetype from a planet's seed. */
+/**
+ * Pick a stable archetype from a planet's seed. Photographic archetypes share
+ * the rotation with three additional procedural-only "alien" looks, so a
+ * meaningful slice of the constellation feels otherworldly.
+ */
 export const archetypeForSeed = (seed: number): PlanetArchetype => {
   const h = Math.abs(Math.imul(seed + 0x9e3779b9, 2654435761)) >>> 0;
   const list: PlanetArchetype[] = [
@@ -72,6 +90,9 @@ export const archetypeForSeed = (seed: number): PlanetArchetype => {
     'icy',
     'molten',
     'alien',
+    'crystalline',
+    'nebulaCore',
+    'bioOrganic',
   ];
   return list[h % list.length];
 };
@@ -89,10 +110,12 @@ export const makePlanetBodyTexture = (
 ): Texture => {
   const archetype = archetypeForSeed(seed);
 
-  // Prefer the baked photographic sphere when the asset set is available.
+  // Prefer the baked photographic sphere when the asset set is available —
+  // unless this is a procedural-only archetype (the alien variants), which
+  // intentionally stay graphics-drawn for an otherworldly look.
   // The baked texture does not depend on ownerId, so ownership is carried
   // by the halo/rings/orbiters around the planet.
-  if (planetAssetsReady()) {
+  if (planetAssetsReady() && !PROCEDURAL_ONLY.has(archetype)) {
     // Bake larger than the sim radius for crisper pixels under zoom. The
     // PlanetLayer scales the sprite down via `bodyBaseScale` so the visible
     // sphere radius still matches `radius`.
@@ -159,6 +182,12 @@ const drawArchetype = (
       return drawMolten(g, cx, cy, r, core, rng);
     case 'alien':
       return drawAlien(g, cx, cy, r, core, rng);
+    case 'crystalline':
+      return drawCrystalline(g, cx, cy, r, core, rng);
+    case 'nebulaCore':
+      return drawNebulaCore(g, cx, cy, r, core, rng);
+    case 'bioOrganic':
+      return drawBioOrganic(g, cx, cy, r, core, rng);
   }
 };
 
@@ -476,6 +505,189 @@ const drawAlien = (
     g.circle(px, py, pr * 1.4).fill({ color, alpha: 0.12 });
     g.circle(px, py, pr).fill({ color, alpha: 0.55 });
     g.circle(px, py, pr * 0.55).fill({ color: 0xffffff, alpha: 0.4 });
+  }
+};
+
+// ─── Crystalline: prismatic shards on a glassy surface ────────────────────
+const drawCrystalline = (
+  g: Graphics,
+  cx: number,
+  cy: number,
+  r: number,
+  core: number,
+  rng: Rng,
+): void => {
+  const base = toward(core, 0x0a1e3a, 0.3);
+  const dark = toward(base, 0x000016, 0.7);
+  const lit = toward(core, 0x9be8ff, 0.55);
+  drawLitSphere(g, cx, cy, r, dark, base, lit);
+
+  // Sharp prismatic facets — triangular slivers radiating from random anchors.
+  const facetTints = [0x9be8ff, 0xff8be0, 0xc8a0ff, 0xa0ffd8];
+  const facets = 14 + Math.floor(rng() * 8);
+  for (let i = 0; i < facets; i++) {
+    const a = rng() * Math.PI * 2;
+    const d = rng() * r * 0.7;
+    const px = cx + Math.cos(a) * d;
+    const py = cy + Math.sin(a) * d;
+    const len = r * (0.18 + rng() * 0.32);
+    const wid = r * (0.04 + rng() * 0.08);
+    const ang = rng() * Math.PI * 2;
+    const tint = toward(core, facetTints[Math.floor(rng() * facetTints.length)], 0.55);
+    // Drape the shard inside the disc with a four-point polygon.
+    const tip = { x: px + Math.cos(ang) * len, y: py + Math.sin(ang) * len };
+    const tail = { x: px - Math.cos(ang) * len * 0.3, y: py - Math.sin(ang) * len * 0.3 };
+    const nx = -Math.sin(ang) * wid;
+    const ny = Math.cos(ang) * wid;
+    if (Math.hypot(tip.x - cx, tip.y - cy) > r * 0.95) continue;
+    g.poly([
+      tip.x, tip.y,
+      px + nx, py + ny,
+      tail.x, tail.y,
+      px - nx, py - ny,
+    ]).fill({ color: tint, alpha: 0.55 });
+    // Bright sheen along one edge.
+    g.moveTo(tail.x, tail.y).lineTo(tip.x, tip.y).stroke({
+      width: Math.max(1, r * 0.02),
+      color: 0xffffff,
+      alpha: 0.6,
+    });
+  }
+
+  // Faint hex-grid hint for an artificial feel.
+  for (let i = 0; i < 6; i++) {
+    const a = rng() * Math.PI * 2;
+    const d = rng() * r * 0.6;
+    const px = cx + Math.cos(a) * d;
+    const py = cy + Math.sin(a) * d;
+    const hr = r * (0.06 + rng() * 0.05);
+    if (Math.hypot(px - cx, py - cy) + hr > r * 0.92) continue;
+    g.regularPoly(px, py, hr, 6).stroke({
+      width: Math.max(0.6, r * 0.012),
+      color: 0xc8e8ff,
+      alpha: 0.4,
+    });
+  }
+};
+
+// ─── NebulaCore: a dim world wreathed in violet/teal nebular gas ───────────
+const drawNebulaCore = (
+  g: Graphics,
+  cx: number,
+  cy: number,
+  r: number,
+  core: number,
+  rng: Rng,
+): void => {
+  const base = toward(core, 0x1c0830, 0.4);
+  const dark = toward(base, 0x000010, 0.65);
+  const lit = toward(core, 0x70d0ff, 0.45);
+  drawLitSphere(g, cx, cy, r, dark, base, lit);
+
+  // Layered gas wisps — large translucent ellipses overlapping in two hues.
+  const wisps = 10 + Math.floor(rng() * 6);
+  for (let i = 0; i < wisps; i++) {
+    const a = rng() * Math.PI * 2;
+    const d = rng() * r * 0.5;
+    const px = cx + Math.cos(a) * d;
+    const py = cy + Math.sin(a) * d;
+    const rx = r * (0.35 + rng() * 0.45);
+    const ry = r * (0.12 + rng() * 0.22);
+    const hue = rng() < 0.55
+      ? toward(core, 0xa040ff, 0.55)
+      : toward(core, 0x40e0ff, 0.5);
+    g.ellipse(px, py, rx, ry).fill({ color: hue, alpha: 0.18 + rng() * 0.18 });
+  }
+
+  // Bright pin-prick "stars" embedded in the nebula.
+  const stars = 12 + Math.floor(rng() * 8);
+  for (let i = 0; i < stars; i++) {
+    const a = rng() * Math.PI * 2;
+    const d = rng() * r * 0.85;
+    const px = cx + Math.cos(a) * d;
+    const py = cy + Math.sin(a) * d;
+    if (Math.hypot(px - cx, py - cy) > r * 0.92) continue;
+    const sr = r * (0.012 + rng() * 0.025);
+    g.circle(px, py, sr * 2.2).fill({ color: 0xffffff, alpha: 0.18 });
+    g.circle(px, py, sr).fill({ color: 0xffffff, alpha: 0.95 });
+  }
+
+  // A glowing core spot — the planet's heart bleeding through the gas.
+  const heartR = r * (0.12 + rng() * 0.06);
+  const heartX = cx + (rng() - 0.5) * r * 0.2;
+  const heartY = cy + (rng() - 0.5) * r * 0.2;
+  g.circle(heartX, heartY, heartR * 1.8).fill({ color: 0xff80c0, alpha: 0.18 });
+  g.circle(heartX, heartY, heartR).fill({ color: 0xffd0f0, alpha: 0.7 });
+};
+
+// ─── BioOrganic: cell-like patches with glowing nodes and veins ────────────
+const drawBioOrganic = (
+  g: Graphics,
+  cx: number,
+  cy: number,
+  r: number,
+  core: number,
+  rng: Rng,
+): void => {
+  const base = toward(core, 0x1a3a18, 0.4);
+  const dark = toward(base, 0x05100a, 0.6);
+  const lit = toward(core, 0xc0ffa0, 0.45);
+  drawLitSphere(g, cx, cy, r, dark, base, lit);
+
+  // Cell-like patches — overlapping irregular blobs in mossy/bile colors.
+  const cells = 8 + Math.floor(rng() * 5);
+  for (let i = 0; i < cells; i++) {
+    const a = rng() * Math.PI * 2;
+    const d = rng() * r * 0.55;
+    const bx = cx + Math.cos(a) * d;
+    const by = cy + Math.sin(a) * d;
+    const cellR = r * (0.18 + rng() * 0.18);
+    if (Math.hypot(bx - cx, by - cy) + cellR > r * 0.92) continue;
+    const tint = rng() < 0.5
+      ? toward(core, 0x4d8a30, 0.55)
+      : toward(core, 0x6a3a78, 0.5);
+    g.circle(bx, by, cellR).fill({ color: tint, alpha: 0.5 });
+    // Darker outline lobe.
+    g.circle(bx + (rng() - 0.5) * cellR * 0.4, by + (rng() - 0.5) * cellR * 0.4, cellR * 0.7)
+      .fill({ color: toward(tint, 0x000000, 0.35), alpha: 0.3 });
+  }
+
+  // Bright bioluminescent nodes scattered across the surface.
+  const nodes = 8 + Math.floor(rng() * 6);
+  for (let i = 0; i < nodes; i++) {
+    const a = rng() * Math.PI * 2;
+    const d = rng() * r * 0.7;
+    const px = cx + Math.cos(a) * d;
+    const py = cy + Math.sin(a) * d;
+    const nr = r * (0.04 + rng() * 0.06);
+    if (Math.hypot(px - cx, py - cy) + nr > r * 0.92) continue;
+    const glow = rng() < 0.5 ? 0xa8ff60 : 0x60fff0;
+    g.circle(px, py, nr * 2.2).fill({ color: glow, alpha: 0.18 });
+    g.circle(px, py, nr).fill({ color: glow, alpha: 0.85 });
+    g.circle(px, py, nr * 0.45).fill({ color: 0xffffff, alpha: 0.7 });
+  }
+
+  // Vein-like curves across the surface for an organic feel.
+  const veins = 5 + Math.floor(rng() * 4);
+  const veinColor = toward(core, 0x60ffaa, 0.55);
+  for (let i = 0; i < veins; i++) {
+    const a0 = rng() * Math.PI * 2;
+    const a1 = a0 + (rng() - 0.5) * 1.4;
+    const r0 = r * (0.2 + rng() * 0.55);
+    const r1 = r * (0.2 + rng() * 0.55);
+    const x0 = cx + Math.cos(a0) * r0;
+    const y0 = cy + Math.sin(a0) * r0;
+    const x1 = cx + Math.cos(a1) * r1;
+    const y1 = cy + Math.sin(a1) * r1;
+    const mx = (x0 + x1) / 2 + (rng() - 0.5) * r * 0.25;
+    const my = (y0 + y1) / 2 + (rng() - 0.5) * r * 0.25;
+    g.moveTo(x0, y0)
+      .quadraticCurveTo(mx, my, x1, y1)
+      .stroke({
+        width: Math.max(0.8, r * 0.022),
+        color: veinColor,
+        alpha: 0.45,
+      });
   }
 };
 

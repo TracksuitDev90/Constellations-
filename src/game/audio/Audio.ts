@@ -3,12 +3,38 @@
  * all sounds are synthesized from oscillators and noise. Keeps the bundle
  * small and avoids IP concerns with sample licensing.
  */
+/**
+ * Diatonic pentatonic-ish ladder used for arrival chimes. Picking from a
+ * fixed scale guarantees overlapping pings sound musical rather than dissonant.
+ */
+const FRIENDLY_LADDER = [
+  523.25, // C5
+  587.33, // D5
+  659.25, // E5
+  783.99, // G5
+  880.0,  // A5
+  1046.5, // C6
+  1318.5, // E6
+  1567.98, // G6
+];
+
+const ABSORB_LADDER = [
+  329.63, // E4
+  293.66, // D4
+  261.63, // C4
+  220.0,  // A3
+  196.0,  // G3
+];
+
 export class Audio {
   private ctx: AudioContext | null = null;
   private musicGain: GainNode | null = null;
   private sfxGain: GainNode | null = null;
   private musicStarted = false;
   private lastLaunchAt = 0;
+  /** Per-planet throttle so a flood of arrivals doesn't drown out the ambient. */
+  private lastArriveAt = new Map<number, number>();
+  private lastRingFillAt = 0;
   muted = false;
   musicVolume = 0.35;
   sfxVolume = 0.45;
@@ -111,6 +137,76 @@ export class Audio {
       osc.connect(g).connect(this.sfxGain);
       osc.start(start);
       osc.stop(start + 0.65);
+    }
+  }
+
+  /**
+   * Play a soft chime as a ship lands. `friendly` arrivals ascend up a major
+   * pentatonic scale; absorbed ships (chipping at an enemy garrison) descend
+   * a minor-leaning scale. Per-planet throttling keeps things musical when a
+   * whole wave of ships arrives at once.
+   */
+  shipArrival(planetId: number, friendly: boolean, fillProgress = 0): void {
+    if (!this.ctx || !this.sfxGain || this.muted) return;
+    const now = this.ctx.currentTime;
+    const last = this.lastArriveAt.get(planetId) ?? 0;
+    const minGap = friendly ? 0.07 : 0.09;
+    if (now - last < minGap) return;
+    this.lastArriveAt.set(planetId, now);
+
+    const ladder = friendly ? FRIENDLY_LADDER : ABSORB_LADDER;
+    // fillProgress (0..1) advances the ladder so a planet that's growing
+    // sounds visibly ascending; outside that the planet's id seeds the index
+    // so each planet has its own characteristic chime.
+    const seed = friendly
+      ? Math.floor(fillProgress * (ladder.length - 1) + (planetId * 3) % 3)
+      : Math.floor(((planetId * 7) + (1 - fillProgress) * (ladder.length - 1)) % ladder.length);
+    const idx = Math.max(0, Math.min(ladder.length - 1, seed));
+    const freq = ladder[idx];
+
+    const osc = this.ctx.createOscillator();
+    osc.type = friendly ? 'sine' : 'triangle';
+    osc.frequency.value = freq;
+
+    const g = this.ctx.createGain();
+    const peak = friendly ? 0.07 : 0.05;
+    const dur = friendly ? 0.32 : 0.28;
+    g.gain.setValueAtTime(0.0001, now);
+    g.gain.exponentialRampToValueAtTime(peak, now + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    osc.connect(g).connect(this.sfxGain);
+    osc.start(now);
+    osc.stop(now + dur + 0.05);
+  }
+
+  /**
+   * Resonant bell when a planet's capacity ring fills — marks the moment a
+   * planet "upgrades" and starts producing faster.
+   */
+  ringFilled(ringIndex: number): void {
+    if (!this.ctx || !this.sfxGain || this.muted) return;
+    const now = this.ctx.currentTime;
+    if (now - this.lastRingFillAt < 0.08) return;
+    this.lastRingFillAt = now;
+
+    // Two-note bell: a fundamental + a perfect fifth above, brighter for
+    // higher rings.
+    const base = ringIndex === 0 ? 523.25 : 659.25; // C5 or E5
+    const fifth = base * 1.5;
+    const partials = [base, fifth, base * 2];
+    for (let i = 0; i < partials.length; i++) {
+      const osc = this.ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = partials[i];
+      const g = this.ctx.createGain();
+      const start = now + i * 0.012;
+      const peak = 0.18 / (i + 1);
+      g.gain.setValueAtTime(0.0001, start);
+      g.gain.exponentialRampToValueAtTime(peak, start + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, start + 0.9);
+      osc.connect(g).connect(this.sfxGain);
+      osc.start(start);
+      osc.stop(start + 0.95);
     }
   }
 

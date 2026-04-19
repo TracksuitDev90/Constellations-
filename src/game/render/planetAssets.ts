@@ -10,9 +10,13 @@
  * Jim Hastings-Trew's Planet Pixel Emporium. See public/textures/CREDITS.md.
  */
 import { Texture } from 'pixi.js';
-import type { PlanetArchetype } from './textures.js';
+import { PROCEDURAL_ONLY, type PlanetArchetype } from './textures.js';
 
-const TEXTURE_PATHS: Record<PlanetArchetype, string> = {
+/**
+ * Source equirectangular maps for archetypes that have photographic textures.
+ * Procedural-only archetypes (alien variants) deliberately have no entry here.
+ */
+const TEXTURE_PATHS: Partial<Record<PlanetArchetype, string>> = {
   terrestrial: 'textures/terrestrial.jpg',
   gasGiant: 'textures/gasgiant.jpg',
   icy: 'textures/icy.jpg',
@@ -41,6 +45,7 @@ export const loadPlanetAssets = (): Promise<void> => {
   if (loadPromise) return loadPromise;
   loadPromise = (async () => {
     const entries = Object.entries(TEXTURE_PATHS) as Array<[PlanetArchetype, string]>;
+    const baked = entries.length;
     await Promise.all(
       entries.map(async ([arch, path]) => {
         const img = await loadImage(resolveAsset(path));
@@ -58,9 +63,12 @@ export const loadPlanetAssets = (): Promise<void> => {
         });
       }),
     );
+    bakedSourceCount = baked;
   })();
   return loadPromise;
 };
+
+let bakedSourceCount = 0;
 
 const loadImage = (src: string): Promise<HTMLImageElement> =>
   new Promise((resolve, reject) => {
@@ -70,9 +78,13 @@ const loadImage = (src: string): Promise<HTMLImageElement> =>
     img.src = src;
   });
 
-/** True once every archetype's source bitmap has been sampled into memory. */
+/** True once every photographic archetype's source bitmap has been sampled. */
 export const planetAssetsReady = (): boolean =>
-  sources.size === Object.keys(TEXTURE_PATHS).length;
+  bakedSourceCount > 0 && sources.size === bakedSourceCount;
+
+/** Whether a particular archetype has a baked photographic source. */
+export const hasBakedSource = (archetype: PlanetArchetype): boolean =>
+  !PROCEDURAL_ONLY.has(archetype) && sources.has(archetype);
 
 /**
  * Bake a lit, sphere-projected disc for the given archetype. Seed picks a

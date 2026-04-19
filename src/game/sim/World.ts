@@ -1,5 +1,11 @@
 import { dist, vec, type Vec2 } from '../../util/math.js';
-import { BASE_PRODUCTION, type Planet, type PlanetType } from './Planet.js';
+import {
+  BASE_PRODUCTION,
+  filledRingCount,
+  productionMultiplier,
+  type Planet,
+  type PlanetType,
+} from './Planet.js';
 import type { Player } from './Player.js';
 import { ShipPool } from './Ship.js';
 import { createStream, type ShipStream } from './Stream.js';
@@ -20,6 +26,10 @@ export interface MapSpec {
 export interface WorldEvents {
   onShipLaunch?: (owner: number) => void;
   onPlanetCapture?: (planetId: number, newOwner: number) => void;
+  /** Fired when a ship lands. `friendly` = arrived at an owned planet. */
+  onShipArrive?: (planetId: number, owner: number, friendly: boolean) => void;
+  /** Fired when garrison crosses a new ring threshold (or a ring opens up). */
+  onRingFilled?: (planetId: number, ringIndex: number, owner: number) => void;
   onGameOver?: (winner: number | null) => void;
 }
 
@@ -55,7 +65,7 @@ export class World {
     this.events = events;
     this.planets = map.planets.map((p, i) => {
       const type: PlanetType = p.type ?? 0;
-      return {
+      const planet: Planet = {
         id: i,
         pos: { ...p.pos },
         radius: p.radius,
@@ -65,7 +75,10 @@ export class World {
         productionRate: BASE_PRODUCTION[type],
         productionAcc: 0,
         capturePulse: 0,
+        ringsFilled: 0,
       };
+      planet.ringsFilled = filledRingCount(planet);
+      return planet;
     });
     this.edges = new Set();
     this.neighbors = new Map();
@@ -153,14 +166,18 @@ export class World {
     if (this.gameOver) return;
     this.time += dt;
 
-    // Production
+    // Production. Output scales by how many of the planet's capacity rings are
+    // currently filled — this is the Auralux Constellations growth loop, where
+    // investing garrison in a ringed planet upgrades it into a faster source.
     for (const p of this.planets) {
       if (p.capturePulse > 0) p.capturePulse = Math.max(0, p.capturePulse - dt);
       if (p.owner === null) continue;
-      p.productionAcc += p.productionRate * dt;
+      const mult = productionMultiplier(p);
+      p.productionAcc += p.productionRate * mult * dt;
       while (p.productionAcc >= 1) {
         p.productionAcc -= 1;
         p.garrison += 1;
+        this.notifyRingChange(p);
       }
     }
 
@@ -268,7 +285,8 @@ export class World {
 
   private arrive(shipIdx: number, planet: Planet): void {
     const ship = this.ships.get(shipIdx);
-    if (planet.owner === ship.owner) {
+    const friendly = planet.owner === ship.owner;
+    if (friendly) {
       planet.garrison += 1;
     } else {
       planet.garrison -= 1;
@@ -276,10 +294,32 @@ export class World {
         planet.owner = ship.owner;
         planet.garrison = 1;
         planet.capturePulse = 0.6;
+        planet.ringsFilled = 0;
         this.events.onPlanetCapture?.(planet.id, ship.owner);
       }
     }
+    this.events.onShipArrive?.(planet.id, ship.owner, friendly);
+    this.notifyRingChange(planet);
     this.ships.kill(shipIdx);
+  }
+
+  /**
+   * Detect ring threshold crossings (in either direction) and notify listeners.
+   * Crossing a threshold upward is an "upgrade" moment — the visible ring fills
+   * and production multiplies.
+   */
+  private notifyRingChange(planet: Planet): void {
+    if (planet.owner === null) {
+      planet.ringsFilled = 0;
+      return;
+    }
+    const filled = filledRingCount(planet);
+    if (filled > planet.ringsFilled) {
+      for (let k = planet.ringsFilled; k < filled; k++) {
+        this.events.onRingFilled?.(planet.id, k, planet.owner);
+      }
+    }
+    planet.ringsFilled = filled;
   }
 
   private checkGameOver(): void {

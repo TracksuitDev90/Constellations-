@@ -25,6 +25,8 @@ export class Game {
   private accumulator = 0;
   private paused = false;
   private activeOverlay: HTMLDivElement | null = null;
+  /** Most recent (planetId, timestamp) for simple double-tap detection. */
+  private lastTap: { planetId: number; time: number } | null = null;
 
   constructor(app: Application, ui: HTMLElement) {
     this.app = app;
@@ -132,11 +134,26 @@ export class Game {
     new Input(this.app.canvas as unknown as HTMLCanvasElement, this.renderer, this.world, {
       tapPlanet: (id) => {
         const p = this.world.planets[id];
+        const now = performance.now();
         if (p.owner === 0) {
-          // Tapping an owned planet selects only it (replaces any prior selection).
-          this.selection.set(id);
+          // Double-tap a friendly planet → toggle absorb mode (heal / upgrade).
+          const isDouble =
+            this.lastTap !== null &&
+            this.lastTap.planetId === id &&
+            now - this.lastTap.time < 350;
+          if (isDouble) {
+            this.world.triggerAbsorb(id, 0, !p.absorbing);
+            this.lastTap = null;
+          } else {
+            // Tapping an owned planet selects only it (replaces any prior selection).
+            this.selection.set(id);
+            this.lastTap = { planetId: id, time: now };
+          }
         } else if (this.selection.ids.size > 0) {
           this.selection.routeTo(id);
+          this.lastTap = { planetId: id, time: now };
+        } else {
+          this.lastTap = { planetId: id, time: now };
         }
       },
       tapEmpty: () => this.selection.clear(),
@@ -182,6 +199,16 @@ export class Game {
       this.selection.selectAllOwned();
     } else if (e.key === 'Escape') {
       this.selection.clear();
+      // Also cancel any in-progress absorb so Escape is a universal "stop".
+      for (const p of this.world.planets) {
+        if (p.owner === 0 && p.absorbing) this.world.triggerAbsorb(p.id, 0, false);
+      }
+    } else if (e.key === 'f' || e.key === 'F') {
+      // Keyboard shortcut: toggle absorb on every selected friendly planet.
+      for (const id of this.selection.ids) {
+        const p = this.world.planets[id];
+        if (p.owner === 0) this.world.triggerAbsorb(id, 0, !p.absorbing);
+      }
     } else if (e.key === ' ') {
       e.preventDefault();
       this.paused = !this.paused;

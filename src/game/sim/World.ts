@@ -119,9 +119,15 @@ export class World {
   }
 
   /**
-   * Send a one-shot wave of ships from source -> target along constellation edges.
-   * If `count` is omitted, the entire current garrison of the source is launched.
-   * Streams no longer auto-refill from production — callers must tap/drag again.
+   * Open a stream of ships from source -> target along constellation edges.
+   *
+   * Semantics:
+   * - If `count` is undefined, the stream is *continuous* — it keeps emitting
+   *   whatever the source produces until the source is retargeted, cancelled,
+   *   or lost. This matches the Auralux feel where selecting a planet and
+   *   tapping a target makes it flow indefinitely.
+   * - If `count` is a number, it's a bounded one-shot wave (used by the AI
+   *   so it can commit exactly N ships and walk away).
    */
   openStream(owner: number, source: number, target: number, count?: number): void {
     if (source === target) return;
@@ -130,12 +136,31 @@ export class World {
     const path = this.findPath(source, target);
     if (path.length < 2) return;
     const nextHop = path[1];
-    const remaining = count === undefined ? src.garrison : Math.min(count, src.garrison);
+    const remaining =
+      count === undefined ? Number.POSITIVE_INFINITY : Math.min(count, src.garrison);
     if (remaining <= 0) return;
     this.cancelStreamsFrom(source, owner);
     this.streams.push(createStream(owner, source, nextHop, DEFAULT_EMIT_INTERVAL, remaining));
     if (nextHop !== target) {
       this.queueDownstream(owner, path, remaining);
+    }
+    // Redirect any in-flight ships that came from this source to the new target.
+    // Matches Auralux Constellations: retapping a new target curves the whole
+    // wave mid-flight rather than making you wait for the next batch.
+    this.redirectInFlight(owner, source, nextHop);
+  }
+
+  /**
+   * Retarget every active transit ship owned by `owner` whose sourcePlanet
+   * matches `source`. Used when the player retargets a selected planet's stream.
+   */
+  private redirectInFlight(owner: number, source: number, newTarget: number): void {
+    const ships = this.ships.all;
+    for (const ship of ships) {
+      if (!ship.active || ship.owner !== owner) continue;
+      if (ship.state !== 'transit') continue;
+      if (ship.sourcePlanet !== source) continue;
+      ship.targetPlanet = newTarget;
     }
   }
 
@@ -211,11 +236,13 @@ export class World {
       if (!s.active || !s.isSelected || s.owner !== owner) continue;
       if (s.state !== 'orbiting' && s.state !== 'transit') continue;
       // Break orbit: decrement parent garrison so accounting stays consistent.
+      // Also remember the source so future retargets can redirect this ship.
       if (s.state === 'orbiting' && s.parentPlanet >= 0) {
         const parent = this.planets[s.parentPlanet];
         if (parent && parent.owner === owner && parent.garrison > 0) {
           parent.garrison -= 1;
         }
+        s.sourcePlanet = s.parentPlanet;
       }
       s.state = 'transit';
       s.parentPlanet = -1;
@@ -327,6 +354,7 @@ export class World {
     if (orbiterIdx >= 0) {
       const ship = this.ships.get(orbiterIdx);
       ship.state = 'transit';
+      ship.sourcePlanet = src.id;
       ship.parentPlanet = -1;
       ship.targetPlanet = stream.target;
       ship.age = 0;
@@ -362,6 +390,7 @@ export class World {
       wobbleAmp: (Math.random() - 0.5) * 0.6,
       wobblePhase: Math.random() * Math.PI * 2,
       state: 'transit',
+      sourcePlanet: src.id,
     });
     this.events.onShipLaunch?.(stream.owner);
   }
@@ -592,6 +621,7 @@ export class World {
       if (this.countOrbitersOf(planet.id) < planet.maxUnitCapacity) {
         ship.state = 'orbiting';
         ship.parentPlanet = planet.id;
+        ship.sourcePlanet = -1;
         ship.targetPlanet = -1;
         ship.orbitRadius = planet.radius * ORBIT_RADIUS_MULT + (Math.random() - 0.5) * 6;
         ship.orbitDir = Math.random() < 0.5 ? 1 : -1;

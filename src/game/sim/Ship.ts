@@ -22,6 +22,12 @@ export interface Ship {
   vy: number;
   /** For 'transit' state: destination planet id. For others: -1. */
   targetPlanet: number;
+  /**
+   * Planet the unit originally departed from in its current transit leg.
+   * Used to redirect in-flight swarms when the player retargets the source.
+   * -1 for freshly-spawned orbiters whose source is the same as parent.
+   */
+  sourcePlanet: number;
   /** Planet the unit calls home (for orbit/absorb). -1 if none. */
   parentPlanet: number;
   speed: number;
@@ -51,6 +57,7 @@ export interface SpawnOptions {
   /** Optional — defaults to 'transit' for backwards compatibility. */
   state?: ShipState;
   parentPlanet?: number;
+  sourcePlanet?: number;
   orbitRadius?: number;
   orbitDir?: number;
   wanderPhase?: number;
@@ -69,6 +76,7 @@ export class ShipPool {
   ): number {
     const state = opts.state ?? 'transit';
     const parentPlanet = opts.parentPlanet ?? -1;
+    const sourcePlanet = opts.sourcePlanet ?? -1;
     const orbitRadius = opts.orbitRadius ?? 0;
     const orbitDir = opts.orbitDir ?? 1;
     const wanderPhase = opts.wanderPhase ?? Math.random() * Math.PI * 2;
@@ -83,6 +91,7 @@ export class ShipPool {
       s.vx = opts.vx;
       s.vy = opts.vy;
       s.targetPlanet = targetPlanet;
+      s.sourcePlanet = sourcePlanet;
       s.parentPlanet = parentPlanet;
       s.speed = speed;
       s.turnRate = opts.turnRate;
@@ -104,6 +113,7 @@ export class ShipPool {
       vx: opts.vx,
       vy: opts.vy,
       targetPlanet,
+      sourcePlanet,
       parentPlanet,
       speed,
       turnRate: opts.turnRate,
@@ -126,6 +136,7 @@ export class ShipPool {
     s.isSelected = false;
     s.state = 'transit';
     s.parentPlanet = -1;
+    s.sourcePlanet = -1;
     this.freeList.push(idx);
   }
 

@@ -103,24 +103,27 @@ export class Selection {
   }
 
   /**
-   * Route selected sources/units to a target planet. If any units are
-   * currently selected, they break orbit and transit directly to the target
-   * using the boids flocking in World.step. Otherwise, fall back to the
-   * classic stream routing over constellation edges.
+   * Route selected sources/units to a target planet.
+   *
+   * Always opens a continuous stream from every selected source to the target
+   * — this is what lets the player chain moves (A → B, then B → C, then C → D)
+   * and have each planet keep flowing its production onward. If any orbiters
+   * were flagged as selected, they also break orbit and transit directly,
+   * giving the immediate wave feel on top of the persistent stream. Already
+   * in-flight ships from the same source are redirected by openStream so the
+   * whole swarm curves to the new target rather than waiting for the next
+   * batch.
    */
   routeTo(targetId: number): void {
     const commandedUnits = this.world.commandSelectedTo(this.playerId, targetId);
-    if (commandedUnits > 0) {
-      // Units moved directly — leave planet selection intact so the player can
-      // redirect the remainder via stream tap on subsequent taps.
-      // Clear per-unit selection flags now that they're in transit.
-      this.clearUnitSelection();
-      return;
-    }
-    // Fall back to streaming garrisons over edges.
     for (const src of this.selected) {
       if (src === targetId) continue;
       this.world.openStream(this.playerId, src, targetId);
+    }
+    if (commandedUnits > 0) {
+      // Clear per-unit selection flags now that they're in transit; selection
+      // of the source planet persists so future retargets still work.
+      this.clearUnitSelection();
     }
   }
 

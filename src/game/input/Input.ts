@@ -14,7 +14,8 @@ export interface PointerState {
 
 export interface InputCallbacks {
   tapPlanet: (planetId: number) => void;
-  tapEmpty: () => void;
+  /** Called when the player taps empty space. `worldX/Y` are the tap point. */
+  tapEmpty: (worldX: number, worldY: number) => void;
   dragCommit: (sourcePlanet: number, targetPlanet: number) => void;
   dragPreview: (sourcePlanet: number | null, targetPlanet: number | null) => void;
   /** Called continuously while a lasso-drag is in progress (world-space coords). */
@@ -160,8 +161,12 @@ export class Input {
     const dt = performance.now() - p.startTime;
     if (!p.moved && dt < TAP_TIME_THRESHOLD) {
       const hit = this.planetAtScreen(p.x, p.y);
-      if (hit !== null) this.cb.tapPlanet(hit);
-      else this.cb.tapEmpty();
+      if (hit !== null) {
+        this.cb.tapPlanet(hit);
+      } else {
+        const w = this.renderer.screenToWorld(p.x, p.y);
+        this.cb.tapEmpty(w.x, w.y);
+      }
       return;
     }
 

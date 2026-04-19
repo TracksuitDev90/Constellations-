@@ -4,12 +4,14 @@ import type { Vec2 } from '../../util/math.js';
  * Ship states drive the per-tick steering:
  *   'orbiting'  — unit circles its parent planet using tangential steering
  *                 plus a small wander/separation jitter so the swarm vibrates.
- *   'transit'   — unit is flying toward a target planet; uses boids-style
- *                 seek + separation + cohesion.
+ *   'transit'   — unit is flying toward a target planet OR a point in space;
+ *                 uses boids-style seek + separation + cohesion.
+ *   'hovering'  — unit is loitering around a free-space point it was ordered
+ *                 to hold at (no parent planet).
  *   'absorbing' — unit is being pulled into its parent planet's center to be
  *                 consumed for heal / upgrade energy.
  */
-export type ShipState = 'orbiting' | 'transit' | 'absorbing';
+export type ShipState = 'orbiting' | 'transit' | 'hovering' | 'absorbing';
 
 export interface Ship {
   active: boolean;
@@ -20,8 +22,19 @@ export interface Ship {
   /** Current velocity. Ships keep momentum and steer toward their target. */
   vx: number;
   vy: number;
-  /** For 'transit' state: destination planet id. For others: -1. */
+  /** For 'transit' toward a planet: destination planet id. Otherwise -1. */
   targetPlanet: number;
+  /**
+   * For 'transit'/'hovering' toward a free-space point: world coordinates
+   * of the destination. Ignored when targetPlanet >= 0.
+   */
+  targetX: number;
+  targetY: number;
+  /**
+   * Planet the unit originally departed from in its current transit leg.
+   * Preserved as metadata; not currently used for redirect logic.
+   */
+  sourcePlanet: number;
   /** Planet the unit calls home (for orbit/absorb). -1 if none. */
   parentPlanet: number;
   speed: number;
@@ -51,6 +64,9 @@ export interface SpawnOptions {
   /** Optional — defaults to 'transit' for backwards compatibility. */
   state?: ShipState;
   parentPlanet?: number;
+  sourcePlanet?: number;
+  targetX?: number;
+  targetY?: number;
   orbitRadius?: number;
   orbitDir?: number;
   wanderPhase?: number;
@@ -69,6 +85,9 @@ export class ShipPool {
   ): number {
     const state = opts.state ?? 'transit';
     const parentPlanet = opts.parentPlanet ?? -1;
+    const sourcePlanet = opts.sourcePlanet ?? -1;
+    const targetX = opts.targetX ?? 0;
+    const targetY = opts.targetY ?? 0;
     const orbitRadius = opts.orbitRadius ?? 0;
     const orbitDir = opts.orbitDir ?? 1;
     const wanderPhase = opts.wanderPhase ?? Math.random() * Math.PI * 2;
@@ -83,6 +102,9 @@ export class ShipPool {
       s.vx = opts.vx;
       s.vy = opts.vy;
       s.targetPlanet = targetPlanet;
+      s.targetX = targetX;
+      s.targetY = targetY;
+      s.sourcePlanet = sourcePlanet;
       s.parentPlanet = parentPlanet;
       s.speed = speed;
       s.turnRate = opts.turnRate;
@@ -104,6 +126,9 @@ export class ShipPool {
       vx: opts.vx,
       vy: opts.vy,
       targetPlanet,
+      targetX,
+      targetY,
+      sourcePlanet,
       parentPlanet,
       speed,
       turnRate: opts.turnRate,
@@ -126,6 +151,7 @@ export class ShipPool {
     s.isSelected = false;
     s.state = 'transit';
     s.parentPlanet = -1;
+    s.sourcePlanet = -1;
     this.freeList.push(idx);
   }
 

@@ -7,11 +7,23 @@ export interface AIConfig {
   reserveFrac: number;
 }
 
+/**
+ * Toned-down defaults: the previous profile (2.8s tick, 0.45 aggression,
+ * 0.55 reserve) rushed hard enough that the player rarely had breathing room.
+ * This profile waits longer between decisions, commits smaller fractions of
+ * its garrison, and only attacks when it has a meaningful numerical edge.
+ */
 export const NORMAL_AI: AIConfig = {
-  tickInterval: 2.8,
-  aggression: 0.45,
-  reserveFrac: 0.55,
+  tickInterval: 5.0,
+  aggression: 0.18,
+  reserveFrac: 0.75,
 };
+
+/** Minimum surplus garrison before the AI will even consider attacking. */
+const MIN_ATTACK_FORCE = 12;
+/** Extra buffer on top of the target's effective garrison, so the AI doesn't
+ * throw away a nearly-even attack. */
+const ATTACK_MARGIN = 4;
 
 export class BasicAI {
   private world: World;
@@ -82,27 +94,33 @@ export class BasicAI {
     }
 
     // Offense: send at most ONE attack wave this tick, from the strongest planet.
+    // Require a comfortable surplus plus an ATTACK_MARGIN over the target so
+    // the AI doesn't throw bodies at coin-flip fights.
     const reserve = this.cfg.reserveFrac;
     const sortedByGarrison = [...myPlanets].sort((a, b) => b.garrison - a.garrison);
     for (const p of sortedByGarrison) {
       const available = p.garrison - Math.ceil(p.garrison * reserve);
-      if (available < 6) continue;
+      if (available < MIN_ATTACK_FORCE) continue;
       let best: { id: number; score: number } | null = null;
       for (const tgt of this.world.planets) {
         if (tgt.owner === me) continue;
         const incomingMine = this.incomingFriendly(tgt.id);
         const effective = tgt.garrison - incomingMine;
-        // Only attack if our wave can plausibly take it.
-        if (available <= effective) continue;
+        // Only attack if our wave clears the garrison with a safety margin.
+        if (available < effective + ATTACK_MARGIN) continue;
         const d = Math.max(60, dist(p.pos, tgt.pos));
-        const neutralBonus = tgt.owner === null ? 1.3 : 1.0;
+        // Prefer neutral targets early; neighbours over long-range gambles.
+        const neutralBonus = tgt.owner === null ? 1.2 : 0.85;
         const score =
           ((tgt.radius * neutralBonus) / (Math.max(1, effective + 1) * d)) *
           this.cfg.aggression;
         if (!best || score > best.score) best = { id: tgt.id, score };
       }
       if (best) {
-        this.world.openStream(me, p.id, best.id, available);
+        // Commit a fraction of `available` instead of the full surplus — keeps
+        // the AI from emptying a planet on one gamble.
+        const commit = Math.max(MIN_ATTACK_FORCE, Math.floor(available * 0.75));
+        this.world.openStream(me, p.id, best.id, commit);
         break; // one wave per think tick keeps the AI measured.
       }
     }

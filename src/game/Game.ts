@@ -4,6 +4,7 @@ import { Audio } from './audio/Audio.js';
 import { Input } from './input/Input.js';
 import { Selection } from './input/Selection.js';
 import { ORION_MAP } from './maps/orion.js';
+import { RING_THRESHOLDS, type Planet } from './sim/Planet.js';
 import { loadPlanetAssets } from './render/planetAssets.js';
 import { Renderer } from './render/Renderer.js';
 import { World } from './sim/World.js';
@@ -44,9 +45,12 @@ export class Game {
       this.ui,
       'Constellations',
       `A meditative real-time strategy game inspired by <em>Auralux</em>.<br/>
-       Tap or click a planet you own, then a target, to route ships along the
-       constellation. Pinch or scroll to zoom; drag with two fingers to pan.<br/>
-       Capture every star to win.`,
+       Tap a planet you own, then any planet to send a wave. Selection sticks,
+       so keep tapping targets to redirect. Send units back to your own ringed
+       worlds to fill the rings — every ring you close upgrades the planet and
+       speeds its production.<br/>
+       Pinch or scroll to zoom; drag with two fingers to pan. Capture every
+       star to win.`,
       [
         {
           label: 'Begin',
@@ -91,6 +95,19 @@ export class Game {
       {
         onShipLaunch: (owner) => {
           if (owner === 0) this.audio.shipLaunch();
+        },
+        onShipArrive: (planetId, owner, friendly) => {
+          // Only chime for events that involve the player — either landing
+          // on player territory, or the player chipping at an enemy world.
+          const planet = this.world.planets[planetId];
+          const isPlayerEvent = owner === 0 || planet.owner === 0;
+          if (!isPlayerEvent) return;
+          const fill = ringFillProgress(planet);
+          this.audio.shipArrival(planetId, friendly, fill);
+        },
+        onRingFilled: (_planetId, ringIndex, owner) => {
+          if (owner !== 0) return;
+          this.audio.ringFilled(ringIndex);
         },
         onPlanetCapture: () => {
           this.audio.planetCaptured();
@@ -237,6 +254,20 @@ export class Game {
     );
   }
 }
+
+/** 0..1 progress toward filling the planet's next capacity ring. */
+const ringFillProgress = (planet: Planet): number => {
+  const thresholds = RING_THRESHOLDS[planet.type];
+  if (thresholds.length === 0) return 0;
+  let prev = 0;
+  for (const cap of thresholds) {
+    if (planet.garrison < cap) {
+      return Math.max(0, Math.min(1, (planet.garrison - prev) / (cap - prev)));
+    }
+    prev = cap;
+  }
+  return 1;
+};
 
 const escapeHtml = (s: string): string =>
   s.replace(/[&<>"']/g, (c) => {

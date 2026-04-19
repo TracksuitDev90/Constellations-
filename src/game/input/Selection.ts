@@ -67,15 +67,14 @@ export class Selection {
   }
 
   routeTo(targetId: number): void {
-    if (this.selected.has(targetId)) {
-      // Target is one of the selected sources — drop it so we don't stream to self.
-      this.selected.delete(targetId);
-    }
+    // Sources stream to the target, except the target itself if it was selected.
     for (const src of this.selected) {
+      if (src === targetId) continue;
       this.world.openStream(this.playerId, src, targetId);
     }
-    // After issuing the order, clear selection so units don't keep being sent.
-    this.selected.clear();
+    // Selection persists so the player can immediately re-target without
+    // re-tapping each source — matches the Auralux Constellations feel where
+    // you can quickly redirect ongoing waves.
   }
 
   /** Remove lost planets from selection. */

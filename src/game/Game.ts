@@ -130,6 +130,12 @@ export class Game {
         onPlanetCapture: () => {
           this.audio.planetCaptured();
         },
+        onPlanetNeutralized: () => {
+          // The planet's hull finally gave out — a distinct "broken shield"
+          // cue so the player registers it as a different event from a
+          // normal ownership flip.
+          this.audio.planetNeutralized();
+        },
         onGameOver: (winner) => {
           this.audio.endSting(winner === 0);
           this.paused = true;

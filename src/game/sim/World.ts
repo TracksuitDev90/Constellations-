@@ -40,6 +40,12 @@ export interface MapSpec {
 export interface WorldEvents {
   onShipLaunch?: (owner: number) => void;
   onPlanetCapture?: (planetId: number, newOwner: number) => void;
+  /**
+   * Fired when a planet's residual health falls to zero under attack. The
+   * planet loses its owner but does NOT flip to the attacker — it becomes
+   * neutral and still needs to be captured by the normal garrison-drain.
+   */
+  onPlanetNeutralized?: (planetId: number, lostOwner: number) => void;
   /** Fired when a ship lands. `friendly` = arrived at an owned planet. */
   onShipArrive?: (planetId: number, owner: number, friendly: boolean) => void;
   /** Fired when a ship is consumed by absorb at its parent planet's center. */
@@ -872,19 +878,47 @@ export class World {
         return;
       }
     } else {
-      planet.garrison -= 1;
-      if (planet.garrison < 0) {
-        planet.owner = ship.owner;
-        planet.garrison = 1;
-        planet.capturePulse = 0.6;
-        // Reset ring fill — captured planets start with empty rings so the
-        // new owner must invest absorb to keep the growth path.
-        planet.ringFillProgress = new Array(planet.ringCount).fill(0);
-        planet.absorbing = false;
-        planet.health = planet.maxHealth;
-        // On capture, evict any leftover orbiters of the prior owner.
-        this.evictOrbitersOf(planet.id, ship.owner);
-        this.events.onPlanetCapture?.(planet.id, ship.owner);
+      // Enemy arrival. Order of operations matters:
+      //   1. Burn through active defenders (garrison) first.
+      //   2. Once defenders are gone on an owned planet, chip at residual
+      //      planetary health — the structure that keeps it flagged as the
+      //      current owner's. When health hits zero the planet goes NEUTRAL,
+      //      not captured, so the attacker must still land a fresh wave to
+      //      take it. Strategically this means stripping a world of all its
+      //      units no longer gives the enemy a free capture — they have to
+      //      actually fight through the hull.
+      //   3. On a neutral planet, arrivals work the old way: drain the
+      //      neutral garrison then flip ownership.
+      if (planet.owner !== null && planet.garrison <= 0) {
+        planet.garrison = 0;
+        planet.health = Math.max(0, planet.health - 1);
+        planet.capturePulse = 0.35;
+        if (planet.health <= 0) {
+          const lostOwner = planet.owner;
+          planet.owner = null;
+          planet.absorbing = false;
+          planet.ringFillProgress = new Array(planet.ringCount).fill(0);
+          planet.capturePulse = 0.55;
+          // The old owner's leftover orbiters are displaced — the world is
+          // briefly no-one's, ready to be claimed by the next arriving wave.
+          this.evictOrbitersOf(planet.id, -1);
+          this.events.onPlanetNeutralized?.(planet.id, lostOwner);
+        }
+      } else {
+        planet.garrison -= 1;
+        if (planet.garrison < 0) {
+          planet.owner = ship.owner;
+          planet.garrison = 1;
+          planet.capturePulse = 0.6;
+          // Reset ring fill — captured planets start with empty rings so the
+          // new owner must invest absorb to keep the growth path.
+          planet.ringFillProgress = new Array(planet.ringCount).fill(0);
+          planet.absorbing = false;
+          planet.health = planet.maxHealth;
+          // On capture, evict any leftover orbiters of the prior owner.
+          this.evictOrbitersOf(planet.id, ship.owner);
+          this.events.onPlanetCapture?.(planet.id, ship.owner);
+        }
       }
     }
     this.events.onShipArrive?.(planet.id, ship.owner, friendly);

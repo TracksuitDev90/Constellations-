@@ -81,41 +81,225 @@ export class Audio {
   private startAmbient(): void {
     if (!this.ctx || !this.musicGain) return;
     this.musicStarted = true;
-    // Two slowly detuned sine pads an octave apart + a very slow LFO on filter.
-    const baseFreqs = [110, 164.81, 246.94]; // A2, E3, B3 — open, calm
+
+    // ── Filter bus ────────────────────────────────────────────────────────
+    // Main lowpass with THREE summed LFOs at prime-ish rates. The combined
+    // modulation never repeats cleanly so the cutoff meanders instead of
+    // pulsing — the drone never sits on the same color for long.
     const filter = this.ctx.createBiquadFilter();
     filter.type = 'lowpass';
-    filter.frequency.value = 900;
+    filter.frequency.value = 820;
     filter.Q.value = 0.8;
     filter.connect(this.musicGain);
 
-    const lfo = this.ctx.createOscillator();
-    lfo.frequency.value = 0.07;
-    const lfoGain = this.ctx.createGain();
-    lfoGain.gain.value = 350;
-    lfo.connect(lfoGain).connect(filter.frequency);
-    lfo.start();
+    this.attachSlowLfo(filter.frequency, 0.067, 360);
+    this.attachSlowLfo(filter.frequency, 0.023, 190);
+    this.attachSlowLfo(filter.frequency, 0.013, 95);
+    // Slowly drifting Q adds a breathing "open / close" quality to the pad.
+    this.attachSlowLfo(filter.Q, 0.031, 0.35);
 
-    for (const f of baseFreqs) {
-      const osc1 = this.ctx.createOscillator();
-      osc1.type = 'sine';
-      osc1.frequency.value = f;
-      const osc2 = this.ctx.createOscillator();
-      osc2.type = 'sine';
-      osc2.frequency.value = f * 1.003; // slight detune
-      const voiceGain = this.ctx.createGain();
-      voiceGain.gain.value = 0.12;
-      osc1.connect(voiceGain);
-      osc2.connect(voiceGain);
-      voiceGain.connect(filter);
-      osc1.start();
-      osc2.start();
-    }
+    // ── Core pad voices ───────────────────────────────────────────────────
+    // Each voice has its own tremolo at a different slow rate + an independent
+    // detune drift, so pairs of voices drift in and out of phase with each
+    // other instead of breathing in unison.
+    const padVoices = [
+      { freq: 110.0, tremRate: 0.041, tremDepth: 0.045, driftRate: 0.019 },   // A2
+      { freq: 164.81, tremRate: 0.063, tremDepth: 0.055, driftRate: 0.027 },  // E3
+      { freq: 246.94, tremRate: 0.029, tremDepth: 0.040, driftRate: 0.017 },  // B3
+    ];
+    for (const v of padVoices) this.addPadVoice(v, filter, 0.11);
+
+    // ── Sub-bass "breathing" voice ───────────────────────────────────────
+    // A very low sine that swells in and out over ~90s. Adds a felt-not-heard
+    // low-end movement that keeps the drone from feeling static even when
+    // the mid register is settled.
+    const subOsc = this.ctx.createOscillator();
+    subOsc.type = 'sine';
+    subOsc.frequency.value = 55; // A1
+    const subGain = this.ctx.createGain();
+    subGain.gain.value = 0.045;
+    subOsc.connect(subGain).connect(this.musicGain);
+    subOsc.start();
+    // Breath LFO on the sub gain — slow, deep.
+    this.attachSlowLfo(subGain.gain, 0.011, 0.04);
+    // Subtle pitch drift on the sub (microtonal), gives an "engine humming"
+    // quality without ever sounding mechanical.
+    this.attachSlowLfo(subOsc.detune, 0.007, 12);
+
+    // ── Upper harmonic shimmer layer ─────────────────────────────────────
+    // A pair of very quiet high sines a fifth apart that drift in their own
+    // amplitude envelope — when they swell they add air, when they recede
+    // the pad feels more grounded.
+    const shimmerA = this.ctx.createOscillator();
+    shimmerA.type = 'sine';
+    shimmerA.frequency.value = 659.25; // E5
+    const shimmerB = this.ctx.createOscillator();
+    shimmerB.type = 'sine';
+    shimmerB.frequency.value = 987.77; // B5 (perfect fifth)
+    const shimmerGain = this.ctx.createGain();
+    shimmerGain.gain.value = 0.014;
+    shimmerA.connect(shimmerGain);
+    shimmerB.connect(shimmerGain);
+    shimmerGain.connect(filter);
+    shimmerA.start();
+    shimmerB.start();
+    // Very slow swell on shimmer — absent most of the time, present briefly.
+    this.attachSlowLfo(shimmerGain.gain, 0.009, 0.012);
+    this.attachSlowLfo(shimmerA.detune, 0.043, 8);
+    this.attachSlowLfo(shimmerB.detune, 0.037, 8);
+
+    // ── Occasional "ghost" harmonic voices ───────────────────────────────
+    // Scheduled transient pads that fade in, drift, and leave. Re-rolls its
+    // pitch each time so the harmonic context shifts without a key change.
+    this.scheduleGhostVoice();
+
+    // ── Occasional bandpass noise "solar wind" bed ───────────────────────
+    // Low-volume filtered noise that fades in slowly and sits under the pad
+    // for ~20-40s. Keeps the texture alive in stretches without any new
+    // melodic event; overlaps freely with the ethereal one-shots.
+    this.scheduleNoiseBed();
 
     // Break up the otherwise-constant drone with sparse ethereal one-shots —
     // airy windy swells, distant chimes, subtle sweeps. Scheduled in JS-time
     // so they don't all stack in the audio graph up front.
     this.scheduleEthereal();
+  }
+
+  /**
+   * Add a core pad voice: two slightly detuned sines, per-voice tremolo via
+   * a slow LFO on the voice gain, and a second detune-drift LFO so the
+   * beating frequency between the two oscillators wanders over minutes.
+   */
+  private addPadVoice(
+    spec: { freq: number; tremRate: number; tremDepth: number; driftRate: number },
+    dest: AudioNode,
+    baseGain: number,
+  ): void {
+    if (!this.ctx) return;
+    const osc1 = this.ctx.createOscillator();
+    osc1.type = 'sine';
+    osc1.frequency.value = spec.freq;
+    const osc2 = this.ctx.createOscillator();
+    osc2.type = 'sine';
+    osc2.frequency.value = spec.freq * 1.003;
+
+    const voiceGain = this.ctx.createGain();
+    voiceGain.gain.value = baseGain;
+    osc1.connect(voiceGain);
+    osc2.connect(voiceGain);
+    voiceGain.connect(dest);
+    osc1.start();
+    osc2.start();
+
+    this.attachSlowLfo(voiceGain.gain, spec.tremRate, spec.tremDepth);
+    // Slow detune drift on osc2 only so the beat frequency between the two
+    // oscillators wanders over minutes — never lands the same way twice.
+    this.attachSlowLfo(osc2.detune, spec.driftRate, 14);
+    // Tiny breath on osc1 too so the pair doesn't stay at a fixed offset.
+    this.attachSlowLfo(osc1.detune, spec.driftRate * 0.63, 6);
+  }
+
+  /**
+   * Attach an oscillator LFO to an AudioParam. The LFO's output is scaled
+   * by `depth` and summed with the param's base value, so the param
+   * oscillates by ±depth around whatever it was set to. Runs forever.
+   */
+  private attachSlowLfo(param: AudioParam, rateHz: number, depth: number): void {
+    if (!this.ctx) return;
+    const lfo = this.ctx.createOscillator();
+    lfo.type = 'sine';
+    lfo.frequency.value = rateHz;
+    const g = this.ctx.createGain();
+    g.gain.value = depth;
+    lfo.connect(g).connect(param);
+    // Randomize start phase so multiple LFOs don't line up on boot.
+    lfo.start(this.ctx.currentTime + Math.random() * 0.2);
+  }
+
+  /**
+   * Schedule a transient "ghost" harmonic pad — a quiet voice that fades in,
+   * drifts, and fades out over ~25-45 seconds on a random consonant interval
+   * above the base key. Reschedules itself after each cycle so the texture
+   * keeps shifting without ever turning into a melody.
+   */
+  private scheduleGhostVoice(): void {
+    const delay = 18000 + Math.random() * 30000;
+    window.setTimeout(() => {
+      if (!this.muted) this.playGhostVoice();
+      this.scheduleGhostVoice();
+    }, delay);
+  }
+
+  private playGhostVoice(): void {
+    if (!this.ctx || !this.musicGain) return;
+    const now = this.ctx.currentTime;
+    // Intervals above A2 (110) that stay consonant with the A-minor pentatonic
+    // pad — fifth, fourth, minor third, octave, major second up a tenth.
+    const notes = [146.83, 196.0, 220.0, 261.63, 329.63];
+    const f = notes[Math.floor(Math.random() * notes.length)];
+    const dur = 25 + Math.random() * 20;
+    const osc1 = this.ctx.createOscillator();
+    osc1.type = 'sine';
+    osc1.frequency.value = f;
+    const osc2 = this.ctx.createOscillator();
+    osc2.type = 'sine';
+    osc2.frequency.value = f * 2.003; // octave up, slightly sharp
+    const g = this.ctx.createGain();
+    const peak = 0.025 + Math.random() * 0.02;
+    g.gain.setValueAtTime(0.0001, now);
+    g.gain.exponentialRampToValueAtTime(peak, now + dur * 0.35);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    osc1.connect(g);
+    osc2.connect(g);
+    g.connect(this.musicGain);
+    osc1.start(now);
+    osc2.start(now);
+    osc1.stop(now + dur + 0.1);
+    osc2.stop(now + dur + 0.1);
+    // Slow drift on the octave partial so the voice shimmers while it's up.
+    this.attachSlowLfo(osc2.detune, 0.051, 11);
+  }
+
+  /**
+   * Schedule a long, quiet "solar wind" noise bed — bandpassed white noise
+   * that fades in slowly, sits for 20-40s, then fades out. Helps fill the
+   * gaps between ethereal one-shots without ever becoming loud enough to
+   * compete with them.
+   */
+  private scheduleNoiseBed(): void {
+    const delay = 12000 + Math.random() * 25000;
+    window.setTimeout(() => {
+      if (!this.muted) this.playNoiseBed();
+      this.scheduleNoiseBed();
+    }, delay);
+  }
+
+  private playNoiseBed(): void {
+    if (!this.ctx || !this.musicGain) return;
+    const now = this.ctx.currentTime;
+    const dur = 20 + Math.random() * 22;
+    const sr = this.ctx.sampleRate;
+    const sampleCount = Math.max(1, Math.floor(sr * Math.min(dur, 12)));
+    const buf = this.ctx.createBuffer(1, sampleCount, sr);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < sampleCount; i++) data[i] = Math.random() * 2 - 1;
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    src.loop = true; // loop the short noise buffer across the full duration
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.Q.value = 0.5;
+    const centerStart = 340 + Math.random() * 280;
+    bp.frequency.setValueAtTime(centerStart, now);
+    bp.frequency.linearRampToValueAtTime(centerStart * (0.6 + Math.random() * 0.6), now + dur);
+    const g = this.ctx.createGain();
+    const peak = 0.028 + Math.random() * 0.015;
+    g.gain.setValueAtTime(0.0001, now);
+    g.gain.exponentialRampToValueAtTime(peak, now + dur * 0.3);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    src.connect(bp).connect(g).connect(this.musicGain);
+    src.start(now);
+    src.stop(now + dur + 0.1);
   }
 
   /**
@@ -256,6 +440,73 @@ export class Audio {
     osc.connect(g).connect(this.sfxGain);
     osc.start(now);
     osc.stop(now + 0.14);
+  }
+
+  /**
+   * A planet's residual hull finally gives out and the world goes neutral.
+   * Reads as a "breaking shield" — a short descending noise-band sweep paired
+   * with a soft sub-thump, and a brief glassy crack on top. Distinct from
+   * `planetCaptured` (ascending chime) and `shipDeath` (sharp poof) so the
+   * player registers it as a third, distinct event.
+   */
+  planetNeutralized(): void {
+    if (!this.ctx || !this.sfxGain || this.muted) return;
+    const now = this.ctx.currentTime;
+
+    // Layer 1: descending bandpass-noise sweep — the "shield shatter".
+    const dur = 0.55;
+    const sampleCount = Math.max(1, Math.floor(this.ctx.sampleRate * dur));
+    const buf = this.ctx.createBuffer(1, sampleCount, this.ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < sampleCount; i++) {
+      const t = i / sampleCount;
+      const env = Math.min(1, t * 20) * Math.pow(1 - t, 1.8);
+      data[i] = (Math.random() * 2 - 1) * env;
+    }
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.Q.value = 1.4;
+    bp.frequency.setValueAtTime(1400, now);
+    bp.frequency.exponentialRampToValueAtTime(320, now + dur);
+    const noiseGain = this.ctx.createGain();
+    noiseGain.gain.value = 0.12;
+    src.connect(bp).connect(noiseGain).connect(this.sfxGain);
+    src.start(now);
+    src.stop(now + dur + 0.02);
+
+    // Layer 2: low sub-thump — gives the shatter body. Slightly longer than
+    // ship death's thump so it reads as a bigger event.
+    const thump = this.ctx.createOscillator();
+    thump.type = 'sine';
+    thump.frequency.setValueAtTime(92, now);
+    thump.frequency.exponentialRampToValueAtTime(44, now + 0.28);
+    const thumpGain = this.ctx.createGain();
+    thumpGain.gain.setValueAtTime(0.0001, now);
+    thumpGain.gain.exponentialRampToValueAtTime(0.16, now + 0.008);
+    thumpGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.32);
+    thump.connect(thumpGain).connect(this.sfxGain);
+    thump.start(now);
+    thump.stop(now + 0.34);
+
+    // Layer 3: two glassy descending partials — the audible "crack" on top
+    // of the shatter. Minor third falling to evoke the loss.
+    const partials = [880, 740];
+    for (let i = 0; i < partials.length; i++) {
+      const osc = this.ctx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(partials[i] * 1.5, now);
+      osc.frequency.exponentialRampToValueAtTime(partials[i] * 0.5, now + 0.4);
+      const g = this.ctx.createGain();
+      const start = now + i * 0.05;
+      g.gain.setValueAtTime(0.0001, start);
+      g.gain.exponentialRampToValueAtTime(0.055 / (i + 1), start + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, start + 0.45);
+      osc.connect(g).connect(this.sfxGain);
+      osc.start(start);
+      osc.stop(start + 0.5);
+    }
   }
 
   planetCaptured(): void {

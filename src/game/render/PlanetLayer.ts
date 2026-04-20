@@ -13,8 +13,13 @@ import { planetAssetsReady } from './planetAssets.js';
 const MAX_ORBITERS = 48;
 /** Major-axis radius of an atom-ring, as a multiple of planet radius. */
 const ORBIT_BAND_MAJOR = 1.85;
-/** Minor-axis as a fraction of major — small enough to read as tilted orbits. */
-const ORBIT_BAND_SQUISH = 0.32;
+/**
+ * Minor-axis squish range. With few orbiters the ring reads as a near-circular
+ * gentle halo; as the swarm grows it slowly flattens into tilted orbits so the
+ * atom-symbol shape only emerges under a massive population.
+ */
+const ORBIT_BAND_SQUISH_LOOSE = 0.92;
+const ORBIT_BAND_SQUISH_ATOM = 0.3;
 /**
  * Ring tilts for up to 3 nested orbits. Evenly spaced every 60° so the three
  * overlapping ellipses spell out the classic atom-symbol silhouette.
@@ -23,21 +28,38 @@ const RING_TILTS = [0, Math.PI / 3, (2 * Math.PI) / 3];
 /**
  * Per-ring angular speeds (rad/s). Alternating signs + slightly different
  * magnitudes make the electrons look like independent orbits rather than a
- * rigid merry-go-round.
+ * rigid merry-go-round. Kept gentle so the motion feels meditative, not busy.
  */
-const RING_SPEEDS = [0.55, -0.78, 0.94];
+const RING_SPEEDS = [0.32, -0.44, 0.55];
 /**
- * Thresholds at which a new orbit ring emerges. Fewer orbiters ⇒ a simple
- * single ring. As the garrison grows a second and eventually third ring
- * pop in, producing the atom-symbol shape the player recognizes.
+ * Thresholds at which a new orbit ring emerges. Tuned so the default starting
+ * garrison (~12) reads as a single loose orbit; the second ring only joins in
+ * after a meaningful buildup, and the full three-ring atom requires a massive
+ * fleet (near the visible cap). The formation should feel earned.
  */
-const RING_GROWTH_THRESHOLDS = [8, 16];
+const RING_GROWTH_THRESHOLDS = [22, 36];
+/**
+ * Full-atom threshold — the count at which squish and structure are at their
+ * most crystalline. Below this, everything eases toward loose/circular.
+ */
+const FULL_ATOM_COUNT = 42;
+/** Min/max ease rate so position transitions feel flowy, not mechanical. */
+const ORBIT_POS_EASE_RATE = 1.6;
+/** Ring alpha fade rate — slower than position so rings bleed in gradually. */
+const RING_ALPHA_EASE_RATE = 0.6;
+/** How quickly the eased ring count catches its discrete target. */
+const RING_COUNT_EASE_RATE = 0.4;
 
 const ringCountFor = (count: number): number => {
   if (count <= 0) return 0;
   if (count <= RING_GROWTH_THRESHOLDS[0]) return 1;
   if (count <= RING_GROWTH_THRESHOLDS[1]) return 2;
   return 3;
+};
+
+const smoothstep = (t: number): number => {
+  const x = Math.max(0, Math.min(1, t));
+  return x * x * (3 - 2 * x);
 };
 
 /** Starting visual scale used when a planet evolves — it pops up from this. */
@@ -62,6 +84,10 @@ interface Orbiter {
   ringIdx: number;
   /** Personal twinkle phase for alpha flicker. */
   phase: number;
+  /** Slow angular drift — small per-ship offset so the swarm breathes. */
+  wanderPhase: number;
+  /** Per-orbiter phase along its ring's ellipse (0..2π). */
+  slotPhase: number;
 }
 
 interface PlanetView {
@@ -88,6 +114,10 @@ interface PlanetView {
   ringPhase: number[];
   /** Per-atom-ring alpha [0..1] for smooth fade-in as new rings emerge. */
   ringAlpha: number[];
+  /** Eased, continuous "ring count" that trails the discrete target smoothly. */
+  easedRingCount: number;
+  /** Eased formation factor (0..1); drives squish and structure sharpness. */
+  atomFormation: number;
   /**
    * Scale that maps the body sprite's pixel diameter to the desired world
    * radius. Rebuilt on size evolution so higher-res textures stay crisp.
@@ -171,6 +201,8 @@ export class PlanetLayer extends Container {
           Math.random() * Math.PI * 2,
         ],
         ringAlpha: [0, 0, 0],
+        easedRingCount: 0,
+        atomFormation: 0,
         bodyBaseScale: computeBodyBaseScale(planet.radius),
       });
     }
@@ -344,15 +376,20 @@ export class PlanetLayer extends Container {
       sprite.anchor.set(0.5);
       sprite.scale.set(0.36);
       sprite.tint = shipTint;
-      // Seed new electrons at a random point along the outermost active
-      // orbit so they slide into formation rather than popping in at origin.
-      sprite.x = (Math.random() - 0.5) * v.baseRadius * 0.5;
-      sprite.y = (Math.random() - 0.5) * v.baseRadius * 0.5;
+      // New electrons appear at a random point just outside the planet body
+      // and glide outward into the current orbit, so the flow looks like
+      // mass condensing into orbit rather than popping into place.
+      const spawnAngle = Math.random() * Math.PI * 2;
+      const spawnR = v.baseRadius * (0.9 + Math.random() * 0.3);
+      sprite.x = Math.cos(spawnAngle) * spawnR;
+      sprite.y = Math.sin(spawnAngle) * spawnR;
       v.orbitRoot.addChild(sprite);
       v.orbiters.push({
         sprite,
         ringIdx: 0,
         phase: Math.random() * Math.PI * 2,
+        wanderPhase: Math.random() * Math.PI * 2,
+        slotPhase: Math.random() * Math.PI * 2,
       });
     }
 
@@ -365,28 +402,51 @@ export class PlanetLayer extends Container {
 
   private tickOrbiters(v: PlanetView, dt: number): void {
     const count = v.orbiters.length;
-    const ringCount = ringCountFor(count);
+    const targetRings = ringCountFor(count);
 
-    // Fade each ring's alpha toward its active state — new rings emerge
-    // smoothly, retiring rings fade out, so transitions look like matter
-    // settling rather than teleporting.
-    const alphaEase = 1 - Math.exp(-dt * 3);
+    // Continuous formation factor — 0 at "empty" or "one loose ring", 1 at the
+    // crystalline full-atom limit. Everything that makes the atom "read" as
+    // an atom (squish, ring count, path alpha) eases from this value so the
+    // structure forms slowly as the population grows instead of snapping in.
+    const rawFormation = Math.max(
+      0,
+      Math.min(1, (count - RING_GROWTH_THRESHOLDS[0]) / Math.max(1, FULL_ATOM_COUNT - RING_GROWTH_THRESHOLDS[0])),
+    );
+    const formTarget = smoothstep(rawFormation);
+    const formEase = 1 - Math.exp(-dt * 0.9);
+    v.atomFormation += (formTarget - v.atomFormation) * formEase;
+
+    // Eased ring count — floats toward the discrete target so transitions
+    // aren't abrupt even visually (rings fade + orbiters redistribute over
+    // several seconds rather than a single frame).
+    const rcEase = 1 - Math.exp(-dt * RING_COUNT_EASE_RATE);
+    v.easedRingCount += (targetRings - v.easedRingCount) * rcEase;
+
+    // Per-ring alpha trails the eased ring count so ring k is "active"
+    // proportionally to how far the structure has grown past it.
+    const alphaEase = 1 - Math.exp(-dt * RING_ALPHA_EASE_RATE);
     for (let k = 0; k < 3; k++) {
-      const targetA = k < ringCount ? 1 : 0;
+      const targetA = Math.max(0, Math.min(1, v.easedRingCount - k));
       v.ringAlpha[k] += (targetA - v.ringAlpha[k]) * alphaEase;
     }
 
     if (count === 0) return;
 
-    // Advance shared phase per active ring.
-    for (let k = 0; k < ringCount; k++) {
-      v.ringPhase[k] += RING_SPEEDS[k] * dt;
+    // Advance shared phase per active ring. Speeds ramp up with formation
+    // so early "single ring" orbits drift slowly and the full atom spins
+    // with more character.
+    const speedScale = 0.55 + 0.45 * v.atomFormation;
+    for (let k = 0; k < targetRings; k++) {
+      v.ringPhase[k] += RING_SPEEDS[k] * speedScale * dt;
     }
 
-    // Round-robin assignment: distribute electrons evenly across rings.
+    // Round-robin assignment, but biased: at low ring counts, later orbiters
+    // still live on ring 0 until the formation factor pulls them out. Since
+    // targetRings already gates this via ringCountFor, plain i % targetRings
+    // gives an even spread that flows naturally when a new ring emerges.
     const memberCount = [0, 0, 0];
     for (let i = 0; i < count; i++) {
-      const r = i % ringCount;
+      const r = i % targetRings;
       v.orbiters[i].ringIdx = r;
       memberCount[r]++;
     }
@@ -394,14 +454,28 @@ export class PlanetLayer extends Container {
 
     const scale = v.displayScale;
     const majorR = v.baseRadius * ORBIT_BAND_MAJOR * scale;
-    const minorR = majorR * ORBIT_BAND_SQUISH;
-    const ease = 1 - Math.exp(-dt * 5);
+    // Squish morphs from near-circular to elliptical as the atom forms.
+    // At low formation every ring reads as a gentle halo; at max formation
+    // the overlapping ellipses resolve into the classic atom silhouette.
+    const squish =
+      ORBIT_BAND_SQUISH_LOOSE +
+      (ORBIT_BAND_SQUISH_ATOM - ORBIT_BAND_SQUISH_LOOSE) * v.atomFormation;
+    const minorR = majorR * squish;
+    const ease = 1 - Math.exp(-dt * ORBIT_POS_EASE_RATE);
 
     for (let i = 0; i < count; i++) {
       const o = v.orbiters[i];
+      o.wanderPhase += dt * 0.7;
       const r = o.ringIdx;
       const slot = slotIdx[r]++;
-      const theta = v.ringPhase[r] + (slot / memberCount[r]) * Math.PI * 2;
+      const memberSpacing = (slot / memberCount[r]) * Math.PI * 2;
+      // Per-orbiter personal slow drift — keeps the swarm breathing instead
+      // of marching in lockstep. Amplitude shrinks as the atom crystallizes
+      // so the final atom symbol reads as crisp even while single-ring
+      // formations feel organic.
+      const wanderAmp = 0.35 * (1 - 0.7 * v.atomFormation);
+      const wander = Math.sin(o.wanderPhase + o.slotPhase) * wanderAmp;
+      const theta = v.ringPhase[r] + memberSpacing + wander;
       const tilt = RING_TILTS[r];
       const ex = Math.cos(theta) * majorR;
       const ey = Math.sin(theta) * minorR;
@@ -419,17 +493,25 @@ export class PlanetLayer extends Container {
 
   /**
    * Faint ghost ellipses along each active atom ring. Fades with ringAlpha
-   * so new rings materialize rather than pop. Uses a short polyline instead
-   * of an ellipse stroke so we can follow the ring's tilt precisely.
+   * so new rings materialize rather than pop. Squish is driven by the
+   * continuous formation factor so paths morph from loose circles to the
+   * tilted atom ellipses as the swarm grows.
    */
   private drawAtomPaths(v: PlanetView, tint: number): void {
     v.atomPaths.clear();
     const scale = v.displayScale;
     const majorR = v.baseRadius * ORBIT_BAND_MAJOR * scale;
-    const minorR = majorR * ORBIT_BAND_SQUISH;
-    const segments = 48;
+    const squish =
+      ORBIT_BAND_SQUISH_LOOSE +
+      (ORBIT_BAND_SQUISH_ATOM - ORBIT_BAND_SQUISH_LOOSE) * v.atomFormation;
+    const minorR = majorR * squish;
+    const segments = 64;
+    // Path alpha grows with both per-ring alpha and the overall atom formation
+    // — paths stay near-invisible at loose single-ring stages and crystallize
+    // only as the atom asserts itself.
+    const formationGate = 0.15 + 0.85 * v.atomFormation;
     for (let k = 0; k < 3; k++) {
-      const alpha = v.ringAlpha[k];
+      const alpha = v.ringAlpha[k] * formationGate;
       if (alpha <= 0.02) continue;
       const tilt = RING_TILTS[k];
       const cosT = Math.cos(tilt);

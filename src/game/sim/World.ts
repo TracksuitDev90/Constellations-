@@ -42,10 +42,22 @@ export interface WorldEvents {
   onPlanetCapture?: (planetId: number, newOwner: number) => void;
   /** Fired when a ship lands. `friendly` = arrived at an owned planet. */
   onShipArrive?: (planetId: number, owner: number, friendly: boolean) => void;
+  /** Fired when a ship is consumed by absorb at its parent planet's center. */
+  onShipAbsorbed?: (planetId: number, owner: number) => void;
+  /**
+   * Fired every time an absorbed unit ticks up a ring's fill counter. Distinct
+   * from `onRingFilled` which only fires on the final unit that completes the ring.
+   */
+  onRingProgress?: (planetId: number, ringIndex: number, owner: number) => void;
   /** Fired when a ring finishes filling with absorbed units. */
   onRingFilled?: (planetId: number, ringIndex: number, owner: number) => void;
   /** Fired when a planet evolves to the next size (ring-fill complete). */
   onPlanetEvolve?: (planetId: number, owner: number, newType: PlanetType) => void;
+  /**
+   * Fired when a ship dies in mid-flight combat with an enemy ship. One call
+   * per ship killed; both sides of a 1:1 trade fire this event.
+   */
+  onShipDeath?: (owner: number, x: number, y: number) => void;
   onGameOver?: (winner: number | null) => void;
 }
 
@@ -56,8 +68,14 @@ export const SHIP_SPEED = 48;
  * continuous trickle, so a batch of ~20 drains in well under a second.
  */
 export const DEFAULT_EMIT_INTERVAL = 0.035;
-/** Max random exit-cone angle, in radians, around the direct line to target. */
-const EXIT_CONE = Math.PI / 3; // ±60°
+/**
+ * Max random exit-cone angle, in radians, around the direct line to target.
+ * Kept narrow so streams look like organized flows, not a shotgun blast —
+ * matches the single-file feel of Auralux: Constellations.
+ */
+const EXIT_CONE = Math.PI / 7; // ±~25°
+/** Distance (world units) at which two enemy ships mutually destroy each other. */
+const SHIP_COLLIDE_RADIUS = 5;
 
 /** Target orbit radius around a planet, expressed as a multiple of planet radius. */
 const ORBIT_RADIUS_MULT = 1.75;
@@ -309,7 +327,72 @@ export class World {
       else this.stepTransit(i, ship, dt, ships);
     }
 
+    // Mid-flight combat: enemy streams that cross destroy each other 1:1.
+    this.stepShipCombat();
+
     this.checkGameOver();
+  }
+
+  /**
+   * Check every pair of in-flight ships of different owners for proximity; any
+   * pair inside `SHIP_COLLIDE_RADIUS` mutually destroys. Grid bucketing keeps
+   * this cheap even with hundreds of ships in the air.
+   */
+  private stepShipCombat(): void {
+    const ships = this.ships.all;
+    const cell = Math.max(SHIP_COLLIDE_RADIUS * 2, 10);
+    const buckets = new Map<number, number[]>();
+    const keyOf = (cx: number, cy: number): number => cx * 100000 + cy;
+    const combatant = (s: Ship): boolean =>
+      s.active && (s.state === 'transit' || s.state === 'hovering');
+    for (let i = 0; i < ships.length; i++) {
+      const s = ships[i];
+      if (!combatant(s)) continue;
+      const cx = Math.floor(s.x / cell);
+      const cy = Math.floor(s.y / cell);
+      const key = keyOf(cx, cy);
+      let arr = buckets.get(key);
+      if (!arr) {
+        arr = [];
+        buckets.set(key, arr);
+      }
+      arr.push(i);
+    }
+
+    const r2 = SHIP_COLLIDE_RADIUS * SHIP_COLLIDE_RADIUS;
+    const dead = new Set<number>();
+    for (const [key, arr] of buckets) {
+      const cx = Math.floor(key / 100000);
+      const cy = key - cx * 100000;
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          const other = buckets.get(keyOf(cx + dx, cy + dy));
+          if (!other) continue;
+          for (const i of arr) {
+            if (dead.has(i)) continue;
+            const si = ships[i];
+            for (const j of other) {
+              if (j <= i) continue; // dedupe (only compare each pair once)
+              if (dead.has(j)) continue;
+              const sj = ships[j];
+              if (si.owner === sj.owner) continue;
+              const ddx = si.x - sj.x;
+              const ddy = si.y - sj.y;
+              if (ddx * ddx + ddy * ddy > r2) continue;
+              dead.add(i);
+              dead.add(j);
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    for (const idx of dead) {
+      const s = ships[idx];
+      this.events.onShipDeath?.(s.owner, s.x, s.y);
+      this.ships.kill(idx);
+    }
   }
 
   /** Spawn a new orbit unit emerging from the planet center. */
@@ -366,7 +449,7 @@ export class World {
       ship.vy = (dirY / m) * SHIP_SPEED;
       ship.speed = SHIP_SPEED;
       ship.turnRate = 1.4 + Math.random() * 1.6;
-      ship.wobbleAmp = (Math.random() - 0.5) * 0.6;
+      ship.wobbleAmp = (Math.random() - 0.5) * 0.3;
       ship.wobblePhase = Math.random() * Math.PI * 2;
       this.events.onShipLaunch?.(stream.owner);
       return;
@@ -387,7 +470,7 @@ export class World {
       vx: Math.cos(headingAngle) * SHIP_SPEED,
       vy: Math.sin(headingAngle) * SHIP_SPEED,
       turnRate: 1.4 + Math.random() * 1.6,
-      wobbleAmp: (Math.random() - 0.5) * 0.6,
+      wobbleAmp: (Math.random() - 0.5) * 0.3,
       wobblePhase: Math.random() * Math.PI * 2,
       state: 'transit',
       sourcePlanet: src.id,
@@ -502,6 +585,7 @@ export class World {
 
   private consumeAbsorbed(planet: Planet): void {
     if (planet.garrison > 0) planet.garrison -= 1;
+    if (planet.owner !== null) this.events.onShipAbsorbed?.(planet.id, planet.owner);
     // Absorb has two jobs: heal first if the planet is damaged, then fill rings.
     if (planet.health < planet.maxHealth) {
       planet.health = Math.min(planet.maxHealth, planet.health + 1);
@@ -514,8 +598,9 @@ export class World {
       if (before >= cap) continue;
       const after = before + 1;
       planet.ringFillProgress[i] = after;
-      if (after >= cap && planet.owner !== null) {
-        this.events.onRingFilled?.(planet.id, i, planet.owner);
+      if (planet.owner !== null) {
+        this.events.onRingProgress?.(planet.id, i, planet.owner);
+        if (after >= cap) this.events.onRingFilled?.(planet.id, i, planet.owner);
       }
       break;
     }

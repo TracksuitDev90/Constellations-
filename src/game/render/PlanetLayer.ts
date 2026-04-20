@@ -18,6 +18,12 @@ const ORBIT_SPEED_MAX = 1.1;
 
 /** Starting visual scale used when a planet evolves — it pops up from this. */
 const EVOLVE_POP_START = 0.72;
+/**
+ * Extra visual scale applied when every ring is completely full, before the
+ * evolve pop. Lets the planet visibly swell as it "fills up" so the player
+ * feels the growth build up before the explosive tier-up.
+ */
+const RING_GROWTH_MAX = 0.35;
 
 /** Map the baked body's pixel diameter back down to the planet's world radius. */
 const computeBodyBaseScale = (radius: number): number => {
@@ -181,14 +187,27 @@ export class PlanetLayer extends Container {
       v.swirlPhase += dt * (0.6 + (anyRingActive ? 0.35 : 0));
       const swirlWobble = anyRingActive ? 1 + Math.sin(v.swirlPhase) * 0.012 : 1;
 
+      // Aggregate eased ring fill — drives a smooth size-up as the player
+      // feeds orbit units into the planet. Resets to 0 on evolve (rings clear).
+      let ringFillNorm = 0;
+      if (v.ringCount > 0) {
+        let s = 0;
+        for (let k = 0; k < v.ringCount; k++) s += v.ringProgress[k] ?? 0;
+        ringFillNorm = Math.max(0, Math.min(1, s / v.ringCount));
+      }
+      const ringGrowth = 1 + ringFillNorm * RING_GROWTH_MAX;
+
       const pulse = 1 + p.capturePulse * 0.2 + p.evolvePulse * 0.15;
-      v.body.scale.set(v.bodyBaseScale * v.displayScale * pulse * swirlWobble);
+      v.body.scale.set(v.bodyBaseScale * v.displayScale * pulse * swirlWobble * ringGrowth);
       v.body.rotation = anyRingActive ? Math.sin(v.swirlPhase * 0.5) * 0.06 : 0;
-      v.halo.scale.set(v.displayScale * pulse);
+      v.halo.scale.set(v.displayScale * pulse * ringGrowth);
+
+      // Effective radius rings / count / selection should space themselves off.
+      const effRadius = v.baseRadius * v.displayScale * ringGrowth;
 
       // Count readout sits just below the planet.
       v.count.text = String(p.garrison);
-      v.count.y = v.baseRadius * v.displayScale + 16;
+      v.count.y = effRadius + 16;
 
       const pal = paletteFor(p.owner);
 
@@ -209,7 +228,7 @@ export class PlanetLayer extends Container {
           const progress = v.ringProgress[k];
 
           const rMid =
-            v.baseRadius * v.displayScale +
+            effRadius +
             RING_INSET +
             RING_WIDTH / 2 +
             k * (RING_WIDTH + RING_GAP);
@@ -270,7 +289,7 @@ export class PlanetLayer extends Container {
       v.shockwave.clear();
       if (p.evolvePulse > 0.01) {
         const t = 1 - p.evolvePulse; // 0 at spawn → 1 as it fades.
-        const baseR = v.baseRadius * v.displayScale;
+        const baseR = effRadius;
         const shockR = baseR * (1.2 + t * 2.4);
         const alpha = p.evolvePulse * 0.85;
         v.shockwave
@@ -288,11 +307,7 @@ export class PlanetLayer extends Container {
           p.ringCount > 0
             ? RING_INSET + p.ringCount * (RING_WIDTH + RING_GAP) - RING_GAP
             : 8;
-        const outer =
-          v.baseRadius * v.displayScale +
-          ringsOuter +
-          8 +
-          Math.sin(this.time * 4) * 1.6;
+        const outer = effRadius + ringsOuter + 8 + Math.sin(this.time * 4) * 1.6;
         v.ring.circle(0, 0, outer).stroke({ width: 2.5, color: pal.ring, alpha: 0.95 });
       }
 

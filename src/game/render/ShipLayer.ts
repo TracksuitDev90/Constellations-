@@ -39,12 +39,16 @@ export class ShipLayer extends Container {
         this.entries[i] = entry;
       }
       if (s.active) {
-        entry.sprite.visible = true;
+        // Orbiting ships are drawn exclusively by the PlanetLayer's atom-ring
+        // visualization. Hiding them here avoids double-rendering the
+        // garrison as both loose orbit dots and structured atom electrons.
+        const hidden = s.state === 'orbiting';
+        entry.sprite.visible = !hidden;
         entry.sprite.x = s.x;
         entry.sprite.y = s.y;
         entry.sprite.tint = paletteFor(s.owner).ship;
-        // Transit ships align to velocity and stretch into a comet. Orbiters
-        // and absorb/hover units stay compact glow dots.
+        // Transit ships align to velocity and stretch into a comet. Absorb
+        // and hover units stay compact glow dots.
         if (s.state === 'transit') {
           const speed = Math.hypot(s.vx, s.vy);
           if (speed > 0.01) entry.sprite.rotation = Math.atan2(s.vy, s.vx);

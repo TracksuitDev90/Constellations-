@@ -11,10 +11,34 @@ import {
 import { planetAssetsReady } from './planetAssets.js';
 
 const MAX_ORBITERS = 48;
-const ORBIT_BAND_INNER = 1.55; // × planet radius (outside ring art)
-const ORBIT_BAND_OUTER = 1.9;
-const ORBIT_SPEED_MIN = 0.5; // rad/s
-const ORBIT_SPEED_MAX = 1.1;
+/** Major-axis radius of an atom-ring, as a multiple of planet radius. */
+const ORBIT_BAND_MAJOR = 1.85;
+/** Minor-axis as a fraction of major — small enough to read as tilted orbits. */
+const ORBIT_BAND_SQUISH = 0.32;
+/**
+ * Ring tilts for up to 3 nested orbits. Evenly spaced every 60° so the three
+ * overlapping ellipses spell out the classic atom-symbol silhouette.
+ */
+const RING_TILTS = [0, Math.PI / 3, (2 * Math.PI) / 3];
+/**
+ * Per-ring angular speeds (rad/s). Alternating signs + slightly different
+ * magnitudes make the electrons look like independent orbits rather than a
+ * rigid merry-go-round.
+ */
+const RING_SPEEDS = [0.55, -0.78, 0.94];
+/**
+ * Thresholds at which a new orbit ring emerges. Fewer orbiters ⇒ a simple
+ * single ring. As the garrison grows a second and eventually third ring
+ * pop in, producing the atom-symbol shape the player recognizes.
+ */
+const RING_GROWTH_THRESHOLDS = [8, 16];
+
+const ringCountFor = (count: number): number => {
+  if (count <= 0) return 0;
+  if (count <= RING_GROWTH_THRESHOLDS[0]) return 1;
+  if (count <= RING_GROWTH_THRESHOLDS[1]) return 2;
+  return 3;
+};
 
 /** Starting visual scale used when a planet evolves — it pops up from this. */
 const EVOLVE_POP_START = 0.72;
@@ -34,9 +58,9 @@ const computeBodyBaseScale = (radius: number): number => {
 
 interface Orbiter {
   sprite: Sprite;
-  angle: number;
-  radius: number;
-  speed: number;
+  /** Which atom ring (0..2) this electron is assigned to. */
+  ringIdx: number;
+  /** Personal twinkle phase for alpha flicker. */
   phase: number;
 }
 
@@ -47,6 +71,7 @@ interface PlanetView {
   body: Sprite;
   ring: Graphics;
   rings: Graphics; // capacity rings (per-planet ringCount)
+  atomPaths: Graphics; // faint orbit ellipses that the electrons follow
   shockwave: Graphics;
   count: Text;
   orbitRoot: Container;
@@ -59,6 +84,10 @@ interface PlanetView {
   swirlPhase: number;
   /** Eased progress per ring (0..1). */
   ringProgress: number[];
+  /** Per-atom-ring shared phase, advanced by RING_SPEEDS each frame. */
+  ringPhase: number[];
+  /** Per-atom-ring alpha [0..1] for smooth fade-in as new rings emerge. */
+  ringAlpha: number[];
   /**
    * Scale that maps the body sprite's pixel diameter to the desired world
    * radius. Rebuilt on size evolution so higher-res textures stay crisp.
@@ -89,11 +118,14 @@ export class PlanetLayer extends Container {
       halo.anchor.set(0.5);
       halo.tint = paletteFor(planet.owner).glow;
 
-      const body = new Sprite(makePlanetBodyTexture(app, planet.owner, planet.radius, planet.id));
+      const body = new Sprite(
+        makePlanetBodyTexture(app, planet.owner, planet.radius, planet.id, planet.type),
+      );
       body.anchor.set(0.5);
 
       const ring = new Graphics();
       const rings = new Graphics();
+      const atomPaths = new Graphics();
       const shockwave = new Graphics();
 
       const orbitRoot = new Container();
@@ -111,7 +143,7 @@ export class PlanetLayer extends Container {
       });
       count.anchor.set(0.5);
 
-      container.addChild(halo, ring, rings, body, orbitRoot, shockwave, count);
+      container.addChild(halo, ring, rings, body, atomPaths, orbitRoot, shockwave, count);
       this.addChild(container);
 
       this.views.push({
@@ -121,6 +153,7 @@ export class PlanetLayer extends Container {
         body,
         ring,
         rings,
+        atomPaths,
         shockwave,
         count,
         orbitRoot,
@@ -132,6 +165,12 @@ export class PlanetLayer extends Container {
         ringCount: planet.ringCount,
         swirlPhase: Math.random() * Math.PI * 2,
         ringProgress: new Array(planet.ringCount).fill(0),
+        ringPhase: [
+          Math.random() * Math.PI * 2,
+          Math.random() * Math.PI * 2,
+          Math.random() * Math.PI * 2,
+        ],
+        ringAlpha: [0, 0, 0],
         bodyBaseScale: computeBodyBaseScale(planet.radius),
       });
     }
@@ -154,7 +193,7 @@ export class PlanetLayer extends Container {
         v.type = p.type;
         v.baseRadius = p.radius;
         v.bodyBaseScale = computeBodyBaseScale(p.radius);
-        v.body.texture = makePlanetBodyTexture(this.app, p.owner, p.radius, p.id);
+        v.body.texture = makePlanetBodyTexture(this.app, p.owner, p.radius, p.id, p.type);
         v.halo.texture = makePlanetHaloTexture(this.app, p.owner, p.radius);
         v.displayScale = EVOLVE_POP_START;
         v.count.style.fontSize = Math.max(13, Math.round(p.radius * 0.7));
@@ -164,7 +203,7 @@ export class PlanetLayer extends Container {
       // (ownership is communicated by the halo + rings + orbiters).
       if (p.owner !== v.lastOwner) {
         if (!planetAssetsReady()) {
-          v.body.texture = makePlanetBodyTexture(this.app, p.owner, p.radius, p.id);
+          v.body.texture = makePlanetBodyTexture(this.app, p.owner, p.radius, p.id, p.type);
         }
         v.halo.texture = makePlanetHaloTexture(this.app, p.owner, p.radius);
         v.halo.tint = paletteFor(p.owner).glow;
@@ -283,12 +322,14 @@ export class PlanetLayer extends Container {
         v.ring.circle(0, 0, outer).stroke({ width: 2.5, color: pal.ring, alpha: 0.95 });
       }
 
-      // Orbiters: represent garrison (up to cap) as floating ships.
+      // Orbiters: represent garrison (up to cap) as atom-symbol electrons.
       if (p.owner !== null) {
         this.syncOrbiters(v, Math.min(p.garrison, MAX_ORBITERS), p.owner);
         this.tickOrbiters(v, dt);
+        this.drawAtomPaths(v, pal.ring);
       } else {
         if (v.orbiters.length > 0) this.clearOrbiters(v);
+        v.atomPaths.clear();
       }
     }
   }
@@ -303,16 +344,14 @@ export class PlanetLayer extends Container {
       sprite.anchor.set(0.5);
       sprite.scale.set(0.36);
       sprite.tint = shipTint;
+      // Seed new electrons at a random point along the outermost active
+      // orbit so they slide into formation rather than popping in at origin.
+      sprite.x = (Math.random() - 0.5) * v.baseRadius * 0.5;
+      sprite.y = (Math.random() - 0.5) * v.baseRadius * 0.5;
       v.orbitRoot.addChild(sprite);
       v.orbiters.push({
         sprite,
-        angle: Math.random() * Math.PI * 2,
-        radius:
-          v.baseRadius *
-          (ORBIT_BAND_INNER + Math.random() * (ORBIT_BAND_OUTER - ORBIT_BAND_INNER)),
-        speed:
-          (ORBIT_SPEED_MIN + Math.random() * (ORBIT_SPEED_MAX - ORBIT_SPEED_MIN)) *
-          (Math.random() < 0.5 ? 1 : -1),
+        ringIdx: 0,
         phase: Math.random() * Math.PI * 2,
       });
     }
@@ -325,14 +364,87 @@ export class PlanetLayer extends Container {
   }
 
   private tickOrbiters(v: PlanetView, dt: number): void {
+    const count = v.orbiters.length;
+    const ringCount = ringCountFor(count);
+
+    // Fade each ring's alpha toward its active state — new rings emerge
+    // smoothly, retiring rings fade out, so transitions look like matter
+    // settling rather than teleporting.
+    const alphaEase = 1 - Math.exp(-dt * 3);
+    for (let k = 0; k < 3; k++) {
+      const targetA = k < ringCount ? 1 : 0;
+      v.ringAlpha[k] += (targetA - v.ringAlpha[k]) * alphaEase;
+    }
+
+    if (count === 0) return;
+
+    // Advance shared phase per active ring.
+    for (let k = 0; k < ringCount; k++) {
+      v.ringPhase[k] += RING_SPEEDS[k] * dt;
+    }
+
+    // Round-robin assignment: distribute electrons evenly across rings.
+    const memberCount = [0, 0, 0];
+    for (let i = 0; i < count; i++) {
+      const r = i % ringCount;
+      v.orbiters[i].ringIdx = r;
+      memberCount[r]++;
+    }
+    const slotIdx = [0, 0, 0];
+
     const scale = v.displayScale;
-    for (const o of v.orbiters) {
-      o.angle += o.speed * dt;
-      const r = o.radius * scale;
-      o.sprite.x = Math.cos(o.angle) * r;
-      o.sprite.y = Math.sin(o.angle) * r;
-      const a = 0.65 + 0.35 * Math.sin(this.time * 2.2 + o.phase);
+    const majorR = v.baseRadius * ORBIT_BAND_MAJOR * scale;
+    const minorR = majorR * ORBIT_BAND_SQUISH;
+    const ease = 1 - Math.exp(-dt * 5);
+
+    for (let i = 0; i < count; i++) {
+      const o = v.orbiters[i];
+      const r = o.ringIdx;
+      const slot = slotIdx[r]++;
+      const theta = v.ringPhase[r] + (slot / memberCount[r]) * Math.PI * 2;
+      const tilt = RING_TILTS[r];
+      const ex = Math.cos(theta) * majorR;
+      const ey = Math.sin(theta) * minorR;
+      const cosT = Math.cos(tilt);
+      const sinT = Math.sin(tilt);
+      const tx = ex * cosT - ey * sinT;
+      const ty = ex * sinT + ey * cosT;
+
+      o.sprite.x += (tx - o.sprite.x) * ease;
+      o.sprite.y += (ty - o.sprite.y) * ease;
+      const a = 0.7 + 0.3 * Math.sin(this.time * 2.2 + o.phase);
       o.sprite.alpha = a;
+    }
+  }
+
+  /**
+   * Faint ghost ellipses along each active atom ring. Fades with ringAlpha
+   * so new rings materialize rather than pop. Uses a short polyline instead
+   * of an ellipse stroke so we can follow the ring's tilt precisely.
+   */
+  private drawAtomPaths(v: PlanetView, tint: number): void {
+    v.atomPaths.clear();
+    const scale = v.displayScale;
+    const majorR = v.baseRadius * ORBIT_BAND_MAJOR * scale;
+    const minorR = majorR * ORBIT_BAND_SQUISH;
+    const segments = 48;
+    for (let k = 0; k < 3; k++) {
+      const alpha = v.ringAlpha[k];
+      if (alpha <= 0.02) continue;
+      const tilt = RING_TILTS[k];
+      const cosT = Math.cos(tilt);
+      const sinT = Math.sin(tilt);
+      for (let s = 0; s < segments; s++) {
+        const theta = (s / segments) * Math.PI * 2;
+        const ex = Math.cos(theta) * majorR;
+        const ey = Math.sin(theta) * minorR;
+        const x = ex * cosT - ey * sinT;
+        const y = ex * sinT + ey * cosT;
+        if (s === 0) v.atomPaths.moveTo(x, y);
+        else v.atomPaths.lineTo(x, y);
+      }
+      v.atomPaths.closePath();
+      v.atomPaths.stroke({ width: 1.2, color: tint, alpha: 0.22 * alpha });
     }
   }
 

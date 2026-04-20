@@ -7,6 +7,7 @@ import {
 } from 'pixi.js';
 import { adjustColor, paletteFor, toward } from '../../util/color.js';
 import { bakePlanetSphere, planetAssetsReady } from './planetAssets.js';
+import type { PlanetType } from '../sim/Planet.js';
 
 const cache = new Map<string, Texture>();
 
@@ -78,22 +79,34 @@ export const bakedBodyDiameter = (radius: number): number =>
   Math.max(128, Math.round(radius * 3));
 
 /**
- * Pick a stable archetype from a planet's seed. Photographic archetypes share
- * the rotation with three additional procedural-only "alien" looks, so a
- * meaningful slice of the constellation feels otherworldly.
+ * Pick a stable archetype from a planet's seed. Regular-sized planets (type 0)
+ * only draw from the photographic set — rock (terrestrial), ice (icy), lava
+ * (molten), gas giant, and Mars-like alien — so every "small" world in the
+ * constellation reads as a real, textured body. Larger planets can roll the
+ * procedural-only exotic looks (crystalline / nebula-core / bio-organic) for
+ * visual variety.
  */
-export const archetypeForSeed = (seed: number): PlanetArchetype => {
+const PHOTOGRAPHIC_ARCHETYPES: PlanetArchetype[] = [
+  'terrestrial',
+  'gasGiant',
+  'icy',
+  'molten',
+  'alien',
+];
+
+const ALL_ARCHETYPES: PlanetArchetype[] = [
+  ...PHOTOGRAPHIC_ARCHETYPES,
+  'crystalline',
+  'nebulaCore',
+  'bioOrganic',
+];
+
+export const archetypeForSeed = (
+  seed: number,
+  planetType?: PlanetType,
+): PlanetArchetype => {
   const h = Math.abs(Math.imul(seed + 0x9e3779b9, 2654435761)) >>> 0;
-  const list: PlanetArchetype[] = [
-    'terrestrial',
-    'gasGiant',
-    'icy',
-    'molten',
-    'alien',
-    'crystalline',
-    'nebulaCore',
-    'bioOrganic',
-  ];
+  const list = planetType === 0 ? PHOTOGRAPHIC_ARCHETYPES : ALL_ARCHETYPES;
   return list[h % list.length];
 };
 
@@ -107,8 +120,9 @@ export const makePlanetBodyTexture = (
   ownerId: number | null,
   radius: number,
   seed: number,
+  planetType?: PlanetType,
 ): Texture => {
-  const archetype = archetypeForSeed(seed);
+  const archetype = archetypeForSeed(seed, planetType);
 
   // Prefer the baked photographic sphere when the asset set is available —
   // unless this is a procedural-only archetype (the alien variants), which

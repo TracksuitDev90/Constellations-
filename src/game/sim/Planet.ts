@@ -10,12 +10,16 @@ export type PlanetType = 0 | 1 | 2 | 3; // Small, Large, Extra Large, XXL
 /** Authored ring count per planet — independent of size, capped by the size. */
 export type RingCount = 0 | 1 | 2;
 
-/** World-space radius for each size. */
+/**
+ * World-space radius for each size. Every tier is sized 1.5× the original
+ * baseline so planets read big on screen. XXL is only ever reached through
+ * evolution — map authors should not pick it as a starting type.
+ */
 export const SIZE_RADIUS: Record<PlanetType, number> = {
-  0: 18,
-  1: 26,
-  2: 34,
-  3: 44,
+  0: 27,
+  1: 39,
+  2: 51,
+  3: 66,
 };
 
 /** Base production rate (ships/sec) per size. Bigger = meaningfully faster. */

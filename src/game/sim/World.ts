@@ -112,7 +112,10 @@ export class World {
     this.height = map.height;
     this.events = events;
     this.planets = map.planets.map((p, i) => {
-      const type: PlanetType = p.type ?? 0;
+      // XXL is terminal: only reachable by evolving via ring-fill. Silently
+      // downgrade any authored XXL so the growth path is preserved.
+      const authoredType: PlanetType = p.type ?? 0;
+      const type: PlanetType = authoredType >= 3 ? 2 : authoredType;
       const ringCount: RingCount = clampRingCount(type, p.ringCount ?? 0);
       const maxHealth = BASE_MAX_HEALTH[type];
       return {

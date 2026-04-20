@@ -3,7 +3,7 @@ import { BasicAI } from './ai/BasicAI.js';
 import { Audio } from './audio/Audio.js';
 import { Input } from './input/Input.js';
 import { Selection } from './input/Selection.js';
-import { ORION_MAP } from './maps/orion.js';
+import { generateOrionMap } from './maps/orion.js';
 import { RING_CAPACITY_FOR_SIZE, type Planet } from './sim/Planet.js';
 import { loadPlanetAssets } from './render/planetAssets.js';
 import { Renderer } from './render/Renderer.js';
@@ -88,7 +88,7 @@ export class Game {
     this.app.stage.filters = [];
 
     this.world = new World(
-      ORION_MAP,
+      generateOrionMap(),
       [
         { id: 0, isAI: false, name: 'You' },
         { id: 1, isAI: true, name: 'Rival' },

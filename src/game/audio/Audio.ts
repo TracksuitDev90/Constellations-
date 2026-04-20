@@ -35,6 +35,9 @@ export class Audio {
   /** Per-planet throttle so a flood of arrivals doesn't drown out the ambient. */
   private lastArriveAt = new Map<number, number>();
   private lastRingFillAt = 0;
+  private lastRingTickAt = new Map<number, number>();
+  private lastAbsorbAt = new Map<number, number>();
+  private lastDeathAt = 0;
   muted = false;
   musicVolume = 0.35;
   sfxVolume = 0.45;
@@ -208,6 +211,84 @@ export class Audio {
       osc.start(start);
       osc.stop(start + 0.95);
     }
+  }
+
+  /**
+   * Soft percussive click when an absorbed unit reaches the planet center.
+   * Per-planet throttle keeps the sound sparse during heavy absorb sessions.
+   */
+  shipAbsorbed(planetId: number): void {
+    if (!this.ctx || !this.sfxGain || this.muted) return;
+    const now = this.ctx.currentTime;
+    const last = this.lastAbsorbAt.get(planetId) ?? 0;
+    if (now - last < 0.045) return;
+    this.lastAbsorbAt.set(planetId, now);
+    const osc = this.ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(720, now);
+    osc.frequency.exponentialRampToValueAtTime(360, now + 0.09);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.0001, now);
+    g.gain.exponentialRampToValueAtTime(0.06, now + 0.005);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + 0.1);
+    osc.connect(g).connect(this.sfxGain);
+    osc.start(now);
+    osc.stop(now + 0.12);
+  }
+
+  /**
+   * Tiny ascending pluck as each absorbed unit ticks a ring's fill counter.
+   * Pitch rises with ring index so the player feels the build-up to a full ring.
+   */
+  ringTick(planetId: number, ringIndex: number): void {
+    if (!this.ctx || !this.sfxGain || this.muted) return;
+    const now = this.ctx.currentTime;
+    const key = planetId * 8 + ringIndex;
+    const last = this.lastRingTickAt.get(key) ?? 0;
+    if (now - last < 0.04) return;
+    this.lastRingTickAt.set(key, now);
+    const base = ringIndex === 0 ? 880 : 1174.66; // A5 or D6
+    const osc = this.ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.value = base;
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.0001, now);
+    g.gain.exponentialRampToValueAtTime(0.045, now + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + 0.14);
+    osc.connect(g).connect(this.sfxGain);
+    osc.start(now);
+    osc.stop(now + 0.16);
+  }
+
+  /**
+   * Short breathy noise burst when two enemy ships mutually annihilate in
+   * mid-flight. Kept quiet: combat is frequent and shouldn't overpower ambient.
+   */
+  shipDeath(): void {
+    if (!this.ctx || !this.sfxGain || this.muted) return;
+    const now = this.ctx.currentTime;
+    if (now - this.lastDeathAt < 0.025) return;
+    this.lastDeathAt = now;
+    const dur = 0.14;
+    const sampleCount = Math.max(1, Math.floor(this.ctx.sampleRate * dur));
+    const buf = this.ctx.createBuffer(1, sampleCount, this.ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < sampleCount; i++) {
+      // Noise with a fast decay envelope.
+      const t = i / sampleCount;
+      data[i] = (Math.random() * 2 - 1) * Math.pow(1 - t, 2.2);
+    }
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    const filter = this.ctx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.value = 1400;
+    filter.Q.value = 0.9;
+    const g = this.ctx.createGain();
+    g.gain.value = 0.11;
+    src.connect(filter).connect(g).connect(this.sfxGain);
+    src.start(now);
+    src.stop(now + dur + 0.02);
   }
 
   endSting(win: boolean): void {

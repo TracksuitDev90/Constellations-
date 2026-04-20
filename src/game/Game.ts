@@ -110,6 +110,17 @@ export class Game {
           if (owner !== 0) return;
           this.audio.ringFilled(ringIndex);
         },
+        onRingProgress: (planetId, ringIndex, owner) => {
+          if (owner !== 0) return;
+          this.audio.ringTick(planetId, ringIndex);
+        },
+        onShipAbsorbed: (planetId, owner) => {
+          if (owner !== 0) return;
+          this.audio.shipAbsorbed(planetId);
+        },
+        onShipDeath: () => {
+          this.audio.shipDeath();
+        },
         onPlanetEvolve: (_planetId, owner) => {
           if (owner !== 0) return;
           // Reuse the capture sting — evolving a planet is a comparably

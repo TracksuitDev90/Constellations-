@@ -211,8 +211,9 @@ export class PlanetLayer extends Container {
 
       const pal = paletteFor(p.owner);
 
-      // Capacity rings: thick concentric bands that smoothly fill with the
-      // owner's ring color as absorbed units accumulate.
+      // Capacity rings: many fine concentric sub-bands that fill with the
+      // owner's color as absorbed units accumulate. Sub-bands of varied width
+      // and density read as dust/ice debris rather than a solid hoop.
       v.rings.clear();
       const RING_WIDTH = Math.max(4, v.baseRadius * 0.35);
       const RING_GAP = Math.max(3, v.baseRadius * 0.12);
@@ -233,48 +234,19 @@ export class PlanetLayer extends Container {
             RING_WIDTH / 2 +
             k * (RING_WIDTH + RING_GAP);
 
-          // Dim empty band (two-tone rails + faint fill).
-          const railInner = rMid - RING_WIDTH / 2;
-          const railOuter = rMid + RING_WIDTH / 2;
-          v.rings.circle(0, 0, railInner).stroke({
-            width: 1,
-            color: pal.ring,
-            alpha: 0.28,
-          });
-          v.rings.circle(0, 0, railOuter).stroke({
-            width: 1,
-            color: pal.ring,
-            alpha: 0.28,
-          });
-          v.rings.circle(0, 0, rMid).stroke({
-            width: RING_WIDTH - 1.5,
-            color: pal.ring,
-            alpha: 0.08,
-          });
-
-          // Filled progress arc — thick band, from top, clockwise.
-          if (progress > 0.001) {
-            const sweep = Math.PI * 2 * progress;
-            const start = -Math.PI / 2;
-            v.rings.arc(0, 0, rMid, start, start + sweep).stroke({
-              width: RING_WIDTH + 3,
-              color: pal.glow,
-              alpha: 0.35,
-            });
-            v.rings.arc(0, 0, rMid, start, start + sweep).stroke({
-              width: RING_WIDTH - 1,
-              color: pal.ring,
-              alpha: 0.95,
-            });
-            v.rings.arc(0, 0, rMid - RING_WIDTH * 0.2, start, start + sweep).stroke({
-              width: Math.max(1, RING_WIDTH * 0.18),
-              color: 0xffffff,
-              alpha: 0.55 * progress,
-            });
-          }
+          drawRealisticRing(
+            v.rings,
+            rMid,
+            RING_WIDTH,
+            progress,
+            pal.ring,
+            pal.glow,
+            p.id * 13 + k,
+            this.time,
+          );
 
           if (progress > 0.995) {
-            const pulseR = railOuter + 1 + Math.sin(this.time * 3 + k * 0.8) * 1.2;
+            const pulseR = rMid + RING_WIDTH / 2 + 1 + Math.sin(this.time * 3 + k * 0.8) * 1.2;
             v.rings.circle(0, 0, pulseR).stroke({
               width: 1.5,
               color: pal.glow,
@@ -372,3 +344,108 @@ export class PlanetLayer extends Container {
     v.orbiters.length = 0;
   }
 }
+
+/**
+ * Deterministic hash → [0, 1). Keeps each planet's ring pattern identical
+ * frame-to-frame so sub-bands don't shimmer at the pixel level.
+ */
+const seeded = (seed: number): number => {
+  // Multiply-with-carry style; fine for visual-only jitter.
+  const x = Math.sin(seed * 9301 + 49297) * 233280;
+  return x - Math.floor(x);
+};
+
+/**
+ * Render a single capacity ring as a dense stack of fine sub-bands — Saturn-
+ * style dust/ice rings rather than a solid hoop. The filled arc (0..progress)
+ * lights each sub-band in the owner's color; the empty arc shows the same
+ * bands at a dim neutral alpha so the band structure reads even at 0% fill.
+ *
+ * All randomness is seeded off a per-ring id so the pattern is stable.
+ */
+const drawRealisticRing = (
+  g: import('pixi.js').Graphics,
+  rMid: number,
+  ringWidth: number,
+  progress: number,
+  ringColor: number,
+  glowColor: number,
+  seed: number,
+  time: number,
+): void => {
+  const innerR = rMid - ringWidth / 2;
+  const outerR = rMid + ringWidth / 2;
+  const sweep = Math.PI * 2 * progress;
+  const start = -Math.PI / 2;
+
+  // Faint wide dust halo behind the structured bands — gives the whole ring
+  // a soft, hazy body.
+  g.circle(0, 0, rMid).stroke({ width: ringWidth + 2, color: ringColor, alpha: 0.05 });
+
+  // Pre-compute sub-band layout. 9 bands with jittered positions + widths.
+  const subCount = 9;
+  const bands: Array<{ r: number; w: number; a: number; glow: boolean }> = [];
+  for (let i = 0; i < subCount; i++) {
+    const t = (i + 0.5) / subCount;
+    // Slight variance in radial position (± up to 12% of its own cell width).
+    const cellH = ringWidth / subCount;
+    const jitter = (seeded(seed + i) - 0.5) * cellH * 0.6;
+    const r = innerR + t * ringWidth + jitter;
+    // Width varies — most bands thin, a couple wide — mimicking real dust density.
+    const wRand = seeded(seed + i * 7 + 3);
+    const w = wRand < 0.18
+      ? cellH * (1.4 + seeded(seed + i * 11) * 0.5) // occasional thick band
+      : cellH * (0.35 + seeded(seed + i * 13) * 0.55); // typical thin strand
+    const aRand = seeded(seed + i * 17);
+    // Base opacity skews middle-heavy so edges fade out naturally.
+    const edgeFade = 1 - Math.pow(Math.abs(t - 0.5) * 2, 1.8);
+    const a = 0.18 + aRand * 0.28 * edgeFade;
+    const glow = wRand < 0.12; // rare bright "Cassini-adjacent" band
+    bands.push({ r, w, a, glow });
+  }
+
+  // Dim empty rails at the exact inner/outer extents — keeps the ring
+  // silhouette crisp even when every band is low-alpha.
+  g.circle(0, 0, innerR).stroke({ width: 0.8, color: ringColor, alpha: 0.35 });
+  g.circle(0, 0, outerR).stroke({ width: 0.8, color: ringColor, alpha: 0.35 });
+
+  // Empty arc: bands in a muted neutral tone so the ring reads as structure
+  // even before the player has fed it anything.
+  if (progress < 0.999) {
+    const emptyStart = start + sweep;
+    const emptyEnd = start + Math.PI * 2;
+    for (const b of bands) {
+      g.arc(0, 0, b.r, emptyStart, emptyEnd).stroke({
+        width: b.w,
+        color: ringColor,
+        alpha: b.a * 0.45,
+      });
+    }
+  }
+
+  // Filled arc: same band layout, owner-tinted and brighter. A subtle outer
+  // glow arc underneath sells the emissive look.
+  if (progress > 0.001) {
+    const filledEnd = start + sweep;
+    g.arc(0, 0, rMid, start, filledEnd).stroke({
+      width: ringWidth + 4,
+      color: glowColor,
+      alpha: 0.22,
+    });
+    for (const b of bands) {
+      g.arc(0, 0, b.r, start, filledEnd).stroke({
+        width: b.w,
+        color: b.glow ? glowColor : ringColor,
+        alpha: Math.min(1, b.a * 2.6),
+      });
+    }
+    // A fine bright "rim" along the middle of the filled arc reads as the
+    // leading edge of the accumulated matter.
+    const rimPulse = 0.55 + 0.2 * Math.sin(time * 2.6 + seed * 0.5);
+    g.arc(0, 0, rMid, start, filledEnd).stroke({
+      width: Math.max(1, ringWidth * 0.12),
+      color: 0xffffff,
+      alpha: 0.45 * progress * rimPulse,
+    });
+  }
+};

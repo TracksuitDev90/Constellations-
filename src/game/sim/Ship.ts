@@ -53,6 +53,13 @@ export interface Ship {
   wanderPhase: number;
   /** Set by Selection; renderers may highlight selected units. */
   isSelected: boolean;
+  /**
+   * When true and the ship arrives at a friendly planet that has room to
+   * absorb (rings, or damage to heal), it transitions straight into 'absorbing'
+   * instead of joining orbit. Set by commands targeting ringed reinforcement
+   * worlds so the player visibly feeds rings with a single tap.
+   */
+  absorbOnArrive: boolean;
 }
 
 export interface SpawnOptions {
@@ -70,6 +77,7 @@ export interface SpawnOptions {
   orbitRadius?: number;
   orbitDir?: number;
   wanderPhase?: number;
+  absorbOnArrive?: boolean;
 }
 
 export class ShipPool {
@@ -91,6 +99,7 @@ export class ShipPool {
     const orbitRadius = opts.orbitRadius ?? 0;
     const orbitDir = opts.orbitDir ?? 1;
     const wanderPhase = opts.wanderPhase ?? Math.random() * Math.PI * 2;
+    const absorbOnArrive = opts.absorbOnArrive ?? false;
     const idx = this.freeList.pop();
     if (idx !== undefined) {
       const s = this.ships[idx];
@@ -115,6 +124,7 @@ export class ShipPool {
       s.orbitDir = orbitDir;
       s.wanderPhase = wanderPhase;
       s.isSelected = false;
+      s.absorbOnArrive = absorbOnArrive;
       return idx;
     }
     const ship: Ship = {
@@ -139,6 +149,7 @@ export class ShipPool {
       orbitDir,
       wanderPhase,
       isSelected: false,
+      absorbOnArrive,
     };
     this.ships.push(ship);
     return this.ships.length - 1;
@@ -152,6 +163,7 @@ export class ShipPool {
     s.state = 'transit';
     s.parentPlanet = -1;
     s.sourcePlanet = -1;
+    s.absorbOnArrive = false;
     this.freeList.push(idx);
   }
 

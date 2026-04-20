@@ -112,9 +112,16 @@ export class Selection {
    * discrete wave — orbiters of selected planets break orbit and transit
    * directly via boids flocking. Called for both enemy attacks and friendly
    * reinforcement.
+   *
+   * `absorbOnArrive` tags the commanded ships so they auto-absorb into the
+   * destination planet (feeding its rings) instead of joining orbit.
    */
-  routeTo(targetId: number): void {
-    const commanded = this.world.commandSelectedTo(this.playerId, { planetId: targetId });
+  routeTo(targetId: number, absorbOnArrive = false): void {
+    const commanded = this.world.commandSelectedTo(
+      this.playerId,
+      { planetId: targetId },
+      { absorbOnArrive },
+    );
     if (commanded > 0) {
       this.clearUnitSelection();
       return;
@@ -123,7 +130,7 @@ export class Selection {
     // back to a classic stream-over-edges wave from every selected planet.
     for (const src of this.selected) {
       if (src === targetId) continue;
-      this.world.openStream(this.playerId, src, targetId);
+      this.world.openStream(this.playerId, src, targetId, undefined, { absorbOnArrive });
     }
   }
 

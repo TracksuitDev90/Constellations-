@@ -38,6 +38,7 @@ export class Audio {
   private lastRingTickAt = new Map<number, number>();
   private lastAbsorbAt = new Map<number, number>();
   private lastDeathAt = 0;
+  private etherealTimer: number | null = null;
   muted = false;
   musicVolume = 0.35;
   sfxVolume = 0.45;
@@ -69,6 +70,12 @@ export class Audio {
     this.muted = muted;
     if (this.musicGain) this.musicGain.gain.value = muted ? 0 : this.musicVolume;
     if (this.sfxGain) this.sfxGain.gain.value = muted ? 0 : this.sfxVolume;
+    if (muted && this.etherealTimer !== null) {
+      clearTimeout(this.etherealTimer);
+      this.etherealTimer = null;
+    } else if (!muted && this.musicStarted && this.etherealTimer === null) {
+      this.scheduleEthereal();
+    }
   }
 
   private startAmbient(): void {
@@ -103,6 +110,133 @@ export class Audio {
       voiceGain.connect(filter);
       osc1.start();
       osc2.start();
+    }
+
+    // Break up the otherwise-constant drone with sparse ethereal one-shots —
+    // airy windy swells, distant chimes, subtle sweeps. Scheduled in JS-time
+    // so they don't all stack in the audio graph up front.
+    this.scheduleEthereal();
+  }
+
+  /**
+   * Queue up the next sparse ambient one-shot. Variable gap (8..22s) so the
+   * variance feels natural, never rhythmic. Reschedules itself forever.
+   */
+  private scheduleEthereal(): void {
+    if (this.etherealTimer !== null) clearTimeout(this.etherealTimer);
+    const delay = 8000 + Math.random() * 14000;
+    this.etherealTimer = window.setTimeout(() => {
+      this.etherealTimer = null;
+      if (!this.muted) this.playEthereal();
+      this.scheduleEthereal();
+    }, delay);
+  }
+
+  /**
+   * Pick one of a handful of soft space-y textures. All are filtered and quiet
+   * enough to sit well under the drone — no lasers, no robot blips.
+   */
+  private playEthereal(): void {
+    if (!this.ctx || !this.musicGain) return;
+    const pick = Math.floor(Math.random() * 4);
+    if (pick === 0) this.etherealWindSwell();
+    else if (pick === 1) this.etherealDistantChime();
+    else if (pick === 2) this.etherealDeepSweep();
+    else this.etherealShimmer();
+  }
+
+  /** Long, breathy filtered-noise swell — reads as solar wind / space air. */
+  private etherealWindSwell(): void {
+    if (!this.ctx || !this.musicGain) return;
+    const now = this.ctx.currentTime;
+    const dur = 4 + Math.random() * 3;
+    const sr = this.ctx.sampleRate;
+    const sampleCount = Math.max(1, Math.floor(sr * dur));
+    const buf = this.ctx.createBuffer(1, sampleCount, sr);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < sampleCount; i++) data[i] = Math.random() * 2 - 1;
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    const lp = this.ctx.createBiquadFilter();
+    lp.type = 'bandpass';
+    lp.Q.value = 0.6;
+    const centerStart = 260 + Math.random() * 200;
+    const centerEnd = centerStart + (Math.random() - 0.5) * 200;
+    lp.frequency.setValueAtTime(centerStart, now);
+    lp.frequency.linearRampToValueAtTime(centerEnd, now + dur);
+    const g = this.ctx.createGain();
+    const peak = 0.055 + Math.random() * 0.025;
+    g.gain.setValueAtTime(0.0001, now);
+    g.gain.exponentialRampToValueAtTime(peak, now + dur * 0.4);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    src.connect(lp).connect(g).connect(this.musicGain);
+    src.start(now);
+    src.stop(now + dur + 0.05);
+  }
+
+  /** Lone distant bell that fades in slowly, like a ping from far away. */
+  private etherealDistantChime(): void {
+    if (!this.ctx || !this.musicGain) return;
+    const now = this.ctx.currentTime;
+    // Pentatonic note up high so it sits above the pad harmonically.
+    const roots = [392.0, 440.0, 523.25, 587.33, 659.25]; // G4 A4 C5 D5 E5
+    const f = roots[Math.floor(Math.random() * roots.length)];
+    const partials = [f, f * 2.01, f * 3.02];
+    const gains = [0.045, 0.022, 0.012];
+    const dur = 4.5;
+    for (let i = 0; i < partials.length; i++) {
+      const osc = this.ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = partials[i];
+      const g = this.ctx.createGain();
+      g.gain.setValueAtTime(0.0001, now);
+      g.gain.exponentialRampToValueAtTime(gains[i], now + 1.2);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+      osc.connect(g).connect(this.musicGain);
+      osc.start(now);
+      osc.stop(now + dur + 0.05);
+    }
+  }
+
+  /** Slow sub-bass sine sweep — feels like something vast passing by. */
+  private etherealDeepSweep(): void {
+    if (!this.ctx || !this.musicGain) return;
+    const now = this.ctx.currentTime;
+    const dur = 6 + Math.random() * 3;
+    const osc = this.ctx.createOscillator();
+    osc.type = 'sine';
+    const f0 = 55 + Math.random() * 25;
+    const f1 = f0 * (0.55 + Math.random() * 0.25);
+    osc.frequency.setValueAtTime(f0, now);
+    osc.frequency.exponentialRampToValueAtTime(f1, now + dur);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.0001, now);
+    g.gain.exponentialRampToValueAtTime(0.08, now + dur * 0.35);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    osc.connect(g).connect(this.musicGain);
+    osc.start(now);
+    osc.stop(now + dur + 0.05);
+  }
+
+  /** Glassy high shimmer — a cluster of detuned high sines, quick fade. */
+  private etherealShimmer(): void {
+    if (!this.ctx || !this.musicGain) return;
+    const now = this.ctx.currentTime;
+    const base = 1320 + Math.random() * 880;
+    const dur = 2.4;
+    const voices = 4;
+    for (let i = 0; i < voices; i++) {
+      const osc = this.ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = base * (1 + (Math.random() - 0.5) * 0.015) * (1 + i * 0.5);
+      const g = this.ctx.createGain();
+      const start = now + i * 0.08;
+      g.gain.setValueAtTime(0.0001, start);
+      g.gain.exponentialRampToValueAtTime(0.018 / (i + 1), start + 0.6);
+      g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+      osc.connect(g).connect(this.musicGain);
+      osc.start(start);
+      osc.stop(start + dur + 0.05);
     }
   }
 
@@ -261,34 +395,70 @@ export class Audio {
   }
 
   /**
-   * Short breathy noise burst when two enemy ships mutually annihilate in
-   * mid-flight. Kept quiet: combat is frequent and shouldn't overpower ambient.
+   * Soft explosive pop when two enemy ships mutually annihilate in mid-flight.
+   * Three-layer hit: sub-bass thump for body, filtered noise burst for air,
+   * brief descending sine chirp for the "crack". Throttled so a wave of
+   * simultaneous kills blends into one impact instead of a crackle.
    */
   shipDeath(): void {
     if (!this.ctx || !this.sfxGain || this.muted) return;
     const now = this.ctx.currentTime;
-    if (now - this.lastDeathAt < 0.025) return;
+    if (now - this.lastDeathAt < 0.05) return;
     this.lastDeathAt = now;
-    const dur = 0.14;
+
+    // Layer 1: noise burst, band-limited and quickly decaying — the "poof".
+    const dur = 0.22;
     const sampleCount = Math.max(1, Math.floor(this.ctx.sampleRate * dur));
     const buf = this.ctx.createBuffer(1, sampleCount, this.ctx.sampleRate);
     const data = buf.getChannelData(0);
     for (let i = 0; i < sampleCount; i++) {
-      // Noise with a fast decay envelope.
       const t = i / sampleCount;
-      data[i] = (Math.random() * 2 - 1) * Math.pow(1 - t, 2.2);
+      // Steep exponential decay with a tiny attack ramp.
+      const env = Math.min(1, t * 40) * Math.pow(1 - t, 2.6);
+      data[i] = (Math.random() * 2 - 1) * env;
     }
     const src = this.ctx.createBufferSource();
     src.buffer = buf;
-    const filter = this.ctx.createBiquadFilter();
-    filter.type = 'bandpass';
-    filter.frequency.value = 1400;
-    filter.Q.value = 0.9;
-    const g = this.ctx.createGain();
-    g.gain.value = 0.11;
-    src.connect(filter).connect(g).connect(this.sfxGain);
+    const noiseFilter = this.ctx.createBiquadFilter();
+    noiseFilter.type = 'bandpass';
+    const centerJitter = 900 + Math.random() * 600;
+    noiseFilter.frequency.setValueAtTime(centerJitter + 400, now);
+    noiseFilter.frequency.exponentialRampToValueAtTime(centerJitter * 0.55, now + dur);
+    noiseFilter.Q.value = 1.1;
+    const noiseGain = this.ctx.createGain();
+    noiseGain.gain.value = 0.095;
+    src.connect(noiseFilter).connect(noiseGain).connect(this.sfxGain);
     src.start(now);
     src.stop(now + dur + 0.02);
+
+    // Layer 2: short sub-bass thump (60→30 Hz) — gives the hit its body. Kept
+    // quiet so it doesn't dominate; felt more than heard.
+    const thump = this.ctx.createOscillator();
+    thump.type = 'sine';
+    thump.frequency.setValueAtTime(78, now);
+    thump.frequency.exponentialRampToValueAtTime(34, now + 0.18);
+    const thumpGain = this.ctx.createGain();
+    thumpGain.gain.setValueAtTime(0.0001, now);
+    thumpGain.gain.exponentialRampToValueAtTime(0.14, now + 0.005);
+    thumpGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.2);
+    thump.connect(thumpGain).connect(this.sfxGain);
+    thump.start(now);
+    thump.stop(now + 0.22);
+
+    // Layer 3: tiny descending sine chirp for the crack — pitched varied per
+    // hit so repeated clashes don't sound stamped out.
+    const chirpStart = 1400 + Math.random() * 500;
+    const chirp = this.ctx.createOscillator();
+    chirp.type = 'triangle';
+    chirp.frequency.setValueAtTime(chirpStart, now);
+    chirp.frequency.exponentialRampToValueAtTime(chirpStart * 0.35, now + 0.09);
+    const chirpGain = this.ctx.createGain();
+    chirpGain.gain.setValueAtTime(0.0001, now);
+    chirpGain.gain.exponentialRampToValueAtTime(0.05, now + 0.006);
+    chirpGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.1);
+    chirp.connect(chirpGain).connect(this.sfxGain);
+    chirp.start(now);
+    chirp.stop(now + 0.12);
   }
 
   endSting(win: boolean): void {

@@ -153,7 +153,13 @@ export class World {
    * If `count` is omitted, the entire current garrison of the source is launched.
    * Streams are discrete — the player taps again for another wave.
    */
-  openStream(owner: number, source: number, target: number, count?: number): void {
+  openStream(
+    owner: number,
+    source: number,
+    target: number,
+    count?: number,
+    opts: { absorbOnArrive?: boolean } = {},
+  ): void {
     if (source === target) return;
     const src = this.planets[source];
     if (src.owner !== owner) return;
@@ -162,20 +168,46 @@ export class World {
     const nextHop = path[1];
     const remaining = count === undefined ? src.garrison : Math.min(count, src.garrison);
     if (remaining <= 0) return;
+    const absorbOnArrive = opts.absorbOnArrive ?? false;
     this.cancelStreamsFrom(source, owner);
-    this.streams.push(createStream(owner, source, nextHop, DEFAULT_EMIT_INTERVAL, remaining));
+    // Only the final-hop stream (nextHop === target) should carry the absorb
+    // flag — mid-hop waypoints are friendly planets we just pass through.
+    this.streams.push(
+      createStream(
+        owner,
+        source,
+        nextHop,
+        DEFAULT_EMIT_INTERVAL,
+        remaining,
+        absorbOnArrive && nextHop === target,
+      ),
+    );
     if (nextHop !== target) {
-      this.queueDownstream(owner, path, remaining);
+      this.queueDownstream(owner, path, remaining, absorbOnArrive);
     }
   }
 
-  private queueDownstream(owner: number, path: number[], remaining: number): void {
+  private queueDownstream(
+    owner: number,
+    path: number[],
+    remaining: number,
+    absorbOnArrive: boolean,
+  ): void {
     for (let i = 1; i < path.length - 1; i++) {
       const s = path[i];
       const t = path[i + 1];
       if (this.planets[s].owner === owner) {
         this.cancelStreamsFrom(s, owner);
-        this.streams.push(createStream(owner, s, t, DEFAULT_EMIT_INTERVAL, remaining));
+        this.streams.push(
+          createStream(
+            owner,
+            s,
+            t,
+            DEFAULT_EMIT_INTERVAL,
+            remaining,
+            absorbOnArrive && t === path[path.length - 1],
+          ),
+        );
       }
     }
   }
@@ -235,10 +267,12 @@ export class World {
   commandSelectedTo(
     owner: number,
     target: { planetId: number } | { x: number; y: number },
+    opts: { absorbOnArrive?: boolean } = {},
   ): number {
     const ships = this.ships.all;
     const planetTarget = 'planetId' in target;
     if (planetTarget && !this.planets[target.planetId]) return 0;
+    const absorbOnArrive = (opts.absorbOnArrive ?? false) && planetTarget;
     let n = 0;
     for (let i = 0; i < ships.length; i++) {
       const s = ships[i];
@@ -266,6 +300,7 @@ export class World {
         s.targetY = target.y;
       }
       s.age = 0;
+      s.absorbOnArrive = absorbOnArrive;
       this.events.onShipLaunch?.(owner);
       n++;
     }
@@ -441,6 +476,7 @@ export class World {
       ship.parentPlanet = -1;
       ship.targetPlanet = stream.target;
       ship.age = 0;
+      ship.absorbOnArrive = stream.absorbOnArrive;
       // Point velocity roughly at the next-hop planet so the break looks intentional.
       const dirX = tgt.pos.x - ship.x;
       const dirY = tgt.pos.y - ship.y;
@@ -474,6 +510,7 @@ export class World {
       wobblePhase: Math.random() * Math.PI * 2,
       state: 'transit',
       sourcePlanet: src.id,
+      absorbOnArrive: stream.absorbOnArrive,
     });
     this.events.onShipLaunch?.(stream.owner);
   }
@@ -562,8 +599,10 @@ export class World {
       this.ships.kill(idx);
       return;
     }
-    // If the planet has turned absorb off, fall back to orbit.
-    if (!planet.absorbing) {
+    // If the planet has turned absorb off, fall back to orbit — unless this
+    // unit was sent as a reinforcement specifically to be absorbed, in which
+    // case it stays committed and finishes its pull to the center.
+    if (!planet.absorbing && !ship.absorbOnArrive) {
       ship.state = 'orbiting';
       return;
     }
@@ -790,6 +829,23 @@ export class World {
     const friendly = planet.owner === ship.owner;
     if (friendly) {
       planet.garrison += 1;
+      // Reinforcement tagged for auto-absorb: route straight into the absorb
+      // pull instead of orbit, so rings visibly fill and the planet grows.
+      // Only meaningful if the planet actually has something to absorb into
+      // (rings to fill or damage to heal).
+      const canAbsorb = planet.ringCount > 0 || planet.health < planet.maxHealth;
+      if (ship.absorbOnArrive && canAbsorb) {
+        ship.state = 'absorbing';
+        ship.parentPlanet = planet.id;
+        ship.sourcePlanet = -1;
+        ship.targetPlanet = -1;
+        ship.isSelected = false;
+        // Keep absorbOnArrive true so stepAbsorbing treats this unit as a
+        // committed reinforcement — it won't pop back to orbit if the player
+        // toggles off the planet's absorb mode mid-flight.
+        this.events.onShipArrive?.(planet.id, ship.owner, friendly);
+        return;
+      }
       // Turn the arriving ship into an orbiter of its new home rather than
       // returning it to the pool — matches the spec: "unit's state resets to
       // Orbiting and it joins the target planet's list".

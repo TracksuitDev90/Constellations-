@@ -158,6 +158,8 @@ export class Game {
           // Friendly planet. Three behaviors depending on current selection:
           //   (a) No selection → select this planet.
           //   (b) Selected other planets → reinforce this planet (route to it).
+          //       If it has rings (or damage), arriving units auto-absorb so
+          //       the player sees rings fill and the planet grow from one tap.
           //   (c) This planet is the sole selection → toggle absorb (fills
           //       rings / heals / feeds upgrade meter).
           if (!hasSelection) {
@@ -165,7 +167,8 @@ export class Game {
           } else if (isOnlySelected) {
             this.world.triggerAbsorb(id, 0, !p.absorbing);
           } else {
-            this.selection.routeTo(id);
+            const absorb = p.ringCount > 0 || p.health < p.maxHealth;
+            this.selection.routeTo(id, absorb);
           }
         } else if (hasSelection) {
           // Enemy or neutral planet with selection → attack.

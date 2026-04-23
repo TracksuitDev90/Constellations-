@@ -6,6 +6,7 @@ import {
   bakedBodyDiameter,
   makePlanetBodyTexture,
   makePlanetHaloTexture,
+  makeShipGlowTexture,
   makeShipTexture,
 } from './textures.js';
 import { planetAssetsReady } from './planetAssets.js';
@@ -80,6 +81,10 @@ const computeBodyBaseScale = (radius: number): number => {
 
 interface Orbiter {
   sprite: Sprite;
+  /** Wider additive halo behind the sprite — accumulates in dense clusters. */
+  glow: Sprite;
+  /** Per-orbiter glow scale so clusters don't read as a solid blob. */
+  glowScale: number;
   /** Which atom ring (0..2) this electron is assigned to. */
   ringIdx: number;
   /** Personal twinkle phase for alpha flicker. */
@@ -134,6 +139,7 @@ export class PlanetLayer extends Container {
   private views: PlanetView[] = [];
   private selectedSources = new Set<number>();
   private shipTex: Texture;
+  private shipGlowTex: Texture;
   private time = 0;
 
   constructor(app: Application, world: World) {
@@ -141,6 +147,7 @@ export class PlanetLayer extends Container {
     this.app = app;
     this.world = world;
     this.shipTex = makeShipTexture(app);
+    this.shipGlowTex = makeShipGlowTexture(app);
 
     for (const planet of world.planets) {
       const container = new Container();
@@ -428,23 +435,39 @@ export class PlanetLayer extends Container {
   private syncOrbiters(v: PlanetView, target: number, owner: number): void {
     const shipTint = paletteFor(owner).ship;
 
-    for (const o of v.orbiters) o.sprite.tint = shipTint;
+    for (const o of v.orbiters) {
+      o.sprite.tint = shipTint;
+      o.glow.tint = shipTint;
+    }
 
     while (v.orbiters.length < target) {
+      // Glow is added first so it renders under the bright dot. Additive
+      // blending means overlapping glows accumulate into bright hotspots
+      // wherever orbiters cluster, without each ring reading as a solid blob.
+      const glow = new Sprite(this.shipGlowTex);
+      glow.anchor.set(0.5);
+      glow.blendMode = 'add';
+      glow.tint = shipTint;
+      const glowScale = 0.42 + Math.random() * 0.22;
+      glow.scale.set(glowScale);
+      v.orbitRoot.addChild(glow);
+
       const sprite = new Sprite(this.shipTex);
       sprite.anchor.set(0.5);
       sprite.scale.set(0.36);
       sprite.tint = shipTint;
-      // New electrons appear at a random point just outside the planet body
-      // and glide outward into the current orbit, so the flow looks like
-      // mass condensing into orbit rather than popping into place.
       const spawnAngle = Math.random() * Math.PI * 2;
       const spawnR = v.baseRadius * (0.9 + Math.random() * 0.3);
       sprite.x = Math.cos(spawnAngle) * spawnR;
       sprite.y = Math.sin(spawnAngle) * spawnR;
+      glow.x = sprite.x;
+      glow.y = sprite.y;
       v.orbitRoot.addChild(sprite);
+
       v.orbiters.push({
         sprite,
+        glow,
+        glowScale,
         ringIdx: 0,
         phase: Math.random() * Math.PI * 2,
         wanderPhase: Math.random() * Math.PI * 2,
@@ -455,7 +478,9 @@ export class PlanetLayer extends Container {
     while (v.orbiters.length > target) {
       const o = v.orbiters.pop()!;
       v.orbitRoot.removeChild(o.sprite);
+      v.orbitRoot.removeChild(o.glow);
       o.sprite.destroy();
+      o.glow.destroy();
     }
   }
 
@@ -547,6 +572,15 @@ export class PlanetLayer extends Container {
       o.sprite.y += (ty - o.sprite.y) * ease;
       const a = 0.7 + 0.3 * Math.sin(this.time * 2.2 + o.phase);
       o.sprite.alpha = a;
+
+      // Glow follows the sprite; its own twinkle runs at a different phase so
+      // the halo pulsing doesn't lock to the dot flicker, which keeps dense
+      // clusters from reading as a single solid blob.
+      o.glow.x = o.sprite.x;
+      o.glow.y = o.sprite.y;
+      const glowFlicker = 0.65 + 0.35 * Math.sin(this.time * 3.1 + o.phase * 1.7);
+      o.glow.alpha = 0.55 * glowFlicker;
+      o.glow.scale.set(o.glowScale);
     }
   }
 
@@ -592,7 +626,9 @@ export class PlanetLayer extends Container {
   private clearOrbiters(v: PlanetView): void {
     for (const o of v.orbiters) {
       v.orbitRoot.removeChild(o.sprite);
+      v.orbitRoot.removeChild(o.glow);
       o.sprite.destroy();
+      o.glow.destroy();
     }
     v.orbiters.length = 0;
   }

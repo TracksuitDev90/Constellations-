@@ -50,6 +50,25 @@ export const makeShipTexture = (app: Application): Texture => {
   });
 };
 
+/**
+ * A wider, softer halo used behind each unit with additive blending so that
+ * clusters of units accumulate into visibly brighter hotspots without losing
+ * the read of individual ships. Radius is much larger than the ship texture
+ * so overlaps are common whenever units are near each other.
+ */
+export const makeShipGlowTexture = (app: Application): Texture => {
+  return makeGlowTexture(app, 'ship-glow', (g) => {
+    const R = 28;
+    for (let i = R; i > 0; i--) {
+      const t = i / R;
+      // Gaussian-ish falloff so the glow has a bright core and a long tail
+      // that fades out cleanly at the edges.
+      const a = Math.pow(1 - t, 2) * 0.085;
+      g.circle(R, R, i).fill({ color: 0xffffff, alpha: a });
+    }
+  });
+};
+
 export type PlanetArchetype =
   | 'terrestrial'
   | 'gasGiant'

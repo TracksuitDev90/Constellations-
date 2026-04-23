@@ -22,6 +22,12 @@ const TEXTURE_PATHS: Partial<Record<PlanetArchetype, string>> = {
   icy: 'textures/icy.jpg',
   molten: 'textures/molten.jpg',
   alien: 'textures/alien.jpg',
+  poison: 'textures/poison.png',
+  amethyst: 'textures/amethyst.png',
+  ember: 'textures/ember.png',
+  oceanic: 'textures/oceanic.png',
+  verdant: 'textures/verdant.png',
+  desert: 'textures/desert.png',
 };
 
 /** Resolve the URL respecting Vite's BASE_URL (set via vite.config). */

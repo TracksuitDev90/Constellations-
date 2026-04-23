@@ -93,6 +93,61 @@ describe('World capture', () => {
   });
 });
 
+describe('commandSelectedTo drains source planet', () => {
+  it('depletes garrison to zero when all orbit units are commanded away', () => {
+    const map: MapSpec = {
+      width: 400,
+      height: 100,
+      planets: [
+        { pos: { x: 50, y: 50 }, radius: 16, owner: 0, garrison: 0 },
+        { pos: { x: 350, y: 50 }, radius: 16, owner: null, garrison: 2 },
+      ],
+      edges: [[0, 1]],
+    };
+    const w = new World(map, [{ id: 0, isAI: false, name: 'P' }]);
+    // Let production spawn several live orbiters around planet 0.
+    w.planets[0].productionRate = 4;
+    for (let i = 0; i < 80; i++) w.step(0.05);
+    expect(w.planets[0].garrison).toBeGreaterThan(3);
+    // Freeze production so we only observe the effect of the command.
+    w.planets[0].productionRate = 0;
+    for (const s of w.ships.all) {
+      if (s.active && s.state === 'orbiting' && s.parentPlanet === 0) {
+        s.isSelected = true;
+      }
+    }
+    const n = w.commandSelectedTo(0, { planetId: 1 });
+    expect(n).toBeGreaterThan(0);
+    expect(w.planets[0].garrison).toBe(0);
+  });
+
+  it('drains residual garrison even when it exceeds the live-orbit cap', () => {
+    const map: MapSpec = {
+      width: 400,
+      height: 100,
+      planets: [
+        { pos: { x: 50, y: 50 }, radius: 16, owner: 0, garrison: 0 },
+        { pos: { x: 350, y: 50 }, radius: 16, owner: null, garrison: 2 },
+      ],
+      edges: [[0, 1]],
+    };
+    const w = new World(map, [{ id: 0, isAI: false, name: 'P' }]);
+    w.planets[0].productionRate = 4;
+    for (let i = 0; i < 80; i++) w.step(0.05);
+    w.planets[0].productionRate = 0;
+    // Simulate a production overflow — garrison beyond live-orbit count.
+    w.planets[0].garrison += 7;
+    for (const s of w.ships.all) {
+      if (s.active && s.state === 'orbiting' && s.parentPlanet === 0) {
+        s.isSelected = true;
+      }
+    }
+    const n = w.commandSelectedTo(0, { planetId: 1 });
+    expect(n).toBeGreaterThan(0);
+    expect(w.planets[0].garrison).toBe(0);
+  });
+});
+
 describe('World game over', () => {
   it('declares winner when only one owner remains', () => {
     let winner: number | null = -1;

@@ -211,10 +211,18 @@ export class Game {
 
     window.addEventListener('keydown', this.onKey);
 
-    this.hud = new Hud(this.ui, this.world, () => {
-      this.audio.setMuted(!this.audio.muted);
-      return this.audio.muted;
-    });
+    this.hud = new Hud(
+      this.ui,
+      this.world,
+      () => {
+        this.audio.setMuted(!this.audio.muted);
+        return this.audio.muted;
+      },
+      () => {
+        this.paused = !this.paused;
+        return this.paused;
+      },
+    );
 
     this.accumulator = 0;
     this.paused = false;
@@ -246,6 +254,7 @@ export class Game {
     } else if (e.key === ' ') {
       e.preventDefault();
       this.paused = !this.paused;
+      this.hud?.setPausedUI(this.paused);
     }
   };
 

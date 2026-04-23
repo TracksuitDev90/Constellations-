@@ -283,6 +283,11 @@ export class World {
     if (planetTarget && !this.planets[target.planetId]) return 0;
     const absorbOnArrive = (opts.absorbOnArrive ?? false) && planetTarget;
     let n = 0;
+    // Planets that had an orbiter commanded away — we'll also drain any
+    // production overflow (garrison beyond live-orbiter cap) from these so
+    // the count under the planet visibly drops to zero instead of leaving a
+    // phantom reserve behind.
+    const drained = new Set<number>();
     for (let i = 0; i < ships.length; i++) {
       const s = ships[i];
       if (!s.active || !s.isSelected || s.owner !== owner) continue;
@@ -297,6 +302,7 @@ export class World {
         if (parent && parent.owner === owner && parent.garrison > 0) {
           parent.garrison -= 1;
         }
+        drained.add(s.parentPlanet);
         s.sourcePlanet = s.parentPlanet;
       }
       s.state = 'transit';
@@ -313,7 +319,61 @@ export class World {
       this.events.onShipLaunch?.(owner);
       n++;
     }
+    // Drain residual garrison on source planets by spawning fresh transit
+    // ships straight from the planet edge. Covers the production-overflow
+    // case (garrison > live-orbiter cap) so commanding a planet's units
+    // always leaves the planet at zero.
+    for (const pid of drained) {
+      if (planetTarget && pid === target.planetId) continue;
+      const src = this.planets[pid];
+      if (!src || src.owner !== owner) continue;
+      while (src.garrison > 0) {
+        src.garrison -= 1;
+        this.spawnTransitFromPlanet(src, target, absorbOnArrive);
+        this.events.onShipLaunch?.(owner);
+        n++;
+      }
+    }
     return n;
+  }
+
+  /**
+   * Spawn a transit-state ship emerging from `src`'s edge, headed at the
+   * given target. Used to drain residual garrison on a command that the
+   * orbit-unit pass couldn't account for.
+   */
+  private spawnTransitFromPlanet(
+    src: Planet,
+    target: { planetId: number } | { x: number; y: number },
+    absorbOnArrive: boolean,
+  ): void {
+    if (src.owner === null) return;
+    const planetTarget = 'planetId' in target;
+    const tx = planetTarget ? this.planets[target.planetId].pos.x : target.x;
+    const ty = planetTarget ? this.planets[target.planetId].pos.y : target.y;
+    const baseAngle = Math.atan2(ty - src.pos.y, tx - src.pos.x);
+    const exitAngle = baseAngle + (Math.random() - 0.5) * EXIT_CONE;
+    const exitR = src.radius + 2 + Math.random() * (src.radius * 0.25);
+    const spawnPos = vec(
+      src.pos.x + Math.cos(exitAngle) * exitR,
+      src.pos.y + Math.sin(exitAngle) * exitR,
+    );
+    const headingAngle = baseAngle + (exitAngle - baseAngle) * 0.55;
+    const idx = this.ships.spawn(src.owner, spawnPos, planetTarget ? target.planetId : -1, SHIP_SPEED, {
+      vx: Math.cos(headingAngle) * SHIP_SPEED,
+      vy: Math.sin(headingAngle) * SHIP_SPEED,
+      turnRate: 1.4 + Math.random() * 1.6,
+      wobbleAmp: (Math.random() - 0.5) * 0.3,
+      wobblePhase: Math.random() * Math.PI * 2,
+      state: 'transit',
+      sourcePlanet: src.id,
+      absorbOnArrive: absorbOnArrive && planetTarget,
+    });
+    if (!planetTarget) {
+      const s = this.ships.get(idx);
+      s.targetX = tx;
+      s.targetY = ty;
+    }
   }
 
   step(dt: number): void {

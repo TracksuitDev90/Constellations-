@@ -1,4 +1,4 @@
-import { Application, Container, Graphics, Sprite, Text, Texture } from 'pixi.js';
+import { Application, Container, Graphics, Sprite, Texture } from 'pixi.js';
 import { paletteFor } from '../../util/color.js';
 import { RING_CAPACITY_FOR_SIZE, type PlanetType } from '../sim/Planet.js';
 import type { World } from '../sim/World.js';
@@ -6,6 +6,7 @@ import {
   bakedBodyDiameter,
   makePlanetBodyTexture,
   makePlanetHaloTexture,
+  makeShipGlowTexture,
   makeShipTexture,
 } from './textures.js';
 import { planetAssetsReady } from './planetAssets.js';
@@ -80,6 +81,10 @@ const computeBodyBaseScale = (radius: number): number => {
 
 interface Orbiter {
   sprite: Sprite;
+  /** Wider additive halo behind the sprite — accumulates in dense clusters. */
+  glow: Sprite;
+  /** Per-orbiter glow scale so clusters don't read as a solid blob. */
+  glowScale: number;
   /** Which atom ring (0..2) this electron is assigned to. */
   ringIdx: number;
   /** Personal twinkle phase for alpha flicker. */
@@ -99,7 +104,10 @@ interface PlanetView {
   rings: Graphics; // capacity rings (per-planet ringCount)
   atomPaths: Graphics; // faint orbit ellipses that the electrons follow
   shockwave: Graphics;
-  count: Text;
+  /** Subtle strength bar beneath the planet — visual stand-in for garrison. */
+  strengthBar: Graphics;
+  /** Eased bar fill (0..1+) so the indicator glides with population changes. */
+  easedStrength: number;
   orbitRoot: Container;
   orbiters: Orbiter[];
   lastOwner: number | null;
@@ -131,6 +139,7 @@ export class PlanetLayer extends Container {
   private views: PlanetView[] = [];
   private selectedSources = new Set<number>();
   private shipTex: Texture;
+  private shipGlowTex: Texture;
   private time = 0;
 
   constructor(app: Application, world: World) {
@@ -138,6 +147,7 @@ export class PlanetLayer extends Container {
     this.app = app;
     this.world = world;
     this.shipTex = makeShipTexture(app);
+    this.shipGlowTex = makeShipGlowTexture(app);
 
     for (const planet of world.planets) {
       const container = new Container();
@@ -157,23 +167,11 @@ export class PlanetLayer extends Container {
       const rings = new Graphics();
       const atomPaths = new Graphics();
       const shockwave = new Graphics();
+      const strengthBar = new Graphics();
 
       const orbitRoot = new Container();
 
-      const count = new Text({
-        text: String(planet.garrison),
-        style: {
-          fontFamily: '-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif',
-          fontSize: Math.max(13, Math.round(planet.radius * 0.7)),
-          fontWeight: '600',
-          fill: 0xffffff,
-          align: 'center',
-          stroke: { color: 0x000000, width: 2, alpha: 0.55 },
-        },
-      });
-      count.anchor.set(0.5);
-
-      container.addChild(halo, ring, rings, body, atomPaths, orbitRoot, shockwave, count);
+      container.addChild(halo, ring, rings, body, atomPaths, orbitRoot, shockwave, strengthBar);
       this.addChild(container);
 
       this.views.push({
@@ -185,7 +183,8 @@ export class PlanetLayer extends Container {
         rings,
         atomPaths,
         shockwave,
-        count,
+        strengthBar,
+        easedStrength: 0,
         orbitRoot,
         orbiters: [],
         lastOwner: planet.owner,
@@ -228,7 +227,6 @@ export class PlanetLayer extends Container {
         v.body.texture = makePlanetBodyTexture(this.app, p.owner, p.radius, p.id, p.type);
         v.halo.texture = makePlanetHaloTexture(this.app, p.owner, p.radius);
         v.displayScale = EVOLVE_POP_START;
-        v.count.style.fontSize = Math.max(13, Math.round(p.radius * 0.7));
       }
 
       // Owner change → halo re-tints. The body stays as the baked planet map
@@ -276,11 +274,12 @@ export class PlanetLayer extends Container {
       // Effective radius rings / count / selection should space themselves off.
       const effRadius = v.baseRadius * v.displayScale * ringGrowth;
 
-      // Count readout sits just below the planet.
-      v.count.text = String(p.garrison);
-      v.count.y = effRadius + 16;
-
       const pal = paletteFor(p.owner);
+
+      // Strength bar under the planet — a visual stand-in for the old numeric
+      // garrison readout. Length scales with garrison / maxUnitCapacity (past
+      // 1.0 it overflows into a pulsing "saturated" glow).
+      this.drawStrengthBar(v, p.garrison, p.maxUnitCapacity, effRadius, pal, p.owner, dt);
 
       // Capacity rings: many fine concentric sub-bands that fill with the
       // owner's color as absorbed units accumulate. Sub-bands of varied width
@@ -366,26 +365,109 @@ export class PlanetLayer extends Container {
     }
   }
 
+  /**
+   * Render the subtle strength indicator beneath the planet. Replaces the old
+   * numeric garrison readout with a visual bar whose filled length tracks
+   * `garrison / maxUnitCapacity`. Once the garrison saturates, an outer pulse
+   * glow communicates overflow rather than breaking the scale.
+   */
+  private drawStrengthBar(
+    v: PlanetView,
+    garrison: number,
+    capacity: number,
+    effRadius: number,
+    pal: import('../../util/color.js').PlayerPalette,
+    owner: number | null,
+    dt: number,
+  ): void {
+    const g = v.strengthBar;
+    g.clear();
+    if (owner === null || garrison <= 0) {
+      v.easedStrength = 0;
+      return;
+    }
+    const targetFill = capacity > 0 ? garrison / capacity : 0;
+    const ease = 1 - Math.exp(-dt * 5);
+    v.easedStrength += (targetFill - v.easedStrength) * ease;
+    const fill = Math.max(0, v.easedStrength);
+
+    const width = Math.max(24, effRadius * 1.6);
+    const height = Math.max(3, effRadius * 0.1);
+    const y = effRadius + height + 6;
+    const left = -width / 2;
+
+    const radius = height / 2;
+
+    // Backdrop — a dim pill so the bar reads against both starfield and halo.
+    g.roundRect(left - 1, y - height / 2 - 1, width + 2, height + 2, radius + 1)
+      .fill({ color: 0x000000, alpha: 0.32 });
+    g.roundRect(left, y - height / 2, width, height, radius)
+      .fill({ color: pal.glow, alpha: 0.22 });
+
+    // Filled portion — clamps at 1, the remainder communicates overflow via
+    // the outer pulse below.
+    const clipped = Math.min(1, fill);
+    const fillW = Math.max(0, width * clipped);
+    if (fillW > 0.5) {
+      g.roundRect(left, y - height / 2, fillW, height, Math.min(radius, fillW / 2))
+        .fill({ color: pal.ring, alpha: 0.95 });
+      // Highlight strip along the top of the filled segment for depth.
+      g.roundRect(
+        left + 1,
+        y - height / 2 + 0.5,
+        Math.max(0, fillW - 2),
+        Math.max(0.8, height * 0.35),
+        Math.min(radius, fillW / 2),
+      ).fill({ color: 0xffffff, alpha: 0.35 });
+    }
+
+    // Saturation glow: beyond full, pulse a soft ring of light around the bar
+    // so massive fleets read as "overflowing" instead of silently capping.
+    const overflow = Math.max(0, fill - 1);
+    if (overflow > 0.01) {
+      const pulse = 0.55 + 0.45 * Math.sin(this.time * 3.8);
+      const a = Math.min(0.75, 0.35 + overflow * 0.6) * pulse;
+      g.roundRect(left - 2, y - height / 2 - 2, width + 4, height + 4, radius + 2)
+        .stroke({ width: 1.4, color: pal.ring, alpha: a });
+    }
+  }
+
   private syncOrbiters(v: PlanetView, target: number, owner: number): void {
     const shipTint = paletteFor(owner).ship;
 
-    for (const o of v.orbiters) o.sprite.tint = shipTint;
+    for (const o of v.orbiters) {
+      o.sprite.tint = shipTint;
+      o.glow.tint = shipTint;
+    }
 
     while (v.orbiters.length < target) {
+      // Glow is added first so it renders under the bright dot. Additive
+      // blending means overlapping glows accumulate into bright hotspots
+      // wherever orbiters cluster, without each ring reading as a solid blob.
+      const glow = new Sprite(this.shipGlowTex);
+      glow.anchor.set(0.5);
+      glow.blendMode = 'add';
+      glow.tint = shipTint;
+      const glowScale = 0.42 + Math.random() * 0.22;
+      glow.scale.set(glowScale);
+      v.orbitRoot.addChild(glow);
+
       const sprite = new Sprite(this.shipTex);
       sprite.anchor.set(0.5);
       sprite.scale.set(0.36);
       sprite.tint = shipTint;
-      // New electrons appear at a random point just outside the planet body
-      // and glide outward into the current orbit, so the flow looks like
-      // mass condensing into orbit rather than popping into place.
       const spawnAngle = Math.random() * Math.PI * 2;
       const spawnR = v.baseRadius * (0.9 + Math.random() * 0.3);
       sprite.x = Math.cos(spawnAngle) * spawnR;
       sprite.y = Math.sin(spawnAngle) * spawnR;
+      glow.x = sprite.x;
+      glow.y = sprite.y;
       v.orbitRoot.addChild(sprite);
+
       v.orbiters.push({
         sprite,
+        glow,
+        glowScale,
         ringIdx: 0,
         phase: Math.random() * Math.PI * 2,
         wanderPhase: Math.random() * Math.PI * 2,
@@ -396,7 +478,9 @@ export class PlanetLayer extends Container {
     while (v.orbiters.length > target) {
       const o = v.orbiters.pop()!;
       v.orbitRoot.removeChild(o.sprite);
+      v.orbitRoot.removeChild(o.glow);
       o.sprite.destroy();
+      o.glow.destroy();
     }
   }
 
@@ -488,6 +572,15 @@ export class PlanetLayer extends Container {
       o.sprite.y += (ty - o.sprite.y) * ease;
       const a = 0.7 + 0.3 * Math.sin(this.time * 2.2 + o.phase);
       o.sprite.alpha = a;
+
+      // Glow follows the sprite; its own twinkle runs at a different phase so
+      // the halo pulsing doesn't lock to the dot flicker, which keeps dense
+      // clusters from reading as a single solid blob.
+      o.glow.x = o.sprite.x;
+      o.glow.y = o.sprite.y;
+      const glowFlicker = 0.65 + 0.35 * Math.sin(this.time * 3.1 + o.phase * 1.7);
+      o.glow.alpha = 0.55 * glowFlicker;
+      o.glow.scale.set(o.glowScale);
     }
   }
 
@@ -533,7 +626,9 @@ export class PlanetLayer extends Container {
   private clearOrbiters(v: PlanetView): void {
     for (const o of v.orbiters) {
       v.orbitRoot.removeChild(o.sprite);
+      v.orbitRoot.removeChild(o.glow);
       o.sprite.destroy();
+      o.glow.destroy();
     }
     v.orbiters.length = 0;
   }

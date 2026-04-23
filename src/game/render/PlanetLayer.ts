@@ -1,4 +1,4 @@
-import { Application, Container, Graphics, Sprite, Text, Texture } from 'pixi.js';
+import { Application, Container, Graphics, Sprite, Texture } from 'pixi.js';
 import { paletteFor } from '../../util/color.js';
 import { RING_CAPACITY_FOR_SIZE, type PlanetType } from '../sim/Planet.js';
 import type { World } from '../sim/World.js';
@@ -99,7 +99,10 @@ interface PlanetView {
   rings: Graphics; // capacity rings (per-planet ringCount)
   atomPaths: Graphics; // faint orbit ellipses that the electrons follow
   shockwave: Graphics;
-  count: Text;
+  /** Subtle strength bar beneath the planet — visual stand-in for garrison. */
+  strengthBar: Graphics;
+  /** Eased bar fill (0..1+) so the indicator glides with population changes. */
+  easedStrength: number;
   orbitRoot: Container;
   orbiters: Orbiter[];
   lastOwner: number | null;
@@ -157,23 +160,11 @@ export class PlanetLayer extends Container {
       const rings = new Graphics();
       const atomPaths = new Graphics();
       const shockwave = new Graphics();
+      const strengthBar = new Graphics();
 
       const orbitRoot = new Container();
 
-      const count = new Text({
-        text: String(planet.garrison),
-        style: {
-          fontFamily: '-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif',
-          fontSize: Math.max(13, Math.round(planet.radius * 0.7)),
-          fontWeight: '600',
-          fill: 0xffffff,
-          align: 'center',
-          stroke: { color: 0x000000, width: 2, alpha: 0.55 },
-        },
-      });
-      count.anchor.set(0.5);
-
-      container.addChild(halo, ring, rings, body, atomPaths, orbitRoot, shockwave, count);
+      container.addChild(halo, ring, rings, body, atomPaths, orbitRoot, shockwave, strengthBar);
       this.addChild(container);
 
       this.views.push({
@@ -185,7 +176,8 @@ export class PlanetLayer extends Container {
         rings,
         atomPaths,
         shockwave,
-        count,
+        strengthBar,
+        easedStrength: 0,
         orbitRoot,
         orbiters: [],
         lastOwner: planet.owner,
@@ -228,7 +220,6 @@ export class PlanetLayer extends Container {
         v.body.texture = makePlanetBodyTexture(this.app, p.owner, p.radius, p.id, p.type);
         v.halo.texture = makePlanetHaloTexture(this.app, p.owner, p.radius);
         v.displayScale = EVOLVE_POP_START;
-        v.count.style.fontSize = Math.max(13, Math.round(p.radius * 0.7));
       }
 
       // Owner change → halo re-tints. The body stays as the baked planet map
@@ -276,11 +267,12 @@ export class PlanetLayer extends Container {
       // Effective radius rings / count / selection should space themselves off.
       const effRadius = v.baseRadius * v.displayScale * ringGrowth;
 
-      // Count readout sits just below the planet.
-      v.count.text = String(p.garrison);
-      v.count.y = effRadius + 16;
-
       const pal = paletteFor(p.owner);
+
+      // Strength bar under the planet — a visual stand-in for the old numeric
+      // garrison readout. Length scales with garrison / maxUnitCapacity (past
+      // 1.0 it overflows into a pulsing "saturated" glow).
+      this.drawStrengthBar(v, p.garrison, p.maxUnitCapacity, effRadius, pal, p.owner, dt);
 
       // Capacity rings: many fine concentric sub-bands that fill with the
       // owner's color as absorbed units accumulate. Sub-bands of varied width
@@ -363,6 +355,73 @@ export class PlanetLayer extends Container {
         if (v.orbiters.length > 0) this.clearOrbiters(v);
         v.atomPaths.clear();
       }
+    }
+  }
+
+  /**
+   * Render the subtle strength indicator beneath the planet. Replaces the old
+   * numeric garrison readout with a visual bar whose filled length tracks
+   * `garrison / maxUnitCapacity`. Once the garrison saturates, an outer pulse
+   * glow communicates overflow rather than breaking the scale.
+   */
+  private drawStrengthBar(
+    v: PlanetView,
+    garrison: number,
+    capacity: number,
+    effRadius: number,
+    pal: import('../../util/color.js').PlayerPalette,
+    owner: number | null,
+    dt: number,
+  ): void {
+    const g = v.strengthBar;
+    g.clear();
+    if (owner === null || garrison <= 0) {
+      v.easedStrength = 0;
+      return;
+    }
+    const targetFill = capacity > 0 ? garrison / capacity : 0;
+    const ease = 1 - Math.exp(-dt * 5);
+    v.easedStrength += (targetFill - v.easedStrength) * ease;
+    const fill = Math.max(0, v.easedStrength);
+
+    const width = Math.max(24, effRadius * 1.6);
+    const height = Math.max(3, effRadius * 0.1);
+    const y = effRadius + height + 6;
+    const left = -width / 2;
+
+    const radius = height / 2;
+
+    // Backdrop — a dim pill so the bar reads against both starfield and halo.
+    g.roundRect(left - 1, y - height / 2 - 1, width + 2, height + 2, radius + 1)
+      .fill({ color: 0x000000, alpha: 0.32 });
+    g.roundRect(left, y - height / 2, width, height, radius)
+      .fill({ color: pal.glow, alpha: 0.22 });
+
+    // Filled portion — clamps at 1, the remainder communicates overflow via
+    // the outer pulse below.
+    const clipped = Math.min(1, fill);
+    const fillW = Math.max(0, width * clipped);
+    if (fillW > 0.5) {
+      g.roundRect(left, y - height / 2, fillW, height, Math.min(radius, fillW / 2))
+        .fill({ color: pal.ring, alpha: 0.95 });
+      // Highlight strip along the top of the filled segment for depth.
+      g.roundRect(
+        left + 1,
+        y - height / 2 + 0.5,
+        Math.max(0, fillW - 2),
+        Math.max(0.8, height * 0.35),
+        Math.min(radius, fillW / 2),
+      ).fill({ color: 0xffffff, alpha: 0.35 });
+    }
+
+    // Saturation glow: beyond full, pulse a soft ring of light around the bar
+    // so massive fleets read as "overflowing" instead of silently capping.
+    const overflow = Math.max(0, fill - 1);
+    if (overflow > 0.01) {
+      const pulse = 0.55 + 0.45 * Math.sin(this.time * 3.8);
+      const a = Math.min(0.75, 0.35 + overflow * 0.6) * pulse;
+      g.roundRect(left - 2, y - height / 2 - 2, width + 4, height + 4, radius + 2)
+        .stroke({ width: 1.4, color: pal.ring, alpha: a });
     }
   }
 

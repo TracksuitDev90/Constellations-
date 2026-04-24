@@ -201,6 +201,37 @@ describe('absorb ring filling', () => {
   });
 });
 
+describe('reinforcement stacking', () => {
+  it('accepts arrivals past the native maxUnitCapacity so swarms thicken', () => {
+    const map: MapSpec = {
+      width: 400,
+      height: 100,
+      planets: [
+        // Source with lots of units ready to send.
+        { pos: { x: 50, y: 50 }, radius: 16, owner: 0, garrison: 0, type: 0 },
+        // Target already at its small-planet capacity (40).
+        { pos: { x: 350, y: 50 }, radius: 16, owner: 0, garrison: 40, type: 0 },
+      ],
+      edges: [[0, 1]],
+    };
+    const w = new World(map, [{ id: 0, isAI: false, name: 'P' }]);
+    w.planets[0].productionRate = 40;
+    w.planets[0].garrison = 0;
+    for (let i = 0; i < 80; i++) w.step(0.05);
+    // Stop production so the test only observes arrivals at the target.
+    w.planets[0].productionRate = 0;
+    // Send everything from planet 0 to planet 1.
+    w.openStream(0, 0, 1);
+    for (let i = 0; i < 2000; i++) w.step(0.05);
+    const orbiters = w.ships.all.filter(
+      (s) => s.active && s.state === 'orbiting' && s.parentPlanet === 1,
+    ).length;
+    // Target should be carrying strictly more live orbiters than its native
+    // cap — previously arrivals past 40 were silently killed on landing.
+    expect(orbiters).toBeGreaterThan(40);
+  });
+});
+
 describe('World game over', () => {
   it('declares winner when only one owner remains', () => {
     let winner: number | null = -1;

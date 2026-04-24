@@ -16,10 +16,12 @@ import { planetAssetsReady } from './planetAssets.js';
  * Upper bound on atom-electron sprites per planet. Bigger planets get more
  * so a full XXL garrison actually reads as a dense swarm rather than capping
  * at the small-planet ceiling; small ones stay capped low to preserve the
- * "lone orbit" silhouette.
+ * "lone orbit" silhouette. Accepts overflow well past maxUnitCapacity (up
+ * to HARD_ORBITER_CAP) so reinforcement stacks visibly on a maxed planet.
  */
+const HARD_ORBITER_CAP = 300;
 const orbiterCapFor = (maxUnitCapacity: number): number =>
-  Math.max(32, Math.min(maxUnitCapacity, 160));
+  Math.max(32, Math.min(maxUnitCapacity * 2, HARD_ORBITER_CAP));
 /**
  * Seconds a newly-produced orbiter spends "being born" — ramping up from a
  * tiny scale at the planet center out to its ring slot. Long enough that the

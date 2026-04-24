@@ -148,6 +148,59 @@ describe('commandSelectedTo drains source planet', () => {
   });
 });
 
+describe('absorb ring filling', () => {
+  const ringedMap: MapSpec = {
+    width: 200,
+    height: 100,
+    planets: [
+      {
+        pos: { x: 100, y: 50 },
+        radius: 20,
+        owner: 0,
+        garrison: 0,
+        type: 0,
+        ringCount: 1,
+      },
+    ],
+    edges: [],
+  };
+
+  it('no-ops triggerAbsorb when there is nothing to fill', () => {
+    const map: MapSpec = {
+      width: 200,
+      height: 100,
+      planets: [
+        { pos: { x: 100, y: 50 }, radius: 20, owner: 0, garrison: 5, type: 0, ringCount: 0 },
+      ],
+      edges: [],
+    };
+    const w = new World(map, [{ id: 0, isAI: false, name: 'P' }]);
+    // Plain planet with no rings and full health → toggle should be rejected.
+    w.triggerAbsorb(0, 0, true);
+    expect(w.planets[0].absorbing).toBe(false);
+  });
+
+  it('flushes phantom garrison into ring fill during absorb', () => {
+    const w = new World(ringedMap, [{ id: 0, isAI: false, name: 'P' }]);
+    // Freeze production so the test observes only the flush behavior.
+    w.planets[0].productionRate = 0;
+    // Inject a big phantom garrison — uncounted production overflow waiting
+    // for the orbiter cap to free up. With absorb on, every one of these
+    // must end up consumed as a ring-fill tick (previously they would stall).
+    w.planets[0].garrison = 12;
+    w.triggerAbsorb(0, 0, true);
+    expect(w.planets[0].absorbing).toBe(true);
+    // Run long enough for the flush pass and the pull-to-center to complete.
+    for (let i = 0; i < 200; i++) w.step(0.05);
+    expect(w.planets[0].garrison).toBe(0);
+    // Planet evolves when ring fills fully — either it grew (ringCount reset)
+    // or ringFillProgress ticked up meaningfully. Both are valid end states.
+    const p = w.planets[0];
+    const totalFill = p.ringFillProgress.reduce((a, b) => a + b, 0);
+    expect(p.type > 0 || totalFill > 0).toBe(true);
+  });
+});
+
 describe('World game over', () => {
   it('declares winner when only one owner remains', () => {
     let winner: number | null = -1;

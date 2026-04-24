@@ -89,6 +89,16 @@ const ORBIT_RADIUS_MULT = 1.75;
 const ORBIT_SETTLE_TOLERANCE = 3;
 /** How far (px) from planet center before an absorbing unit is consumed. */
 const ABSORB_CONSUME_DIST = 3;
+/**
+ * Max rate (ghosts/sec) at which phantom garrison is converted into visible
+ * absorbing ships. Tuned so even an XXL with a full overflow staggers its
+ * flush over a readable second or two instead of popping in a single frame.
+ */
+const ABSORB_FLUSH_RATE = 14;
+
+/** True when the planet still has something absorb can usefully fill. */
+const canAbsorb = (p: Planet): boolean =>
+  p.ringCount > 0 || p.health < p.maxHealth;
 
 /** Boids tuning for transit swarms. Kept gentle — ships must still arrive. */
 const SEPARATION_RADIUS = 9;
@@ -139,6 +149,7 @@ export class World {
         ringFillProgress: new Array(ringCount).fill(0),
         maxUnitCapacity: BASE_UNIT_CAPACITY[type],
         absorbing: false,
+        absorbFlushAcc: 0,
         health: maxHealth,
         maxHealth,
       };
@@ -261,10 +272,15 @@ export class World {
    * Toggle absorption mode on a friendly planet. While absorbing, orbit units
    * are pulled into the center and consumed — feeding either health (if damaged)
    * or the upgrade meter (which converts into permanent production gains).
+   *
+   * No-op when a planet has nothing left to absorb into (no unfilled rings
+   * and full health): sparing the player from silently feeding units into a
+   * sink with no visible payoff.
    */
   triggerAbsorb(planetId: number, owner: number, enabled = true): void {
     const p = this.planets[planetId];
     if (!p || p.owner !== owner) return;
+    if (enabled && !canAbsorb(p)) return;
     p.absorbing = enabled;
   }
 
@@ -387,8 +403,41 @@ export class World {
       if (p.capturePulse > 0) p.capturePulse = Math.max(0, p.capturePulse - dt);
       if (p.evolvePulse > 0) p.evolvePulse = Math.max(0, p.evolvePulse - dt * 0.9);
       if (p.owner === null) continue;
-      // Absorbing planets stall production so all focus is on consuming orbiters.
-      if (p.absorbing) continue;
+
+      if (p.absorbing) {
+        // While absorbing, production still runs — but new units are born
+        // already pulling for the center, so the rings keep filling instead
+        // of stalling once the existing orbit drains. Auto-cancel absorb
+        // once there's nothing left to feed so we don't silently burn units.
+        if (!canAbsorb(p)) {
+          p.absorbing = false;
+        } else {
+          p.productionAcc += p.productionRate * dt;
+          while (p.productionAcc >= 1) {
+            p.productionAcc -= 1;
+            p.garrison += 1;
+            this.spawnAbsorbingGhost(p);
+          }
+          // Flush residual garrison that never got a live orbiter (production
+          // overflow from before absorb turned on, or from hitting the orbit
+          // cap). Rate-limited so a big planet staggers its flush rather than
+          // popping 60 ghosts on a single frame.
+          const local = this.countLocalShipsOf(p.id);
+          const phantom = Math.max(0, p.garrison - local);
+          if (phantom > 0) {
+            p.absorbFlushAcc += ABSORB_FLUSH_RATE * dt;
+            const burst = Math.min(phantom, Math.floor(p.absorbFlushAcc));
+            if (burst > 0) {
+              p.absorbFlushAcc -= burst;
+              for (let i = 0; i < burst; i++) this.spawnAbsorbingGhost(p);
+            }
+          } else {
+            p.absorbFlushAcc = 0;
+          }
+          continue;
+        }
+      }
+
       p.productionAcc += p.productionRate * dt;
       while (p.productionAcc >= 1) {
         p.productionAcc -= 1;
@@ -521,11 +570,62 @@ export class World {
     });
   }
 
+  /**
+   * Spawn a ship already in absorbing state at the orbit radius so the player
+   * sees it immediately streak inward. Used while the planet is in absorb mode
+   * to keep rings filling from continuing production and from phantom garrison
+   * that never got a live orbiter under the cap.
+   */
+  private spawnAbsorbingGhost(planet: Planet): void {
+    if (planet.owner === null) return;
+    const angle = Math.random() * Math.PI * 2;
+    const orbitRadius =
+      planet.radius * ORBIT_RADIUS_MULT + (Math.random() - 0.5) * 6;
+    const spawnPos = vec(
+      planet.pos.x + Math.cos(angle) * orbitRadius,
+      planet.pos.y + Math.sin(angle) * orbitRadius,
+    );
+    // Initial velocity points straight at the center so the visual pull reads
+    // as decisive even for the first frame of its life.
+    const pullSpeed = SHIP_SPEED * 1.6;
+    this.ships.spawn(planet.owner, spawnPos, -1, SHIP_SPEED, {
+      vx: -Math.cos(angle) * pullSpeed,
+      vy: -Math.sin(angle) * pullSpeed,
+      turnRate: 2.2,
+      wobbleAmp: 0,
+      wobblePhase: 0,
+      state: 'absorbing',
+      parentPlanet: planet.id,
+      orbitRadius,
+      orbitDir: 1,
+      wanderPhase: 0,
+      // Committed absorb — if the player toggles absorb off mid-pull this ship
+      // still finishes landing into the planet rather than snapping back to
+      // orbit, so a cancelled absorb doesn't feel like it ate units twice.
+      absorbOnArrive: true,
+    });
+  }
+
   private countOrbitersOf(planetId: number): number {
     const all = this.ships.all;
     let n = 0;
     for (const s of all) {
       if (s.active && s.state === 'orbiting' && s.parentPlanet === planetId) n++;
+    }
+    return n;
+  }
+
+  /**
+   * Count every active ship that claims `planetId` as its parent — orbiting
+   * OR absorbing. Used by the absorb-flush pass to size `garrison - ships`
+   * (phantom overflow waiting to be made visible).
+   */
+  private countLocalShipsOf(planetId: number): number {
+    const all = this.ships.all;
+    let n = 0;
+    for (const s of all) {
+      if (!s.active || s.parentPlanet !== planetId) continue;
+      if (s.state === 'orbiting' || s.state === 'absorbing') n++;
     }
     return n;
   }

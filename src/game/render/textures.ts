@@ -114,10 +114,62 @@ const PHOTOGRAPHIC_ARCHETYPES: PlanetArchetype[] = [
   'desert',
 ];
 
+/**
+ * Per-match archetype assignment. Populated by `assignPlanetArchetypes` at the
+ * start of a match so every planet pulls a *distinct* texture from the pool
+ * while the pool is large enough (no two planets share the same baked map
+ * unless the match has more planets than archetypes). Cleared + refilled on
+ * each new match so replays feel fresh.
+ */
+const archetypeAssignments = new Map<number, PlanetArchetype>();
+
+/**
+ * Deterministic Fisher–Yates shuffle — same seed in → same sequence out, so
+ * a match's texture set is stable within itself (tests, re-bakes on evolve)
+ * but varies between matches when the caller passes a time-based seed.
+ */
+const shuffledArchetypes = (seed: number): PlanetArchetype[] => {
+  const arr = PHOTOGRAPHIC_ARCHETYPES.slice();
+  let a = (seed | 0) || 1;
+  const next = () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(next() * (i + 1));
+    const tmp = arr[i];
+    arr[i] = arr[j];
+    arr[j] = tmp;
+  }
+  return arr;
+};
+
+/**
+ * Assign a unique archetype to every planet id for the lifetime of a match.
+ * If the map has more planets than available archetypes we wrap around (rare
+ * in practice — pool is 11, maps are well under that), ensuring we still
+ * maximize spread rather than collapsing to a few repeats.
+ */
+export const assignPlanetArchetypes = (
+  planetIds: readonly number[],
+  seed: number,
+): void => {
+  archetypeAssignments.clear();
+  const shuffled = shuffledArchetypes(seed);
+  for (let i = 0; i < planetIds.length; i++) {
+    archetypeAssignments.set(planetIds[i], shuffled[i % shuffled.length]);
+  }
+};
+
 export const archetypeForSeed = (
   seed: number,
   _planetType?: PlanetType,
 ): PlanetArchetype => {
+  const assigned = archetypeAssignments.get(seed);
+  if (assigned) return assigned;
   const h = Math.abs(Math.imul(seed + 0x9e3779b9, 2654435761)) >>> 0;
   return PHOTOGRAPHIC_ARCHETYPES[h % PHOTOGRAPHIC_ARCHETYPES.length];
 };

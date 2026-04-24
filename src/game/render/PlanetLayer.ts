@@ -3,6 +3,7 @@ import { paletteFor } from '../../util/color.js';
 import { RING_CAPACITY_FOR_SIZE, type PlanetType } from '../sim/Planet.js';
 import type { World } from '../sim/World.js';
 import {
+  assignPlanetArchetypes,
   bakedBodyDiameter,
   makePlanetBodyTexture,
   makePlanetHaloTexture,
@@ -148,6 +149,14 @@ export class PlanetLayer extends Container {
     this.world = world;
     this.shipTex = makeShipTexture(app);
     this.shipGlowTex = makeShipGlowTexture(app);
+
+    // Assign every planet a distinct archetype from the pool before baking
+    // any body textures, so no two worlds in the same match share a surface.
+    assignPlanetArchetypes(
+      world.planets.map((p) => p.id),
+      // Use the wall clock as the per-match seed so replays shuffle the pool.
+      Date.now() & 0x7fffffff,
+    );
 
     for (const planet of world.planets) {
       const container = new Container();

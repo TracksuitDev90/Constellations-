@@ -88,6 +88,13 @@ export interface Planet {
   maxUnitCapacity: number;
   /** When true, orbit ships are pulled to the center and consumed on contact. */
   absorbing: boolean;
+  /**
+   * Sub-unit accumulator for the "phantom garrison" flush while absorbing.
+   * Drives how many extra absorbing ghost ships spawn per second to convert
+   * uncounted production overflow into visible pulls — so the player sees
+   * every garrisoned unit streak inward instead of silently vanishing.
+   */
+  absorbFlushAcc: number;
   /** HP for absorb-to-heal routing. */
   health: number;
   maxHealth: number;

@@ -12,7 +12,26 @@ import {
 } from './textures.js';
 import { planetAssetsReady } from './planetAssets.js';
 
-const MAX_ORBITERS = 48;
+/**
+ * Upper bound on atom-electron sprites per planet. Bigger planets get more
+ * so a full XXL garrison actually reads as a dense swarm rather than capping
+ * at the small-planet ceiling; small ones stay capped low to preserve the
+ * "lone orbit" silhouette.
+ */
+const orbiterCapFor = (maxUnitCapacity: number): number =>
+  Math.max(32, Math.min(maxUnitCapacity, 160));
+/**
+ * Seconds a newly-produced orbiter spends "being born" — ramping up from a
+ * tiny scale at the planet center out to its ring slot. Long enough that the
+ * player's eye reads production as a pump-out even on XXL worlds.
+ */
+const ORBITER_BIRTH_DURATION = 0.55;
+/**
+ * Seconds a production pulse ring lingers on the planet surface after a unit
+ * spawns. Drawn on top of the body so even when the orbit is already at cap
+ * the player sees a steady "emitting" heartbeat from the planet.
+ */
+const PRODUCTION_PULSE_DURATION = 0.65;
 /** Major-axis radius of an atom-ring, as a multiple of planet radius. */
 const ORBIT_BAND_MAJOR = 1.85;
 /**
@@ -94,6 +113,15 @@ interface Orbiter {
   wanderPhase: number;
   /** Per-orbiter phase along its ring's ellipse (0..2π). */
   slotPhase: number;
+  /**
+   * Seconds since the orbiter was born. While below ORBITER_BIRTH_DURATION
+   * the sprite scales up from 0 and its position eases out from the planet
+   * center, giving new production a clear "pumped out" read even on big
+   * planets where the atom ring is always dense.
+   */
+  birthAge: number;
+  /** Angle along which the orbiter emerges from the planet surface. */
+  birthAngle: number;
 }
 
 interface PlanetView {
@@ -132,6 +160,16 @@ interface PlanetView {
    * radius. Rebuilt on size evolution so higher-res textures stay crisp.
    */
   bodyBaseScale: number;
+  /**
+   * Last observed productionAcc — used to detect a sub-unit wraparound and
+   * emit a production pulse even on planets already at the visual orbiter
+   * cap, so bigger worlds still visibly "pump" when the atom ring is full.
+   */
+  lastProductionAcc: number;
+  /** Active production pulses; each fades over PRODUCTION_PULSE_DURATION. */
+  productionPulses: Array<{ age: number; angle: number }>;
+  /** Graphics layer for production pulses, drawn on top of the body. */
+  productionFx: Graphics;
 }
 
 export class PlanetLayer extends Container {
@@ -177,10 +215,21 @@ export class PlanetLayer extends Container {
       const atomPaths = new Graphics();
       const shockwave = new Graphics();
       const strengthBar = new Graphics();
+      const productionFx = new Graphics();
 
       const orbitRoot = new Container();
 
-      container.addChild(halo, ring, rings, body, atomPaths, orbitRoot, shockwave, strengthBar);
+      container.addChild(
+        halo,
+        ring,
+        rings,
+        body,
+        productionFx,
+        atomPaths,
+        orbitRoot,
+        shockwave,
+        strengthBar,
+      );
       this.addChild(container);
 
       this.views.push({
@@ -212,6 +261,9 @@ export class PlanetLayer extends Container {
         easedRingCount: 0,
         atomFormation: 0,
         bodyBaseScale: computeBodyBaseScale(planet.radius),
+        lastProductionAcc: 0,
+        productionPulses: [],
+        productionFx,
       });
     }
   }
@@ -362,15 +414,75 @@ export class PlanetLayer extends Container {
         v.ring.circle(0, 0, outer).stroke({ width: 2.5, color: pal.ring, alpha: 0.95 });
       }
 
+      // Production detection: a sub-unit accumulator wrap means the sim just
+      // spawned a ship this frame. Fire a production pulse even when the
+      // visual orbiter cap is already saturated so bigger planets still read
+      // as actively "pumping out" units, which was the missing feedback the
+      // player lost once garrison climbed past the atom-ring population.
+      if (p.owner !== null && p.productionAcc < v.lastProductionAcc - 0.05) {
+        v.productionPulses.push({ age: 0, angle: Math.random() * Math.PI * 2 });
+      }
+      v.lastProductionAcc = p.owner === null ? 0 : p.productionAcc;
+
       // Orbiters: represent garrison (up to cap) as atom-symbol electrons.
       if (p.owner !== null) {
-        this.syncOrbiters(v, Math.min(p.garrison, MAX_ORBITERS), p.owner);
+        this.syncOrbiters(v, Math.min(p.garrison, orbiterCapFor(p.maxUnitCapacity)), p.owner);
         this.tickOrbiters(v, dt);
         this.drawAtomPaths(v, pal.ring);
       } else {
         if (v.orbiters.length > 0) this.clearOrbiters(v);
         v.atomPaths.clear();
+        v.productionPulses.length = 0;
       }
+
+      this.drawProductionPulses(v, dt, effRadius, pal);
+    }
+  }
+
+  /**
+   * Update and render any in-flight production pulses on this planet. Each
+   * pulse is a short-lived ring + spark at a random angle on the planet's
+   * surface; it fades as its age approaches PRODUCTION_PULSE_DURATION. Drawn
+   * on top of the body so it reads cleanly against any texture.
+   */
+  private drawProductionPulses(
+    v: PlanetView,
+    dt: number,
+    effRadius: number,
+    pal: import('../../util/color.js').PlayerPalette,
+  ): void {
+    const g = v.productionFx;
+    g.clear();
+    if (v.productionPulses.length === 0) return;
+    // Cap history so a long match can't leak pulses; 16 concurrent is plenty
+    // given how short each one lives.
+    if (v.productionPulses.length > 16) v.productionPulses.splice(0, v.productionPulses.length - 16);
+    for (let i = v.productionPulses.length - 1; i >= 0; i--) {
+      const pulse = v.productionPulses[i];
+      pulse.age += dt;
+      const t = pulse.age / PRODUCTION_PULSE_DURATION;
+      if (t >= 1) {
+        v.productionPulses.splice(i, 1);
+        continue;
+      }
+      const ease = t * t;
+      // Expanding arc just outside the planet surface.
+      const r = effRadius * (1 + 0.2 * ease);
+      const sweep = Math.PI * 0.55;
+      const start = pulse.angle - sweep / 2;
+      const end = pulse.angle + sweep / 2;
+      g.arc(0, 0, r, start, end).stroke({
+        width: Math.max(1.2, effRadius * 0.06) * (1 - t),
+        color: pal.glow,
+        alpha: 0.65 * (1 - t),
+      });
+      // Bright spark at the emission point on the surface.
+      const sx = Math.cos(pulse.angle) * effRadius;
+      const sy = Math.sin(pulse.angle) * effRadius;
+      g.circle(sx, sy, Math.max(1.5, effRadius * 0.08) * (1 - t * 0.5)).fill({
+        color: pal.ring,
+        alpha: 0.9 * (1 - t),
+      });
     }
   }
 
@@ -463,14 +575,17 @@ export class PlanetLayer extends Container {
 
       const sprite = new Sprite(this.shipTex);
       sprite.anchor.set(0.5);
-      sprite.scale.set(0.36);
+      // Start at zero scale and right at the planet center. tickOrbiters
+      // ramps scale + position out during the birth window so newly-produced
+      // units visibly emerge *from* the planet rather than materialize in orbit.
+      sprite.scale.set(0);
       sprite.tint = shipTint;
-      const spawnAngle = Math.random() * Math.PI * 2;
-      const spawnR = v.baseRadius * (0.9 + Math.random() * 0.3);
-      sprite.x = Math.cos(spawnAngle) * spawnR;
-      sprite.y = Math.sin(spawnAngle) * spawnR;
-      glow.x = sprite.x;
-      glow.y = sprite.y;
+      const birthAngle = Math.random() * Math.PI * 2;
+      sprite.x = 0;
+      sprite.y = 0;
+      glow.x = 0;
+      glow.y = 0;
+      glow.alpha = 0;
       v.orbitRoot.addChild(sprite);
 
       v.orbiters.push({
@@ -481,6 +596,8 @@ export class PlanetLayer extends Container {
         phase: Math.random() * Math.PI * 2,
         wanderPhase: Math.random() * Math.PI * 2,
         slotPhase: Math.random() * Math.PI * 2,
+        birthAge: 0,
+        birthAngle,
       });
     }
 
@@ -559,6 +676,7 @@ export class PlanetLayer extends Container {
     for (let i = 0; i < count; i++) {
       const o = v.orbiters[i];
       o.wanderPhase += dt * 0.7;
+      o.birthAge += dt;
       const r = o.ringIdx;
       const slot = slotIdx[r]++;
       const memberSpacing = (slot / memberCount[r]) * Math.PI * 2;
@@ -577,19 +695,52 @@ export class PlanetLayer extends Container {
       const tx = ex * cosT - ey * sinT;
       const ty = ex * sinT + ey * cosT;
 
-      o.sprite.x += (tx - o.sprite.x) * ease;
-      o.sprite.y += (ty - o.sprite.y) * ease;
+      // Birth emergence: during the first ORBITER_BIRTH_DURATION seconds the
+      // orbiter's ring-ease is overridden by a direct center→surface→ring
+      // trajectory so the player reads the unit being *ejected* from the
+      // planet instead of popping into its ring slot.
+      const bp = Math.min(1, o.birthAge / ORBITER_BIRTH_DURATION);
+      if (bp < 1) {
+        const eased = smoothstep(bp);
+        // First half: center → planet surface along the birth angle.
+        // Second half: surface → assigned ring slot.
+        const surfaceR = v.baseRadius * 0.95;
+        const sx = Math.cos(o.birthAngle) * surfaceR;
+        const sy = Math.sin(o.birthAngle) * surfaceR;
+        let bx: number;
+        let by: number;
+        if (eased < 0.5) {
+          const t = eased / 0.5;
+          bx = sx * t;
+          by = sy * t;
+        } else {
+          const t = (eased - 0.5) / 0.5;
+          bx = sx + (tx - sx) * t;
+          by = sy + (ty - sy) * t;
+        }
+        o.sprite.x = bx;
+        o.sprite.y = by;
+        const birthScale = 0.36 * eased;
+        o.sprite.scale.set(birthScale);
+      } else {
+        o.sprite.x += (tx - o.sprite.x) * ease;
+        o.sprite.y += (ty - o.sprite.y) * ease;
+        o.sprite.scale.set(0.36);
+      }
+
       const a = 0.7 + 0.3 * Math.sin(this.time * 2.2 + o.phase);
-      o.sprite.alpha = a;
+      o.sprite.alpha = a * (bp < 1 ? bp : 1);
 
       // Glow follows the sprite; its own twinkle runs at a different phase so
       // the halo pulsing doesn't lock to the dot flicker, which keeps dense
-      // clusters from reading as a single solid blob.
+      // clusters from reading as a single solid blob. Glow also ramps up
+      // during birth so a freshly spawned unit doesn't flash a full-strength
+      // halo at t=0.
       o.glow.x = o.sprite.x;
       o.glow.y = o.sprite.y;
       const glowFlicker = 0.65 + 0.35 * Math.sin(this.time * 3.1 + o.phase * 1.7);
-      o.glow.alpha = 0.55 * glowFlicker;
-      o.glow.scale.set(o.glowScale);
+      o.glow.alpha = 0.55 * glowFlicker * (bp < 1 ? bp : 1);
+      o.glow.scale.set(o.glowScale * (bp < 1 ? 0.4 + 0.6 * bp : 1));
     }
   }
 

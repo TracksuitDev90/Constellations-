@@ -95,6 +95,14 @@ const ABSORB_CONSUME_DIST = 3;
  * flush over a readable second or two instead of popping in a single frame.
  */
 const ABSORB_FLUSH_RATE = 14;
+/**
+ * Hard ceiling on live orbiters a friendly planet can accept from arriving
+ * reinforcements — higher than the per-size `maxUnitCapacity` that gates
+ * native production, so a player stacking extra waves on a captured world
+ * sees the swarm visibly thicken instead of silently topping out at the
+ * base size cap. Safety net to keep the O(n²) orbit separation cheap.
+ */
+const REINFORCEMENT_ORBIT_CAP = 300;
 
 /** True when the planet still has something absorb can usefully fill. */
 const canAbsorb = (p: Planet): boolean =>
@@ -1017,8 +1025,10 @@ export class World {
       }
       // Turn the arriving ship into an orbiter of its new home rather than
       // returning it to the pool — matches the spec: "unit's state resets to
-      // Orbiting and it joins the target planet's list".
-      if (this.countOrbitersOf(planet.id) < planet.maxUnitCapacity) {
+      // Orbiting and it joins the target planet's list". Reinforcements are
+      // allowed past the native production cap (up to REINFORCEMENT_ORBIT_CAP)
+      // so stacking more waves on a maxed planet visibly thickens the swarm.
+      if (this.countOrbitersOf(planet.id) < REINFORCEMENT_ORBIT_CAP) {
         ship.state = 'orbiting';
         ship.parentPlanet = planet.id;
         ship.sourcePlanet = -1;

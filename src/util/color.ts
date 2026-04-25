@@ -63,3 +63,24 @@ export const toward = (color: number, target: number, t: number): number => {
   const b = Math.round(b0 + (b1 - b0) * t);
   return (r << 16) | (g << 8) | b;
 };
+
+const hash01 = (n: number): number => {
+  const x = Math.sin(n * 9301 + 49297) * 233280;
+  return x - Math.floor(x);
+};
+
+/**
+ * Per-channel deterministic jitter. Each RGB channel is multiplied by an
+ * independent factor in `[1-amount, 1+amount]` so the result is recognizably
+ * the same hue with a small drift. Used per-planet so two planets owned by
+ * the same player still feel individually unique.
+ */
+export const hueJitter = (color: number, seed: number, amount = 0.15): number => {
+  const jr = 1 + (hash01(seed * 7 + 1) - 0.5) * amount * 2;
+  const jg = 1 + (hash01(seed * 13 + 2) - 0.5) * amount * 2;
+  const jb = 1 + (hash01(seed * 19 + 3) - 0.5) * amount * 2;
+  const r = Math.min(255, Math.max(0, Math.round(((color >> 16) & 0xff) * jr)));
+  const g = Math.min(255, Math.max(0, Math.round(((color >> 8) & 0xff) * jg)));
+  const b = Math.min(255, Math.max(0, Math.round((color & 0xff) * jb)));
+  return (r << 16) | (g << 8) | b;
+};

@@ -1,5 +1,5 @@
 import { Application, Container, Graphics, Sprite, Texture } from 'pixi.js';
-import { paletteFor } from '../../util/color.js';
+import { adjustColor, hueJitter, paletteFor, toward } from '../../util/color.js';
 import { RING_CAPACITY_FOR_SIZE, type PlanetType } from '../sim/Planet.js';
 import type { World } from '../sim/World.js';
 import {
@@ -195,6 +195,12 @@ interface PlanetView {
   capRingSpin: number[];
   /** Per-ring rotation speed (rad/sec). Slight variance keeps stacked rings independent. */
   capRingSpinSpeed: number[];
+  /**
+   * Visual style picked per capacity ring slot. Stable across re-renders
+   * because it's derived from the planet id, so a given world's rings never
+   * "swap looks" between frames.
+   */
+  ringStyle: Array<'brushstroke' | 'spiky'>;
 }
 
 export class PlanetLayer extends Container {
@@ -273,6 +279,8 @@ export class PlanetLayer extends Container {
       const speedPick = (k: number): number =>
         (0.18 + seeded(tiltSeed + k * 23 + 3) * 0.18) *
         (Math.random() < 0.5 ? -1 : 1);
+      const stylePick = (k: number): 'brushstroke' | 'spiky' =>
+        seeded(tiltSeed + k * 29 + 41) < 0.5 ? 'brushstroke' : 'spiky';
       this.views.push({
         planetId: planet.id,
         container,
@@ -313,6 +321,7 @@ export class PlanetLayer extends Container {
           seeded(tiltSeed + 17) * Math.PI * 2,
         ],
         capRingSpinSpeed: [speedPick(0), speedPick(1)],
+        ringStyle: [stylePick(0), stylePick(1)],
       });
     }
   }
@@ -429,13 +438,31 @@ export class PlanetLayer extends Container {
 
           v.capRingSpin[k] += (v.capRingSpinSpeed[k] ?? 0.25) * dt;
 
-          drawWispyRing(
+          // Two-tone colors per ring: a darker base + a lighter accent, both
+          // jittered per planet so two worlds owned by the same player feel
+          // individually distinct without losing their owner-color identity.
+          const jitterSeed = p.id * 73 + k * 19;
+          const baseColor = adjustColor(
+            hueJitter(pal.ring, jitterSeed, 0.18),
+            0.55,
+          );
+          const accentColor = toward(
+            hueJitter(pal.ring, jitterSeed + 11, 0.18),
+            0xffffff,
+            0.4,
+          );
+          const draw =
+            v.ringStyle[k] === 'spiky'
+              ? drawSpikyTendrilRing
+              : drawBrushstrokeRing;
+          draw(
             v.ringsBack,
             v.ringsFront,
             rMid,
             RING_WIDTH,
             progress,
-            pal.ring,
+            baseColor,
+            accentColor,
             pal.glow,
             p.id * 13 + k,
             this.time,
@@ -864,35 +891,91 @@ const seeded = (seed: number): number => {
 };
 
 /**
- * Wispy gas-cloud ring. Renders the ring as a series of brushy strands
- * sweeping along a tilted ellipse around the planet, splitting each
- * strand at its depth-zero crossing so the back half draws into `back`
- * (occluded by the body) and the front half into `front` (covering the
- * body). The combined effect is a 3D cloud rotating around the world
- * rather than a flat halo.
- *
- *   - `tilt`     — out-of-plane angle of the ring (radians). 0 → seen
- *                  edge-on (a pure horizontal stripe); π/2 → seen
- *                  flat-on (a circle). Picked per-planet for variety.
- *   - `yaw`      — rotation of the ring's tilt axis around the planet's
- *                  z-axis, so different rings on the same map don't all
- *                  share the same horizon line.
- *   - `spin`     — current rotation phase along the ring; advanced each
- *                  frame so the cloud visibly orbits.
- *   - `progress` — 0..1 fill amount. Strands inside the filled angular
- *                  arc bloom into the owner's tint; strands outside stay
- *                  ghostly so the empty ring still reads as structure.
- *
- * All wisp positions, lengths and alphas are seeded per-ring so the
- * pattern is stable across frames but unique per planet.
+ * Project a parameter angle θ around a tilted ring of radius `r` into screen
+ * space. `sin(tilt)` foreshortens the ellipse's vertical axis; `yaw` rotates
+ * the resulting ellipse around the planet centre. Returns a depth coordinate
+ * so callers can split drawing into back/front halves and produce the
+ * orbit-around-planet 3D illusion.
  */
-const drawWispyRing = (
+const projectRing = (
+  theta: number,
+  r: number,
+  sinT: number,
+  cosT: number,
+  cosY: number,
+  sinY: number,
+): { x: number; y: number; depth: number } => {
+  const lx = Math.cos(theta) * r;
+  const ly = Math.sin(theta) * r;
+  const tx = lx;
+  const ty = ly * sinT;
+  const tz = ly * cosT;
+  const rx = tx * cosY - ty * sinY;
+  const ry = tx * sinY + ty * cosY;
+  return { x: rx, y: ry, depth: tz };
+};
+
+const FILL_START = -Math.PI / 2;
+const isFilled = (theta: number, progress: number): boolean => {
+  if (progress >= 0.999) return true;
+  const sweep = Math.PI * 2 * progress;
+  const d = ((theta - FILL_START) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2);
+  return d <= sweep;
+};
+
+/**
+ * Draw a glowing leading-edge arc along the filled portion of the ring.
+ * Shared between both ring styles so progress always reads at a glance.
+ */
+const drawFillBeads = (
   back: import('pixi.js').Graphics,
   front: import('pixi.js').Graphics,
   rMid: number,
   ringWidth: number,
   progress: number,
-  ringColor: number,
+  glowColor: number,
+  seed: number,
+  time: number,
+  spin: number,
+  sinT: number,
+  cosT: number,
+  cosY: number,
+  sinY: number,
+): void => {
+  if (progress <= 0.01) return;
+  const sweep = Math.PI * 2 * progress;
+  const beadCount = Math.max(8, Math.floor(34 * progress));
+  const rimPulse = 0.65 + 0.25 * Math.sin(time * 2.2 + seed * 0.7);
+  for (let i = 0; i <= beadCount; i++) {
+    const t = i / beadCount;
+    const a = FILL_START + sweep * t + spin;
+    const p = projectRing(a, rMid, sinT, cosT, cosY, sinY);
+    const target = p.depth >= 0 ? front : back;
+    target
+      .circle(p.x, p.y, Math.max(1.2, ringWidth * 0.09))
+      .fill({ color: 0xffffff, alpha: 0.55 * rimPulse * progress });
+    target
+      .circle(p.x, p.y, Math.max(2.4, ringWidth * 0.18))
+      .fill({ color: glowColor, alpha: 0.22 * progress });
+  }
+};
+
+/**
+ * Brushstroke ring (image-2 reference): a watercolour band built from a few
+ * broad sweeping base strokes plus shorter, lighter accent strokes laid on
+ * top. The base strokes draw the full ellipse so the ring always reads as a
+ * confident loop; the accents add the painterly "two pigments overlapping"
+ * texture visible in the reference. Tilt/yaw/spin/progress drive the same
+ * orbit illusion as before.
+ */
+const drawBrushstrokeRing = (
+  back: import('pixi.js').Graphics,
+  front: import('pixi.js').Graphics,
+  rMid: number,
+  ringWidth: number,
+  progress: number,
+  baseColor: number,
+  accentColor: number,
   glowColor: number,
   seed: number,
   time: number,
@@ -900,119 +983,202 @@ const drawWispyRing = (
   yaw: number,
   spin: number,
 ): void => {
-  // Project a point on the ring (parameter angle θ around the body) into
-  // screen space using the ring's tilt (sin α scales the horizontal
-  // foreshortening) plus a yaw rotation that spins the whole ellipse.
   const sinT = Math.sin(tilt);
+  const cosT = Math.cos(tilt);
   const cosY = Math.cos(yaw);
   const sinY = Math.sin(yaw);
 
-  const project = (theta: number, r: number): { x: number; y: number; depth: number } => {
-    // Plane-local point on the unit circle.
-    const lx = Math.cos(theta) * r;
-    const ly = Math.sin(theta) * r;
-    // Tilt the circle so the y-axis foreshortens by sin(tilt). When tilt is
-    // π/2 the ring becomes a circle (sin = 1); smaller tilts squish it.
-    const tx = lx;
-    const ty = ly * sinT;
-    const tz = ly * Math.cos(tilt); // depth perpendicular to the screen
-    // Yaw rotation: rotates the squished ellipse around the planet's z axis.
-    const rx = tx * cosY - ty * sinY;
-    const ry = tx * sinY + ty * cosY;
-    return { x: rx, y: ry, depth: tz };
-  };
+  // Base strokes — broad, low-alpha sweeps drawn around the full ellipse.
+  // Two of them at slightly different radial offsets blend into a band that
+  // reads as the darker pigment in the reference.
+  const BASE_STROKES = 2;
+  const BASE_SAMPLES = 64;
+  for (let s = 0; s < BASE_STROKES; s++) {
+    const sSeed = seed * 41 + s * 13 + 3;
+    const radialOffset = (s - (BASE_STROKES - 1) / 2) * ringWidth * 0.32;
+    const wobblePhase = seeded(sSeed) * Math.PI * 2;
+    const wobbleAmp = ringWidth * (0.08 + seeded(sSeed * 7) * 0.12);
+    for (let i = 0; i < BASE_SAMPLES; i++) {
+      const theta = (i / BASE_SAMPLES) * Math.PI * 2;
+      const a = theta + spin;
+      // Slow radial wobble keeps the band from reading as a perfect ellipse.
+      const r =
+        rMid +
+        radialOffset +
+        Math.sin(theta * 3 + wobblePhase) * wobbleAmp;
+      const p = projectRing(a, r, sinT, cosT, cosY, sinY);
+      const target = p.depth >= 0 ? front : back;
+      const inFill = isFilled(a, progress);
+      const depthShade = 0.7 + 0.3 * (p.depth / rMid + 0.5);
+      const flicker = 0.85 + 0.15 * Math.sin(time * 0.6 + sSeed + theta * 1.5);
+      const tone = inFill ? glowColor : baseColor;
+      const alpha =
+        (inFill ? 0.55 : 0.32) * depthShade * flicker;
+      target
+        .circle(p.x, p.y, ringWidth * 0.55)
+        .fill({ color: tone, alpha });
+    }
+  }
 
-  const innerR = rMid - ringWidth / 2;
-  const outerR = rMid + ringWidth / 2;
-  const sweep = Math.PI * 2 * progress;
-  const fillStart = -Math.PI / 2;
+  // Accent strokes — shorter, brighter arcs of the lighter pigment, tapered
+  // at the ends so each stroke reads as an individual brush mark on top of
+  // the base.
+  const ACCENT_STROKES = 5;
+  for (let s = 0; s < ACCENT_STROKES; s++) {
+    const sSeed = seed * 53 + s * 17 + 11;
+    const baseTheta = (s / ACCENT_STROKES) * Math.PI * 2 + (seeded(sSeed) - 0.5) * 0.6;
+    const length = 0.7 + seeded(sSeed * 7) * 0.9; // 0.7..1.6 rad
+    const radialBias = (seeded(sSeed * 11) - 0.5) * ringWidth * 0.5;
+    const strokeAlpha = 0.5 + seeded(sSeed * 17) * 0.2;
+    const strokeWidth = ringWidth * (0.22 + seeded(sSeed * 19) * 0.14);
+    const samples = 24;
+    for (let i = 0; i <= samples; i++) {
+      const t = i / samples;
+      const a = baseTheta + length * t + spin;
+      const sweepBend = Math.sin(t * Math.PI) * (ringWidth * 0.22);
+      const r = rMid + radialBias + sweepBend;
+      const p = projectRing(a, r, sinT, cosT, cosY, sinY);
+      const target = p.depth >= 0 ? front : back;
+      const taper = Math.pow(Math.sin(t * Math.PI), 0.6);
+      const inFill = isFilled(a, progress);
+      const depthShade = 0.7 + 0.3 * (p.depth / rMid + 0.5);
+      const tone = inFill ? glowColor : accentColor;
+      const dabAlpha =
+        strokeAlpha *
+        taper *
+        depthShade *
+        (inFill ? 1 : 0.85) *
+        (0.85 + 0.15 * Math.sin(time * 1.2 + sSeed + i * 0.5));
+      const dabR = strokeWidth * (0.9 + 0.3 * taper);
+      target.circle(p.x, p.y, dabR).fill({ color: tone, alpha: dabAlpha });
+    }
+  }
 
-  const isFilled = (theta: number): boolean => {
-    if (progress >= 0.999) return true;
-    let d = ((theta - fillStart) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2);
-    return d <= sweep;
-  };
+  drawFillBeads(
+    back, front, rMid, ringWidth, progress, glowColor,
+    seed, time, spin, sinT, cosT, cosY, sinY,
+  );
+};
 
-  // A faint dust haze along the entire ellipse — gives the strands a
-  // hazy backdrop without hard edges.
-  const HAZE_SAMPLES = 56;
-  for (let i = 0; i < HAZE_SAMPLES; i++) {
-    const theta = (i / HAZE_SAMPLES) * Math.PI * 2;
+/**
+ * Spiky tendril ring (image-1 reference): a continuous tendril ellipse with
+ * outward-pointing triangular spikes along its length, dragon-spine style.
+ * The tendril body is a sequence of overlapping dabs in the darker pigment;
+ * spikes are filled triangles whose tip points away from the planet centre.
+ * A subset of spikes get a smaller inner triangle in the lighter pigment so
+ * each spike reads as two-tone like the reference. Tilt/yaw/spin/progress
+ * still drive the orbit illusion via the shared `projectRing` helper.
+ */
+const drawSpikyTendrilRing = (
+  back: import('pixi.js').Graphics,
+  front: import('pixi.js').Graphics,
+  rMid: number,
+  ringWidth: number,
+  progress: number,
+  baseColor: number,
+  accentColor: number,
+  glowColor: number,
+  seed: number,
+  time: number,
+  tilt: number,
+  yaw: number,
+  spin: number,
+): void => {
+  const sinT = Math.sin(tilt);
+  const cosT = Math.cos(tilt);
+  const cosY = Math.cos(yaw);
+  const sinY = Math.sin(yaw);
+
+  // Tendril body — overlapping dabs sweeping the full ellipse. Slightly
+  // thicker than the brushstroke base so the spikes have a continuous
+  // backbone to root in.
+  const BODY_SAMPLES = 80;
+  for (let i = 0; i < BODY_SAMPLES; i++) {
+    const theta = (i / BODY_SAMPLES) * Math.PI * 2;
     const a = theta + spin;
-    const inFill = isFilled(a);
-    const p = project(a, rMid);
+    const wobble = Math.sin(theta * 5 + seed) * (ringWidth * 0.08);
+    const p = projectRing(a, rMid + wobble, sinT, cosT, cosY, sinY);
     const target = p.depth >= 0 ? front : back;
-    const tone = inFill ? glowColor : ringColor;
-    const alpha = (inFill ? 0.22 : 0.07) * (0.7 + 0.3 * Math.sin(time + seed + theta * 2));
+    const inFill = isFilled(a, progress);
+    const depthShade = 0.7 + 0.3 * (p.depth / rMid + 0.5);
+    const tone = inFill ? glowColor : baseColor;
+    const alpha = (inFill ? 0.85 : 0.7) * depthShade;
     target
-      .circle(p.x, p.y, ringWidth * 0.45)
+      .circle(p.x, p.y, ringWidth * 0.42)
       .fill({ color: tone, alpha });
   }
 
-  // Brushy strands. Each strand is a curving sweep of overlapping soft
-  // dabs at varied radial offsets — that's what gives the ring its
-  // watercolor-on-paper feel rather than reading as a band.
-  const STRAND_COUNT = 9;
-  for (let s = 0; s < STRAND_COUNT; s++) {
-    const sSeed = seed * 31 + s * 11 + 7;
-    const baseTheta = (s / STRAND_COUNT) * Math.PI * 2 + (seeded(sSeed) - 0.5) * 0.45;
-    const length = 0.85 + seeded(sSeed * 7) * 1.7; // 0.85..2.55 rad
-    const radialBias = (seeded(sSeed * 11) - 0.5) * ringWidth * 0.55;
-    const tightness = 0.6 + seeded(sSeed * 13) * 0.7; // 0.6..1.3
-    const strandAlpha = 0.32 + seeded(sSeed * 17) * 0.28;
-    const strandWidth = ringWidth * (0.18 + seeded(sSeed * 19) * 0.18);
-    const strandJitter = (seeded(sSeed * 23) - 0.5) * 0.15; // small phase drift
-    const samples = 22;
-    for (let i = 0; i <= samples; i++) {
-      const t = i / samples;
-      // Strand path: an arc with a slow radial swirl so the trail doesn't
-      // sit flush against rMid.
-      const localTheta = baseTheta + length * t;
-      const a = localTheta + spin + strandJitter * Math.sin(time * 0.4 + sSeed);
-      // Radial drift along the strand: sweeps inner→outer→inner so each
-      // brushstroke crosses the band rather than lying on top of it.
-      const sweepBend = Math.sin(t * Math.PI) * tightness * (ringWidth * 0.32);
-      const r = rMid + radialBias + sweepBend;
-      const p = project(a, r);
-      const target = p.depth >= 0 ? front : back;
-      // Taper alpha at the ends so each strand fades into the ether.
-      const taper = Math.pow(Math.sin(t * Math.PI), 0.7);
-      const inFill = isFilled(a);
-      const depthShade = 0.65 + 0.35 * (p.depth / rMid + 0.5);
-      const colour = inFill ? (i % 4 === 0 ? glowColor : ringColor) : ringColor;
-      const dabAlpha =
-        strandAlpha *
-        taper *
-        depthShade *
-        (inFill ? 1 : 0.45) *
-        (0.85 + 0.15 * Math.sin(time * 1.4 + sSeed + i * 0.6));
-      const dabR = strandWidth * (0.85 + 0.4 * taper);
-      target.circle(p.x, p.y, dabR).fill({ color: colour, alpha: dabAlpha });
+  // Spikes — triangular protrusions pointing outward from the ring midline.
+  // Each spike samples two adjacent ring points to derive a tangent, then
+  // emits a tip along the outward normal.
+  const SPIKE_COUNT = 60;
+  for (let i = 0; i < SPIKE_COUNT; i++) {
+    const theta = (i / SPIKE_COUNT) * Math.PI * 2;
+    const a = theta + spin;
+    // Skip ~25% of slots to give the dragon-spine an irregular silhouette.
+    if (seeded(seed * 23 + i * 7) < 0.25) continue;
+
+    const inFill = isFilled(a, progress);
+    const lengthJitter = seeded(seed * 31 + i * 11);
+    const spikeLen =
+      ringWidth * (0.6 + lengthJitter * 0.7) * (inFill ? 1.2 : 1);
+    const halfBase = ringWidth * 0.18;
+
+    // Tangent estimated from a small Δθ on either side of the spike root.
+    const dTheta = 0.05;
+    const pPrev = projectRing(a - dTheta, rMid, sinT, cosT, cosY, sinY);
+    const pNext = projectRing(a + dTheta, rMid, sinT, cosT, cosY, sinY);
+    const pMid = projectRing(a, rMid, sinT, cosT, cosY, sinY);
+
+    const tx = pNext.x - pPrev.x;
+    const ty = pNext.y - pPrev.y;
+    const tLen = Math.hypot(tx, ty) || 1;
+    const tnx = tx / tLen;
+    const tny = ty / tLen;
+    // Outward normal: rotate tangent 90° and flip if it points toward origin.
+    let nx = -tny;
+    let ny = tnx;
+    if (nx * pMid.x + ny * pMid.y < 0) {
+      nx = -nx;
+      ny = -ny;
+    }
+
+    const tipX = pMid.x + nx * spikeLen;
+    const tipY = pMid.y + ny * spikeLen;
+    const baseAx = pMid.x + tnx * halfBase;
+    const baseAy = pMid.y + tny * halfBase;
+    const baseBx = pMid.x - tnx * halfBase;
+    const baseBy = pMid.y - tny * halfBase;
+
+    const target = pMid.depth >= 0 ? front : back;
+    const depthShade = 0.7 + 0.3 * (pMid.depth / rMid + 0.5);
+    const tone = inFill ? glowColor : baseColor;
+    target
+      .poly([baseAx, baseAy, baseBx, baseBy, tipX, tipY])
+      .fill({ color: tone, alpha: 0.85 * depthShade });
+
+    // Every ~4th spike gets a smaller inner triangle in the accent tone for
+    // the dual-pigment glint visible on the reference image.
+    if (i % 4 === 0) {
+      const innerLen = spikeLen * 0.55;
+      const innerHalf = halfBase * 0.5;
+      const innerTipX = pMid.x + nx * innerLen;
+      const innerTipY = pMid.y + ny * innerLen;
+      const innerAx = pMid.x + tnx * innerHalf;
+      const innerAy = pMid.y + tny * innerHalf;
+      const innerBx = pMid.x - tnx * innerHalf;
+      const innerBy = pMid.y - tny * innerHalf;
+      target
+        .poly([innerAx, innerAy, innerBx, innerBy, innerTipX, innerTipY])
+        .fill({
+          color: inFill ? glowColor : accentColor,
+          alpha: 0.9 * depthShade,
+        });
     }
   }
 
-  // Glowing leading edge along the filled arc so progress reads at a glance
-  // even when the strands themselves are diffuse. Drawn as a series of
-  // bright beads along the ellipse, depth-aware like the strands above.
-  if (progress > 0.01) {
-    const beadCount = Math.max(8, Math.floor(34 * progress));
-    const rimPulse = 0.65 + 0.25 * Math.sin(time * 2.2 + seed * 0.7);
-    for (let i = 0; i <= beadCount; i++) {
-      const t = i / beadCount;
-      const a = fillStart + sweep * t + spin;
-      const p = project(a, rMid);
-      const target = p.depth >= 0 ? front : back;
-      target
-        .circle(p.x, p.y, Math.max(1.2, ringWidth * 0.09))
-        .fill({ color: 0xffffff, alpha: 0.55 * rimPulse * progress });
-      target
-        .circle(p.x, p.y, Math.max(2.4, ringWidth * 0.18))
-        .fill({ color: glowColor, alpha: 0.22 * progress });
-    }
-  }
-
-  // Suppress unused-locals — kept around in case a follow-up wants to draw
-  // crisp inner/outer rails again.
-  void innerR;
-  void outerR;
+  drawFillBeads(
+    back, front, rMid, ringWidth, progress, glowColor,
+    seed, time, spin, sinT, cosT, cosY, sinY,
+  );
 };

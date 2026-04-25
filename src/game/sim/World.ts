@@ -307,22 +307,25 @@ export class World {
     remaining: number,
     absorbOnArrive: boolean,
   ): void {
+    // Queue every leg of the path. Legs whose source isn't yet owned by the
+    // streamer stay dormant — `step()` skips emission while ownership is
+    // wrong, then fires the wave automatically once the leading capture
+    // flips the planet. Lets the player tap a far world and watch a chain
+    // of captures unfold without re-issuing orders at each waypoint.
     for (let i = 1; i < path.length - 1; i++) {
       const s = path[i];
       const t = path[i + 1];
-      if (this.planets[s].owner === owner) {
-        this.cancelStreamsFrom(s, owner);
-        this.streams.push(
-          createStream(
-            owner,
-            s,
-            t,
-            DEFAULT_EMIT_INTERVAL,
-            remaining,
-            absorbOnArrive && t === path[path.length - 1],
-          ),
-        );
-      }
+      this.cancelStreamsFrom(s, owner);
+      this.streams.push(
+        createStream(
+          owner,
+          s,
+          t,
+          DEFAULT_EMIT_INTERVAL,
+          remaining,
+          absorbOnArrive && t === path[path.length - 1],
+        ),
+      );
     }
   }
 
@@ -585,10 +588,17 @@ export class World {
       }
     }
 
-    // Drop finished streams and any whose source is no longer owned by the streamer.
-    this.streams = this.streams.filter(
-      (s) => s.remaining > 0 && this.planets[s.source].owner === s.owner,
-    );
+    // Drop finished streams. Streams whose source is null-owned (neutral,
+    // not yet captured) stay alive so a queued forward-leg fires as soon as
+    // the leading wave flips the planet. Streams whose source has fallen to
+    // another player are dropped — they can no longer fire and would
+    // otherwise leak forever.
+    this.streams = this.streams.filter((s) => {
+      if (s.remaining <= 0) return false;
+      const src = this.planets[s.source];
+      if (!src) return false;
+      return src.owner === null || src.owner === s.owner;
+    });
 
     // Ship simulation. Each state runs its own steering pass.
     const ships = this.ships.all;
@@ -1086,17 +1096,36 @@ export class World {
       this.ships.kill(idx);
       return;
     }
-    const targetX = tgt ? tgt.pos.x : ship.targetX;
-    const targetY = tgt ? tgt.pos.y : ship.targetY;
-    const arriveDist = tgt ? tgt.radius + 1 : 6;
+    // For drifting planets, lead-predict the catch point and widen arrive
+    // tolerance so a ship that's a frame's worth of drift behind still
+    // registers as landed. Without this, fast-drifting planets effectively
+    // out-pace the steering blend and waves bleed past without capturing.
+    const tgtMoving = tgt ? Math.hypot(tgt.vx, tgt.vy) : 0;
+    const distToTgt = tgt ? Math.hypot(tgt.pos.x - ship.x, tgt.pos.y - ship.y) : 0;
+    const lead = tgt && tgtMoving > 0 ? Math.min(0.6, distToTgt / SHIP_SPEED) : 0;
+    const targetX = tgt ? tgt.pos.x + tgt.vx * lead : ship.targetX;
+    const targetY = tgt ? tgt.pos.y + tgt.vy * lead : ship.targetY;
+    const arriveDist = tgt
+      ? tgt.radius + 4 + tgtMoving * dt
+      : 6;
+    // Arrival check is against the planet's actual centre — a leading aim
+    // helps the ship CATCH the planet, but landing happens when the ship
+    // is on the body itself.
+    if (tgt) {
+      if (distToTgt <= arriveDist) {
+        this.arrive(idx, tgt);
+        return;
+      }
+    } else {
+      const d0 = Math.hypot(targetX - ship.x, targetY - ship.y);
+      if (d0 <= arriveDist) {
+        this.beginHover(ship);
+        return;
+      }
+    }
     const dx = targetX - ship.x;
     const dy = targetY - ship.y;
     const d = Math.hypot(dx, dy);
-    if (d <= arriveDist) {
-      if (tgt) this.arrive(idx, tgt);
-      else this.beginHover(ship);
-      return;
-    }
 
     // Seek (Arrive): force toward the target, slowing near arrival.
     const seekStrength = Math.min(1, d / 40);
@@ -1173,6 +1202,19 @@ export class World {
     }
 
     const step = Math.hypot(ship.vx, ship.vy) * dt;
+    // Swept-arrival: if the segment from current → next position passes
+    // close to the target body this frame, count it as a landing. Catches
+    // edge cases where a fast ship would otherwise fly straight through a
+    // moving planet between two snapshots.
+    if (tgt) {
+      const newX = ship.x + ship.vx * dt;
+      const newY = ship.y + ship.vy * dt;
+      const minD = pointToSegmentDist(tgt.pos.x, tgt.pos.y, ship.x, ship.y, newX, newY);
+      if (minD <= tgt.radius + 1) {
+        this.arrive(idx, tgt);
+        return;
+      }
+    }
     if (step >= d) {
       if (tgt) this.arrive(idx, tgt);
       else this.beginHover(ship);
@@ -1392,3 +1434,30 @@ export class World {
 }
 
 const edgeKey = (a: number, b: number): string => (a < b ? `${a}-${b}` : `${b}-${a}`);
+
+/**
+ * Closest distance from point (px, py) to the line segment (ax, ay)–(bx, by).
+ * Used for swept-arrival so a ship that flies past a moving planet within
+ * one frame still registers as landed.
+ */
+const pointToSegmentDist = (
+  px: number,
+  py: number,
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+): number => {
+  const abx = bx - ax;
+  const aby = by - ay;
+  const apx = px - ax;
+  const apy = py - ay;
+  const ab2 = abx * abx + aby * aby;
+  if (ab2 === 0) return Math.hypot(apx, apy);
+  let t = (apx * abx + apy * aby) / ab2;
+  if (t < 0) t = 0;
+  else if (t > 1) t = 1;
+  const cx = ax + abx * t;
+  const cy = ay + aby * t;
+  return Math.hypot(px - cx, py - cy);
+};

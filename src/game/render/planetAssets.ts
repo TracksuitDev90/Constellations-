@@ -71,10 +71,17 @@ const loadImage = (src: string): Promise<HTMLImageElement> =>
   });
 
 /**
- * Find the planet's tight square bounding box inside the sticker. The planet
- * body and outline are fully opaque while the drop shadow is faint, so an
- * alpha threshold of ~200 cleanly separates them. We then square the bbox
- * around its center so the disc baker draws the planet without distortion.
+ * Find the planet's tight square bounding box inside the sticker. We threshold
+ * on near-fully-opaque pixels so semi-transparent ring/aura overlays (Saturn,
+ * swirl auras) drop out and only the solid planet body contributes — those
+ * overlays would otherwise stretch the bbox sideways and visually shift the
+ * planet off-center within the disc, leaving a "ghost" bit of artwork
+ * floating beside the planet's actual position.
+ *
+ * If a fully-opaque tail/moon still extends past the planet (rare but real),
+ * we square the box by taking `min(w, h)` and slide it within the longer
+ * axis to the position with the highest opaque-pixel count — i.e. wherever
+ * the solid planet body is densest.
  */
 const computePlanetBounds = (img: HTMLImageElement): { bx: number; by: number; bsize: number } => {
   const c = document.createElement('canvas');
@@ -88,7 +95,7 @@ const computePlanetBounds = (img: HTMLImageElement): { bx: number; by: number; b
   let minY = c.height;
   let maxX = -1;
   let maxY = -1;
-  const ALPHA_THRESHOLD = 200;
+  const ALPHA_THRESHOLD = 254;
   for (let y = 0; y < c.height; y++) {
     for (let x = 0; x < c.width; x++) {
       if (data[(y * c.width + x) * 4 + 3] >= ALPHA_THRESHOLD) {
@@ -105,14 +112,52 @@ const computePlanetBounds = (img: HTMLImageElement): { bx: number; by: number; b
   }
   const w = maxX - minX + 1;
   const h = maxY - minY + 1;
-  const side = Math.max(w, h);
-  const cx = (minX + maxX) / 2;
-  const cy = (minY + maxY) / 2;
-  let bx = Math.round(cx - side / 2);
-  let by = Math.round(cy - side / 2);
+  const D = Math.min(w, h);
+
+  // Helper: count opaque pixels inside [x0, x0+D) × [y0, y0+D).
+  const countOpaque = (x0: number, y0: number): number => {
+    let n = 0;
+    const x1 = x0 + D;
+    const y1 = y0 + D;
+    for (let y = y0; y < y1; y++) {
+      const row = y * c.width;
+      for (let x = x0; x < x1; x++) {
+        if (data[(row + x) * 4 + 3] >= ALPHA_THRESHOLD) n++;
+      }
+    }
+    return n;
+  };
+
+  let bx = minX;
+  let by = minY;
+  if (w > h) {
+    // Slide a D-wide window across the bbox horizontally, pick the densest.
+    let bestX = minX;
+    let bestCount = -1;
+    for (let x = minX; x + D <= maxX + 1; x++) {
+      const n = countOpaque(x, minY);
+      if (n > bestCount) {
+        bestCount = n;
+        bestX = x;
+      }
+    }
+    bx = bestX;
+  } else if (h > w) {
+    let bestY = minY;
+    let bestCount = -1;
+    for (let y = minY; y + D <= maxY + 1; y++) {
+      const n = countOpaque(minX, y);
+      if (n > bestCount) {
+        bestCount = n;
+        bestY = y;
+      }
+    }
+    by = bestY;
+  }
+
   if (bx < 0) bx = 0;
   if (by < 0) by = 0;
-  let bsize = side;
+  let bsize = D;
   if (bx + bsize > c.width) bsize = c.width - bx;
   if (by + bsize > c.height) bsize = c.height - by;
   return { bx, by, bsize };

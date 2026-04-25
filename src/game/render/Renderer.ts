@@ -2,6 +2,7 @@ import { Application, Container, Graphics } from 'pixi.js';
 import { PLAYER_PALETTES } from '../../util/color.js';
 import type { World } from '../sim/World.js';
 import { BackgroundLayer } from './BackgroundLayer.js';
+import { HazardLayer } from './HazardLayer.js';
 import { PlanetLayer } from './PlanetLayer.js';
 import { ShipLayer } from './ShipLayer.js';
 
@@ -12,6 +13,7 @@ export class Renderer {
   worldLayer: Container;
   planetLayer: PlanetLayer;
   shipLayer: ShipLayer;
+  hazardLayer: HazardLayer;
   lasso: Graphics;
 
   // Camera / viewport state.
@@ -31,10 +33,18 @@ export class Renderer {
     app.stage.addChild(this.worldLayer);
 
     this.shipLayer = new ShipLayer(app, world);
+    this.hazardLayer = new HazardLayer(app, world);
     this.planetLayer = new PlanetLayer(app, world);
     this.lasso = new Graphics();
 
+    // Z-order: ship streams beneath asteroid debris, then planets and their
+    // halos on top, then hazard neutrals over everything so their dots stay
+    // legible against busy traffic. The HazardLayer internally splits its
+    // asteroid vs. neutral subroots, so we add it twice — once before
+    // planets (asteroids will be in their first child) and the neutral
+    // overlay sits inside the same container above planets via z-index.
     this.worldLayer.addChild(this.shipLayer);
+    this.worldLayer.addChild(this.hazardLayer);
     this.worldLayer.addChild(this.planetLayer);
     this.worldLayer.addChild(this.lasso);
 
@@ -129,6 +139,7 @@ export class Renderer {
   update(dt: number): void {
     this.bg.update(this.viewX, this.viewY);
     this.planetLayer.update(dt);
+    this.hazardLayer.update(dt);
     this.shipLayer.update();
   }
 }

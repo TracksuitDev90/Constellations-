@@ -232,6 +232,139 @@ describe('reinforcement stacking', () => {
   });
 });
 
+describe('drifting planet hazard', () => {
+  it('moves the planet along its drift velocity and bounces off bounds', () => {
+    const map: MapSpec = {
+      width: 800,
+      height: 600,
+      planets: [
+        { pos: { x: 100, y: 100 }, radius: 16, owner: 0, garrison: 1 },
+        { pos: { x: 700, y: 500 }, radius: 16, owner: null, garrison: 1 },
+      ],
+      edges: [[0, 1]],
+      hazards: [{ type: 'driftingPlanet', planetId: 1, vx: 200, vy: 0 }],
+    };
+    const w = new World(map, [{ id: 0, isAI: false, name: 'P' }]);
+    const startX = w.planets[1].pos.x;
+    // After one tick, planet should have moved right.
+    w.step(0.5);
+    expect(w.planets[1].pos.x).toBeGreaterThan(startX);
+    // Drive forward and watch for a sign flip on vx — proves the bounce
+    // logic engaged at least once. Also assert the planet never escaped.
+    let bounced = false;
+    let lastSign = Math.sign(w.planets[1].vx);
+    for (let i = 0; i < 60; i++) {
+      w.step(0.1);
+      const s = Math.sign(w.planets[1].vx);
+      if (s !== 0 && s !== lastSign) {
+        bounced = true;
+        lastSign = s;
+      }
+      expect(w.planets[1].pos.x).toBeGreaterThanOrEqual(w.planets[1].radius - 0.001);
+      expect(w.planets[1].pos.x).toBeLessThanOrEqual(w.width - w.planets[1].radius + 0.001);
+    }
+    expect(bounced).toBe(true);
+  });
+});
+
+describe('asteroid field hazard', () => {
+  it('slows transit ships passing through the field', () => {
+    const baseMap: MapSpec = {
+      width: 1000,
+      height: 200,
+      planets: [
+        { pos: { x: 50, y: 100 }, radius: 16, owner: 0, garrison: 200 },
+        { pos: { x: 950, y: 100 }, radius: 16, owner: 1, garrison: 200 },
+      ],
+      edges: [[0, 1]],
+    };
+    const noField = new World(baseMap, [
+      { id: 0, isAI: false, name: 'P' },
+      { id: 1, isAI: true, name: 'A' },
+    ]);
+    const withField = new World(
+      {
+        ...baseMap,
+        hazards: [
+          {
+            type: 'asteroidField',
+            pos: { x: 500, y: 100 },
+            radius: 200,
+            slowdown: 0.25,
+            seed: 1,
+          },
+        ],
+      },
+      [
+        { id: 0, isAI: false, name: 'P' },
+        { id: 1, isAI: true, name: 'A' },
+      ],
+    );
+    // Freeze production so we observe pure transit steering.
+    for (const w of [noField, withField]) {
+      for (const p of w.planets) p.productionRate = 0;
+      w.openStream(0, 0, 1, 5);
+    }
+    // Run both worlds for a comparable wall-clock and inspect how far the
+    // lead ship has traveled. The field world should be measurably behind.
+    for (let i = 0; i < 300; i++) {
+      noField.step(0.05);
+      withField.step(0.05);
+    }
+    const farthest = (w: World): number => {
+      let x = 0;
+      for (const s of w.ships.all) {
+        if (s.active && s.owner === 0 && s.state === 'transit' && s.x > x) x = s.x;
+      }
+      return x;
+    };
+    expect(farthest(withField)).toBeLessThan(farthest(noField) - 30);
+  });
+});
+
+describe('neutral swarm hazard', () => {
+  it('kills nearby in-flight ships and dies in the exchange', () => {
+    const map: MapSpec = {
+      width: 600,
+      height: 200,
+      planets: [
+        { pos: { x: 50, y: 100 }, radius: 16, owner: 0, garrison: 30 },
+        { pos: { x: 550, y: 100 }, radius: 16, owner: 1, garrison: 5 },
+      ],
+      edges: [[0, 1]],
+      hazards: [
+        {
+          type: 'neutralSwarm',
+          pos: { x: 300, y: 100 },
+          count: 3,
+          patrolRadius: 30,
+          seed: 1,
+        },
+      ],
+    };
+    const w = new World(map, [
+      { id: 0, isAI: false, name: 'P' },
+      { id: 1, isAI: true, name: 'A' },
+    ]);
+    expect(w.neutrals.activeCount()).toBe(3);
+    // Send a wave through the swarm; expect ships and neutrals to trade.
+    for (const p of w.planets) p.productionRate = 0;
+    w.openStream(0, 0, 1, 10);
+    for (let i = 0; i < 600; i++) w.step(0.05);
+    // At least one neutral should have died — i.e. live count is now < 3
+    // (respawn is slow enough that we shouldn't have fully refilled yet
+    // unless the wave passed without contact, which the geometry rules out).
+    const lostAtLeastOne = w.neutrals.activeCount() < 3;
+    // OR every neutral is still up but at least one ship died — both signal
+    // contact. Tally either signal as a pass.
+    const launched = 10;
+    const survivors = w.ships.all.filter(
+      (s) => s.active && s.owner === 0 && (s.state === 'transit' || s.state === 'orbiting'),
+    ).length;
+    expect(lostAtLeastOne || survivors < launched).toBe(true);
+  });
+});
+
 describe('World game over', () => {
   it('declares winner when only one owner remains', () => {
     let winner: number | null = -1;

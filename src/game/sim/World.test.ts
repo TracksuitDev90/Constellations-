@@ -395,3 +395,49 @@ describe('World game over', () => {
     expect(winner).toBe(0);
   });
 });
+
+describe('multi-hop streaming through neutrals', () => {
+  it('chains a wave through an intermediate neutral once captured', () => {
+    // A → B → C: B starts neutral. Player streams from A toward C; the
+    // dormant B-leg should fire automatically the moment B flips.
+    const map: MapSpec = {
+      width: 600,
+      height: 100,
+      planets: [
+        { pos: { x: 50, y: 50 }, radius: 14, owner: 0, garrison: 60, type: 0 },
+        { pos: { x: 300, y: 50 }, radius: 14, owner: null, garrison: 4, type: 0 },
+        { pos: { x: 550, y: 50 }, radius: 14, owner: null, garrison: 4, type: 0 },
+      ],
+      edges: [
+        [0, 1],
+        [1, 2],
+      ],
+    };
+    const w = new World(map, [{ id: 0, isAI: false, name: 'P' }]);
+    w.planets[0].productionRate = 0;
+    w.openStream(0, 0, 2);
+    for (let i = 0; i < 3000 && w.planets[2].owner !== 0; i++) w.step(0.05);
+    expect(w.planets[1].owner).toBe(0);
+    expect(w.planets[2].owner).toBe(0);
+  });
+});
+
+describe('moving planet capture', () => {
+  it('lands a wave on a planet drifting away from the source', () => {
+    const map: MapSpec = {
+      width: 1600,
+      height: 1000,
+      planets: [
+        { pos: { x: 200, y: 500 }, radius: 14, owner: 0, garrison: 40, type: 0 },
+        { pos: { x: 800, y: 500 }, radius: 14, owner: null, garrison: 5, type: 0 },
+      ],
+      edges: [[0, 1]],
+      hazards: [{ type: 'driftingPlanet', planetId: 1, vx: 26, vy: 0 }],
+    };
+    const w = new World(map, [{ id: 0, isAI: false, name: 'P' }]);
+    w.planets[0].productionRate = 0;
+    w.openStream(0, 0, 1);
+    for (let i = 0; i < 4000 && w.planets[1].owner !== 0; i++) w.step(1 / 30);
+    expect(w.planets[1].owner).toBe(0);
+  });
+});

@@ -1,34 +1,24 @@
 /**
- * Loads real equirectangular planet maps and bakes them into lit, spherical
+ * Loads equirectangular planet maps and bakes them into lit, spherical
  * sprites on the CPU. The bake step samples the 2:1 source map for each
  * pixel of the output disc, applies Lambertian shading and a rim highlight,
  * and writes the result to a canvas → Pixi Texture. We can't easily spin a
  * 3D sphere in Pixi 8 without a custom shader, so this offline projection
  * gives us a photographic read without the runtime cost of a shader.
  *
- * Texture source: jeromeetienne/threex.planets (MIT), themselves sourced from
- * Jim Hastings-Trew's Planet Pixel Emporium. See public/textures/CREDITS.md.
+ * Texture set: 39 numbered planet maps (IMG_0314 … IMG_0352) in
+ * public/textures. See public/textures/CREDITS.md.
  */
 import { Texture } from 'pixi.js';
-import { PROCEDURAL_ONLY, type PlanetArchetype } from './textures.js';
+import { PHOTOGRAPHIC_ARCHETYPES, PROCEDURAL_ONLY, type PlanetArchetype } from './textures.js';
 
 /**
- * Source equirectangular maps for archetypes that have photographic textures.
- * Procedural-only archetypes (alien variants) deliberately have no entry here.
+ * Source equirectangular maps for every archetype in the pool. Each archetype
+ * id matches the base filename of its texture in public/textures.
  */
-const TEXTURE_PATHS: Partial<Record<PlanetArchetype, string>> = {
-  terrestrial: 'textures/terrestrial.jpg',
-  gasGiant: 'textures/gasgiant.jpg',
-  icy: 'textures/icy.jpg',
-  molten: 'textures/molten.jpg',
-  alien: 'textures/alien.jpg',
-  poison: 'textures/poison.png',
-  amethyst: 'textures/amethyst.png',
-  ember: 'textures/ember.png',
-  oceanic: 'textures/oceanic.png',
-  verdant: 'textures/verdant.png',
-  desert: 'textures/desert.png',
-};
+const TEXTURE_PATHS: Record<PlanetArchetype, string> = Object.fromEntries(
+  PHOTOGRAPHIC_ARCHETYPES.map((id) => [id, `textures/${id}.png`]),
+) as Record<PlanetArchetype, string>;
 
 /** Resolve the URL respecting Vite's BASE_URL (set via vite.config). */
 const resolveAsset = (path: string): string => {

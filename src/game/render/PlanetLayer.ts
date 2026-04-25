@@ -89,10 +89,14 @@ const smoothstep = (t: number): number => {
 const EVOLVE_POP_START = 0.72;
 /**
  * Extra visual scale applied when every ring is completely full, before the
- * evolve pop. Lets the planet visibly swell as it "fills up" so the player
- * feels the growth build up before the explosive tier-up.
+ * evolve pop. The body and halo both scale by this so the world reads as
+ * physically swelling. We bias the curve so early absorbed units produce a
+ * visible bump (`Math.pow(progress, 0.55)`) — a 35 % cap with a linear curve
+ * was the prior tuning, which felt indistinguishable from the empty ring
+ * state until the player was almost done filling it.
  */
-const RING_GROWTH_MAX = 0.35;
+const RING_GROWTH_MAX = 0.7;
+const RING_GROWTH_CURVE = 0.55;
 
 /** Map the baked body's pixel diameter back down to the planet's world radius. */
 const computeBodyBaseScale = (radius: number): number => {
@@ -132,7 +136,14 @@ interface PlanetView {
   halo: Sprite;
   body: Sprite;
   ring: Graphics;
-  rings: Graphics; // capacity rings (per-planet ringCount)
+  /**
+   * Capacity rings split into two layers so the wispy strands look like they
+   * orbit the planet in 3D — strands whose depth puts them behind the body
+   * draw to `ringsBack` (rendered before the body), strands in front of the
+   * body draw to `ringsFront` (rendered after).
+   */
+  ringsBack: Graphics;
+  ringsFront: Graphics;
   atomPaths: Graphics; // faint orbit ellipses that the electrons follow
   shockwave: Graphics;
   /** Subtle strength bar beneath the planet — visual stand-in for garrison. */
@@ -172,6 +183,18 @@ interface PlanetView {
   productionPulses: Array<{ age: number; angle: number }>;
   /** Graphics layer for production pulses, drawn on top of the body. */
   productionFx: Graphics;
+  /**
+   * Tilt of each capacity ring's plane — the angle the ring makes with the
+   * screen's horizontal axis (radians). Picked once per planet so different
+   * worlds rotate at different inclinations rather than all looking identical.
+   */
+  capRingTilt: number[];
+  /** Yaw orientation of each ring's tilt axis around the planet (radians). */
+  capRingYaw: number[];
+  /** Current spin phase of each ring (advances each frame). */
+  capRingSpin: number[];
+  /** Per-ring rotation speed (rad/sec). Slight variance keeps stacked rings independent. */
+  capRingSpinSpeed: number[];
 }
 
 export class PlanetLayer extends Container {
@@ -213,7 +236,8 @@ export class PlanetLayer extends Container {
       body.anchor.set(0.5);
 
       const ring = new Graphics();
-      const rings = new Graphics();
+      const ringsBack = new Graphics();
+      const ringsFront = new Graphics();
       const atomPaths = new Graphics();
       const shockwave = new Graphics();
       const strengthBar = new Graphics();
@@ -221,11 +245,15 @@ export class PlanetLayer extends Container {
 
       const orbitRoot = new Container();
 
+      // Z-order — the wispy capacity rings split across the body so back-half
+      // strands occlude behind it and front-half strands cross over it,
+      // selling a 3D rotating gas ring rather than a flat overlay.
       container.addChild(
         halo,
         ring,
-        rings,
+        ringsBack,
         body,
+        ringsFront,
         productionFx,
         atomPaths,
         orbitRoot,
@@ -234,13 +262,25 @@ export class PlanetLayer extends Container {
       );
       this.addChild(container);
 
+      // Per-planet ring tilt + spin: deterministic from the planet id so a
+      // given world keeps its inclination across re-renders, but varied
+      // enough across the map that no two rings look identical.
+      const tiltSeed = planet.id * 37 + 11;
+      const tiltPick = (k: number): number =>
+        0.55 + seeded(tiltSeed + k * 13) * 0.7; // ~32°–72°
+      const yawPick = (k: number): number =>
+        seeded(tiltSeed + k * 19 + 5) * Math.PI;
+      const speedPick = (k: number): number =>
+        (0.18 + seeded(tiltSeed + k * 23 + 3) * 0.18) *
+        (Math.random() < 0.5 ? -1 : 1);
       this.views.push({
         planetId: planet.id,
         container,
         halo,
         body,
         ring,
-        rings,
+        ringsBack,
+        ringsFront,
         atomPaths,
         shockwave,
         strengthBar,
@@ -266,6 +306,13 @@ export class PlanetLayer extends Container {
         lastProductionAcc: 0,
         productionPulses: [],
         productionFx,
+        capRingTilt: [tiltPick(0), tiltPick(1)],
+        capRingYaw: [yawPick(0), yawPick(1)],
+        capRingSpin: [
+          seeded(tiltSeed + 7) * Math.PI * 2,
+          seeded(tiltSeed + 17) * Math.PI * 2,
+        ],
+        capRingSpinSpeed: [speedPick(0), speedPick(1)],
       });
     }
   }
@@ -335,7 +382,10 @@ export class PlanetLayer extends Container {
         for (let k = 0; k < v.ringCount; k++) s += v.ringProgress[k] ?? 0;
         ringFillNorm = Math.max(0, Math.min(1, s / v.ringCount));
       }
-      const ringGrowth = 1 + ringFillNorm * RING_GROWTH_MAX;
+      // Front-load the growth so the player sees the world swell from the
+      // first absorbed unit, not just at the very end of filling.
+      const ringGrowth =
+        1 + Math.pow(ringFillNorm, RING_GROWTH_CURVE) * RING_GROWTH_MAX;
 
       const pulse = 1 + p.capturePulse * 0.2 + p.evolvePulse * 0.15;
       v.body.scale.set(v.bodyBaseScale * v.displayScale * pulse * swirlWobble * ringGrowth);
@@ -352,10 +402,12 @@ export class PlanetLayer extends Container {
       // 1.0 it overflows into a pulsing "saturated" glow).
       this.drawStrengthBar(v, p.garrison, p.maxUnitCapacity, effRadius, pal, p.owner, dt);
 
-      // Capacity rings: many fine concentric sub-bands that fill with the
-      // owner's color as absorbed units accumulate. Sub-bands of varied width
-      // and density read as dust/ice debris rather than a solid hoop.
-      v.rings.clear();
+      // Capacity rings: wispy gas-cloud strands wrapping the planet, drawn
+      // across a back/front pair so the ring visibly orbits the body in 3D.
+      // Each ring's tilt + spin phase live on the planet view; we advance the
+      // spin every tick so strands flow continuously around the world.
+      v.ringsBack.clear();
+      v.ringsFront.clear();
       const RING_WIDTH = Math.max(4, v.baseRadius * 0.35);
       const RING_GAP = Math.max(3, v.baseRadius * 0.12);
       const RING_INSET = Math.max(6, v.baseRadius * 0.22);
@@ -375,8 +427,11 @@ export class PlanetLayer extends Container {
             RING_WIDTH / 2 +
             k * (RING_WIDTH + RING_GAP);
 
-          drawRealisticRing(
-            v.rings,
+          v.capRingSpin[k] += (v.capRingSpinSpeed[k] ?? 0.25) * dt;
+
+          drawWispyRing(
+            v.ringsBack,
+            v.ringsFront,
             rMid,
             RING_WIDTH,
             progress,
@@ -384,16 +439,10 @@ export class PlanetLayer extends Container {
             pal.glow,
             p.id * 13 + k,
             this.time,
+            v.capRingTilt[k] ?? 0.6,
+            v.capRingYaw[k] ?? 0,
+            v.capRingSpin[k] ?? 0,
           );
-
-          if (progress > 0.995) {
-            const pulseR = rMid + RING_WIDTH / 2 + 1 + Math.sin(this.time * 3 + k * 0.8) * 1.2;
-            v.rings.circle(0, 0, pulseR).stroke({
-              width: 1.5,
-              color: pal.glow,
-              alpha: 0.5,
-            });
-          }
         }
       }
 
@@ -815,15 +864,31 @@ const seeded = (seed: number): number => {
 };
 
 /**
- * Render a single capacity ring as a dense stack of fine sub-bands — Saturn-
- * style dust/ice rings rather than a solid hoop. The filled arc (0..progress)
- * lights each sub-band in the owner's color; the empty arc shows the same
- * bands at a dim neutral alpha so the band structure reads even at 0% fill.
+ * Wispy gas-cloud ring. Renders the ring as a series of brushy strands
+ * sweeping along a tilted ellipse around the planet, splitting each
+ * strand at its depth-zero crossing so the back half draws into `back`
+ * (occluded by the body) and the front half into `front` (covering the
+ * body). The combined effect is a 3D cloud rotating around the world
+ * rather than a flat halo.
  *
- * All randomness is seeded off a per-ring id so the pattern is stable.
+ *   - `tilt`     — out-of-plane angle of the ring (radians). 0 → seen
+ *                  edge-on (a pure horizontal stripe); π/2 → seen
+ *                  flat-on (a circle). Picked per-planet for variety.
+ *   - `yaw`      — rotation of the ring's tilt axis around the planet's
+ *                  z-axis, so different rings on the same map don't all
+ *                  share the same horizon line.
+ *   - `spin`     — current rotation phase along the ring; advanced each
+ *                  frame so the cloud visibly orbits.
+ *   - `progress` — 0..1 fill amount. Strands inside the filled angular
+ *                  arc bloom into the owner's tint; strands outside stay
+ *                  ghostly so the empty ring still reads as structure.
+ *
+ * All wisp positions, lengths and alphas are seeded per-ring so the
+ * pattern is stable across frames but unique per planet.
  */
-const drawRealisticRing = (
-  g: import('pixi.js').Graphics,
+const drawWispyRing = (
+  back: import('pixi.js').Graphics,
+  front: import('pixi.js').Graphics,
   rMid: number,
   ringWidth: number,
   progress: number,
@@ -831,80 +896,123 @@ const drawRealisticRing = (
   glowColor: number,
   seed: number,
   time: number,
+  tilt: number,
+  yaw: number,
+  spin: number,
 ): void => {
+  // Project a point on the ring (parameter angle θ around the body) into
+  // screen space using the ring's tilt (sin α scales the horizontal
+  // foreshortening) plus a yaw rotation that spins the whole ellipse.
+  const sinT = Math.sin(tilt);
+  const cosY = Math.cos(yaw);
+  const sinY = Math.sin(yaw);
+
+  const project = (theta: number, r: number): { x: number; y: number; depth: number } => {
+    // Plane-local point on the unit circle.
+    const lx = Math.cos(theta) * r;
+    const ly = Math.sin(theta) * r;
+    // Tilt the circle so the y-axis foreshortens by sin(tilt). When tilt is
+    // π/2 the ring becomes a circle (sin = 1); smaller tilts squish it.
+    const tx = lx;
+    const ty = ly * sinT;
+    const tz = ly * Math.cos(tilt); // depth perpendicular to the screen
+    // Yaw rotation: rotates the squished ellipse around the planet's z axis.
+    const rx = tx * cosY - ty * sinY;
+    const ry = tx * sinY + ty * cosY;
+    return { x: rx, y: ry, depth: tz };
+  };
+
   const innerR = rMid - ringWidth / 2;
   const outerR = rMid + ringWidth / 2;
   const sweep = Math.PI * 2 * progress;
-  const start = -Math.PI / 2;
+  const fillStart = -Math.PI / 2;
 
-  // Faint wide dust halo behind the structured bands — gives the whole ring
-  // a soft, hazy body.
-  g.circle(0, 0, rMid).stroke({ width: ringWidth + 2, color: ringColor, alpha: 0.05 });
+  const isFilled = (theta: number): boolean => {
+    if (progress >= 0.999) return true;
+    let d = ((theta - fillStart) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2);
+    return d <= sweep;
+  };
 
-  // Pre-compute sub-band layout. 9 bands with jittered positions + widths.
-  const subCount = 9;
-  const bands: Array<{ r: number; w: number; a: number; glow: boolean }> = [];
-  for (let i = 0; i < subCount; i++) {
-    const t = (i + 0.5) / subCount;
-    // Slight variance in radial position (± up to 12% of its own cell width).
-    const cellH = ringWidth / subCount;
-    const jitter = (seeded(seed + i) - 0.5) * cellH * 0.6;
-    const r = innerR + t * ringWidth + jitter;
-    // Width varies — most bands thin, a couple wide — mimicking real dust density.
-    const wRand = seeded(seed + i * 7 + 3);
-    const w = wRand < 0.18
-      ? cellH * (1.4 + seeded(seed + i * 11) * 0.5) // occasional thick band
-      : cellH * (0.35 + seeded(seed + i * 13) * 0.55); // typical thin strand
-    const aRand = seeded(seed + i * 17);
-    // Base opacity skews middle-heavy so edges fade out naturally.
-    const edgeFade = 1 - Math.pow(Math.abs(t - 0.5) * 2, 1.8);
-    const a = 0.18 + aRand * 0.28 * edgeFade;
-    const glow = wRand < 0.12; // rare bright "Cassini-adjacent" band
-    bands.push({ r, w, a, glow });
+  // A faint dust haze along the entire ellipse — gives the strands a
+  // hazy backdrop without hard edges.
+  const HAZE_SAMPLES = 56;
+  for (let i = 0; i < HAZE_SAMPLES; i++) {
+    const theta = (i / HAZE_SAMPLES) * Math.PI * 2;
+    const a = theta + spin;
+    const inFill = isFilled(a);
+    const p = project(a, rMid);
+    const target = p.depth >= 0 ? front : back;
+    const tone = inFill ? glowColor : ringColor;
+    const alpha = (inFill ? 0.22 : 0.07) * (0.7 + 0.3 * Math.sin(time + seed + theta * 2));
+    target
+      .circle(p.x, p.y, ringWidth * 0.45)
+      .fill({ color: tone, alpha });
   }
 
-  // Dim empty rails at the exact inner/outer extents — keeps the ring
-  // silhouette crisp even when every band is low-alpha.
-  g.circle(0, 0, innerR).stroke({ width: 0.8, color: ringColor, alpha: 0.35 });
-  g.circle(0, 0, outerR).stroke({ width: 0.8, color: ringColor, alpha: 0.35 });
-
-  // Empty arc: bands in a muted neutral tone so the ring reads as structure
-  // even before the player has fed it anything.
-  if (progress < 0.999) {
-    const emptyStart = start + sweep;
-    const emptyEnd = start + Math.PI * 2;
-    for (const b of bands) {
-      g.arc(0, 0, b.r, emptyStart, emptyEnd).stroke({
-        width: b.w,
-        color: ringColor,
-        alpha: b.a * 0.45,
-      });
+  // Brushy strands. Each strand is a curving sweep of overlapping soft
+  // dabs at varied radial offsets — that's what gives the ring its
+  // watercolor-on-paper feel rather than reading as a band.
+  const STRAND_COUNT = 9;
+  for (let s = 0; s < STRAND_COUNT; s++) {
+    const sSeed = seed * 31 + s * 11 + 7;
+    const baseTheta = (s / STRAND_COUNT) * Math.PI * 2 + (seeded(sSeed) - 0.5) * 0.45;
+    const length = 0.85 + seeded(sSeed * 7) * 1.7; // 0.85..2.55 rad
+    const radialBias = (seeded(sSeed * 11) - 0.5) * ringWidth * 0.55;
+    const tightness = 0.6 + seeded(sSeed * 13) * 0.7; // 0.6..1.3
+    const strandAlpha = 0.32 + seeded(sSeed * 17) * 0.28;
+    const strandWidth = ringWidth * (0.18 + seeded(sSeed * 19) * 0.18);
+    const strandJitter = (seeded(sSeed * 23) - 0.5) * 0.15; // small phase drift
+    const samples = 22;
+    for (let i = 0; i <= samples; i++) {
+      const t = i / samples;
+      // Strand path: an arc with a slow radial swirl so the trail doesn't
+      // sit flush against rMid.
+      const localTheta = baseTheta + length * t;
+      const a = localTheta + spin + strandJitter * Math.sin(time * 0.4 + sSeed);
+      // Radial drift along the strand: sweeps inner→outer→inner so each
+      // brushstroke crosses the band rather than lying on top of it.
+      const sweepBend = Math.sin(t * Math.PI) * tightness * (ringWidth * 0.32);
+      const r = rMid + radialBias + sweepBend;
+      const p = project(a, r);
+      const target = p.depth >= 0 ? front : back;
+      // Taper alpha at the ends so each strand fades into the ether.
+      const taper = Math.pow(Math.sin(t * Math.PI), 0.7);
+      const inFill = isFilled(a);
+      const depthShade = 0.65 + 0.35 * (p.depth / rMid + 0.5);
+      const colour = inFill ? (i % 4 === 0 ? glowColor : ringColor) : ringColor;
+      const dabAlpha =
+        strandAlpha *
+        taper *
+        depthShade *
+        (inFill ? 1 : 0.45) *
+        (0.85 + 0.15 * Math.sin(time * 1.4 + sSeed + i * 0.6));
+      const dabR = strandWidth * (0.85 + 0.4 * taper);
+      target.circle(p.x, p.y, dabR).fill({ color: colour, alpha: dabAlpha });
     }
   }
 
-  // Filled arc: same band layout, owner-tinted and brighter. A subtle outer
-  // glow arc underneath sells the emissive look.
-  if (progress > 0.001) {
-    const filledEnd = start + sweep;
-    g.arc(0, 0, rMid, start, filledEnd).stroke({
-      width: ringWidth + 4,
-      color: glowColor,
-      alpha: 0.22,
-    });
-    for (const b of bands) {
-      g.arc(0, 0, b.r, start, filledEnd).stroke({
-        width: b.w,
-        color: b.glow ? glowColor : ringColor,
-        alpha: Math.min(1, b.a * 2.6),
-      });
+  // Glowing leading edge along the filled arc so progress reads at a glance
+  // even when the strands themselves are diffuse. Drawn as a series of
+  // bright beads along the ellipse, depth-aware like the strands above.
+  if (progress > 0.01) {
+    const beadCount = Math.max(8, Math.floor(34 * progress));
+    const rimPulse = 0.65 + 0.25 * Math.sin(time * 2.2 + seed * 0.7);
+    for (let i = 0; i <= beadCount; i++) {
+      const t = i / beadCount;
+      const a = fillStart + sweep * t + spin;
+      const p = project(a, rMid);
+      const target = p.depth >= 0 ? front : back;
+      target
+        .circle(p.x, p.y, Math.max(1.2, ringWidth * 0.09))
+        .fill({ color: 0xffffff, alpha: 0.55 * rimPulse * progress });
+      target
+        .circle(p.x, p.y, Math.max(2.4, ringWidth * 0.18))
+        .fill({ color: glowColor, alpha: 0.22 * progress });
     }
-    // A fine bright "rim" along the middle of the filled arc reads as the
-    // leading edge of the accumulated matter.
-    const rimPulse = 0.55 + 0.2 * Math.sin(time * 2.6 + seed * 0.5);
-    g.arc(0, 0, rMid, start, filledEnd).stroke({
-      width: Math.max(1, ringWidth * 0.12),
-      color: 0xffffff,
-      alpha: 0.45 * progress * rimPulse,
-    });
   }
+
+  // Suppress unused-locals — kept around in case a follow-up wants to draw
+  // crisp inner/outer rails again.
+  void innerR;
+  void outerR;
 };

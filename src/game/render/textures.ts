@@ -77,14 +77,29 @@ export const makeShipGlowTexture = (app: Application): Texture => {
 export type PlanetArchetype = string;
 
 /**
- * The full pool of available planet textures: IMG_0314 … IMG_0352 (39 maps).
- * Adding a new map means dropping the file in public/textures and extending
- * this list — the baker keys off the id directly.
+ * Source files in public/textures that already include painted-in rings or
+ * comet-trail decorations. Excluded from the assignment pool so the new
+ * runtime ring renderer never has to fight a pre-baked ring on the body.
+ *   - IMG_0320: Saturn-style tan rings through the body.
+ *   - IMG_0327: cyan swirl/aura that spirals around the body.
+ *   - IMG_0344: a dark trailing tendril hanging off the planet.
+ */
+const RING_PAINTED_TEXTURES: ReadonlySet<PlanetArchetype> = new Set([
+  'IMG_0320',
+  'IMG_0327',
+  'IMG_0344',
+]);
+
+/**
+ * The full pool of available planet textures: IMG_0314 … IMG_0352 minus the
+ * ones whose source artwork already contains rings or trails. Adding a new
+ * map means dropping the file in public/textures and extending this list —
+ * the baker keys off the id directly.
  */
 export const PHOTOGRAPHIC_ARCHETYPES: readonly PlanetArchetype[] = Array.from(
   { length: 39 },
   (_, i) => `IMG_${String(314 + i).padStart(4, '0')}`,
-);
+).filter((id) => !RING_PAINTED_TEXTURES.has(id));
 
 /**
  * Reserved for archetypes that should stay procedural instead of using a

@@ -1,12 +1,11 @@
 /**
- * Loads equirectangular planet maps and bakes them into lit, spherical
- * sprites on the CPU. The bake step samples the 2:1 source map for each
- * pixel of the output disc, applies Lambertian shading and a rim highlight,
- * and writes the result to a canvas → Pixi Texture. We can't easily spin a
- * 3D sphere in Pixi 8 without a custom shader, so this offline projection
- * gives us a photographic read without the runtime cost of a shader.
+ * Loads pre-rendered planet sticker PNGs (1:1 illustrations of a planet
+ * centered on a transparent canvas, with a soft drop shadow below) and
+ * scales them into the disc size the renderer wants. The artwork is already
+ * shaded and outlined, so we deliberately skip any sphere projection or
+ * Lambertian lighting — adding either would clash with the cartoon style.
  *
- * Texture set: 39 numbered planet maps (IMG_0314 … IMG_0352) in
+ * Texture set: 39 numbered planet stickers (IMG_0314 … IMG_0352) in
  * public/textures. See public/textures/CREDITS.md.
  */
 import { Texture } from 'pixi.js';
@@ -27,10 +26,17 @@ const resolveAsset = (path: string): string => {
   return (base.endsWith('/') ? base : base + '/') + path;
 };
 
+/**
+ * A loaded source — the original sticker plus the tight bounding box of the
+ * planet artwork. The bbox is computed from the alpha channel so we can
+ * crop out the surrounding transparent margin and drop shadow when scaling
+ * the planet into the disc.
+ */
 interface SourceMap {
-  data: Uint8ClampedArray;
-  width: number;
-  height: number;
+  img: HTMLImageElement;
+  bx: number;
+  by: number;
+  bsize: number;
 }
 
 const sources = new Map<PlanetArchetype, SourceMap>();
@@ -45,18 +51,8 @@ export const loadPlanetAssets = (): Promise<void> => {
     await Promise.all(
       entries.map(async ([arch, path]) => {
         const img = await loadImage(resolveAsset(path));
-        const canvas = document.createElement('canvas');
-        canvas.width = img.naturalWidth;
-        canvas.height = img.naturalHeight;
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
-        if (!ctx) throw new Error('2D context unavailable');
-        ctx.drawImage(img, 0, 0);
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        sources.set(arch, {
-          data: imageData.data,
-          width: canvas.width,
-          height: canvas.height,
-        });
+        const bounds = computePlanetBounds(img);
+        sources.set(arch, { img, ...bounds });
       }),
     );
     bakedSourceCount = baked;
@@ -74,6 +70,54 @@ const loadImage = (src: string): Promise<HTMLImageElement> =>
     img.src = src;
   });
 
+/**
+ * Find the planet's tight square bounding box inside the sticker. The planet
+ * body and outline are fully opaque while the drop shadow is faint, so an
+ * alpha threshold of ~200 cleanly separates them. We then square the bbox
+ * around its center so the disc baker draws the planet without distortion.
+ */
+const computePlanetBounds = (img: HTMLImageElement): { bx: number; by: number; bsize: number } => {
+  const c = document.createElement('canvas');
+  c.width = img.naturalWidth;
+  c.height = img.naturalHeight;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  if (!ctx) throw new Error('2D context unavailable');
+  ctx.drawImage(img, 0, 0);
+  const data = ctx.getImageData(0, 0, c.width, c.height).data;
+  let minX = c.width;
+  let minY = c.height;
+  let maxX = -1;
+  let maxY = -1;
+  const ALPHA_THRESHOLD = 200;
+  for (let y = 0; y < c.height; y++) {
+    for (let x = 0; x < c.width; x++) {
+      if (data[(y * c.width + x) * 4 + 3] >= ALPHA_THRESHOLD) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (maxX < 0) {
+    // No opaque pixels — fall back to the whole image.
+    return { bx: 0, by: 0, bsize: Math.min(c.width, c.height) };
+  }
+  const w = maxX - minX + 1;
+  const h = maxY - minY + 1;
+  const side = Math.max(w, h);
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
+  let bx = Math.round(cx - side / 2);
+  let by = Math.round(cy - side / 2);
+  if (bx < 0) bx = 0;
+  if (by < 0) by = 0;
+  let bsize = side;
+  if (bx + bsize > c.width) bsize = c.width - bx;
+  if (by + bsize > c.height) bsize = c.height - by;
+  return { bx, by, bsize };
+};
+
 /** True once every photographic archetype's source bitmap has been sampled. */
 export const planetAssetsReady = (): boolean =>
   bakedSourceCount > 0 && sources.size === bakedSourceCount;
@@ -83,16 +127,18 @@ export const hasBakedSource = (archetype: PlanetArchetype): boolean =>
   !PROCEDURAL_ONLY.has(archetype) && sources.has(archetype);
 
 /**
- * Bake a lit, sphere-projected disc for the given archetype. Seed picks a
- * stable rotation so each planet shows a different face of the same map.
+ * Render the archetype's sticker into a square canvas of the requested
+ * diameter, scaled so the planet artwork fills the canvas edge-to-edge. The
+ * `seed` argument is accepted for API compatibility with the previous baker
+ * but is unused — these illustrations are fixed-pose, no per-planet rotation.
  */
 export const bakePlanetSphere = (
   archetype: PlanetArchetype,
-  seed: number,
+  _seed: number,
   diameter: number,
 ): Texture => {
   const size = Math.max(32, Math.round(diameter));
-  const cacheKey = `${archetype}:${size}:${seed}`;
+  const cacheKey = `${archetype}:${size}`;
   const hit = bakedCache.get(cacheKey);
   if (hit) return hit;
 
@@ -104,125 +150,11 @@ export const bakePlanetSphere = (
   canvas.height = size;
   const ctx = canvas.getContext('2d');
   if (!ctx) throw new Error('2D context unavailable');
-  const out = ctx.createImageData(size, size);
-  projectSphere(out, src, seed);
-  ctx.putImageData(out, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(src.img, src.bx, src.by, src.bsize, src.bsize, 0, 0, size, size);
 
   const tex = Texture.from(canvas);
   bakedCache.set(cacheKey, tex);
   return tex;
-};
-
-/** Project an equirectangular map onto a lit disc, writing into ImageData. */
-const projectSphere = (out: ImageData, src: SourceMap, seed: number): void => {
-  const size = out.width;
-  const r = size / 2;
-  const rng = mulberry32(seed * 1001 + 17);
-  // Per-planet longitude offset so identical archetypes show different faces.
-  const lon0 = rng() * Math.PI * 2;
-  // Small latitude tilt so some planets look tilted.
-  const tilt = (rng() - 0.5) * 0.3;
-  const cosT = Math.cos(tilt);
-  const sinT = Math.sin(tilt);
-
-  // Light direction — from upper-left front quadrant.
-  const Lx = -0.4;
-  const Ly = -0.45;
-  const Lz = 0.8;
-  const Llen = Math.hypot(Lx, Ly, Lz);
-  const lx = Lx / Llen;
-  const ly = Ly / Llen;
-  const lz = Lz / Llen;
-
-  const sw = src.width;
-  const sh = src.height;
-  const sd = src.data;
-
-  const AA_EDGE = 0.985 * 0.985;
-  const DISC = 1.0;
-
-  for (let py = 0; py < size; py++) {
-    const ny = (py - r + 0.5) / r;
-    for (let px = 0; px < size; px++) {
-      const nx = (px - r + 0.5) / r;
-      const d2 = nx * nx + ny * ny;
-      const oi = (py * size + px) * 4;
-      if (d2 > DISC) {
-        out.data[oi + 3] = 0;
-        continue;
-      }
-      const nz = Math.sqrt(Math.max(0, 1 - d2));
-
-      // Apply tilt around X axis: (y, z) rotates.
-      const ty = ny * cosT - nz * sinT;
-      const tz = ny * sinT + nz * cosT;
-
-      // Rotate around Y axis for longitude offset.
-      const cL = Math.cos(lon0);
-      const sL = Math.sin(lon0);
-      const rx = nx * cL + tz * sL;
-      const rz = -nx * sL + tz * cL;
-
-      // Equirectangular sampling.
-      const lon = Math.atan2(rx, rz);
-      const latClamp = Math.max(-1, Math.min(1, ty));
-      const lat = Math.asin(latClamp);
-      const u = (lon + Math.PI) / (2 * Math.PI);
-      const v = 1 - (lat + Math.PI / 2) / Math.PI;
-      let sx = Math.floor(u * sw);
-      let sy = Math.floor(v * sh);
-      if (sx < 0) sx = 0;
-      else if (sx >= sw) sx = sw - 1;
-      if (sy < 0) sy = 0;
-      else if (sy >= sh) sy = sh - 1;
-      const si = (sy * sw + sx) * 4;
-      let r8 = sd[si];
-      let g8 = sd[si + 1];
-      let b8 = sd[si + 2];
-
-      // Lambertian lighting on the sphere normal (nx, ny, nz) — use the
-      // pre-tilt normal so shading matches what we see, not the tilted map.
-      const lambert = Math.max(0, nx * lx + ny * ly + nz * lz);
-      const ambient = 0.22;
-      const bright = ambient + (1 - ambient) * lambert;
-      r8 = Math.min(255, r8 * bright);
-      g8 = Math.min(255, g8 * bright);
-      b8 = Math.min(255, b8 * bright);
-
-      // Specular bump on the sunward pole.
-      const spec = Math.pow(lambert, 24) * 180;
-      r8 = Math.min(255, r8 + spec);
-      g8 = Math.min(255, g8 + spec);
-      b8 = Math.min(255, b8 + spec);
-
-      // Cool rim toward the limb so the silhouette reads as a sphere.
-      const rim = Math.pow(1 - nz, 3);
-      r8 = Math.min(255, r8 + rim * 14);
-      g8 = Math.min(255, g8 + rim * 22);
-      b8 = Math.min(255, b8 + rim * 38);
-
-      // Smooth the outer 1–2 px for antialiasing.
-      let alpha = 255;
-      if (d2 > AA_EDGE) {
-        const t = 1 - (d2 - AA_EDGE) / (DISC - AA_EDGE);
-        alpha = Math.max(0, Math.min(255, Math.floor(255 * t)));
-      }
-
-      out.data[oi] = r8;
-      out.data[oi + 1] = g8;
-      out.data[oi + 2] = b8;
-      out.data[oi + 3] = alpha;
-    }
-  }
-};
-
-const mulberry32 = (seed: number) => {
-  let a = seed | 0;
-  return () => {
-    a = (a + 0x6d2b79f5) | 0;
-    let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
 };

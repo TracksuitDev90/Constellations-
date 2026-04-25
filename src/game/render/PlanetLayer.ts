@@ -280,6 +280,14 @@ export class PlanetLayer extends Container {
       const p = this.world.planets[i];
       const v = this.views[i];
 
+      // Track the planet's live position so drifting hazard planets visibly
+      // wander. For static planets this is a cheap no-op write (same coords
+      // as last frame). The planet container holds halo, body, rings, and
+      // orbiters as children, so updating the container origin moves them
+      // all together without re-laying anything out.
+      v.container.x = p.pos.x;
+      v.container.y = p.pos.y;
+
       // Evolution: when the planet's size changes, rebake the body texture at
       // the new radius, reset ring state, and pop the visual scale so the
       // planet visibly "explodes" into its larger form.

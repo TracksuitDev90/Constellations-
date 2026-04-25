@@ -1,4 +1,5 @@
 import { dist, vec, type Vec2 } from '../../util/math.js';
+import { NeutralPool } from './Neutral.js';
 import {
   BASE_MAX_HEALTH,
   BASE_PRODUCTION,
@@ -35,6 +36,40 @@ export interface MapSpec {
     ringCount?: number;
   }>;
   edges: Array<[number, number]>;
+  /**
+   * At most one entry today. Each match rolls a single hazard (drifting
+   * planet, asteroid belt, or neutral green swarm) so every level feels
+   * different without overwhelming the strategic read.
+   */
+  hazards?: HazardSpec[];
+}
+
+/**
+ * One per-level "world hazard" — picked at map generation time. Discriminated
+ * union so each variant carries only the data it needs.
+ *
+ *   - driftingPlanet: a single planet drifts in a straight line at vx/vy and
+ *     bounces off the map bounds. Edges and pathfinding still reference its
+ *     id, so streams keep flowing — the world just won't sit still.
+ *   - asteroidField: a circular zone that multiplies transit-ship speed by
+ *     `slowdown` (e.g. 0.35). Doesn't kill ships, just delays them — useful
+ *     for forcing detours or surviving longer through a chokepoint.
+ *   - neutralSwarm: a pack of green hostiles spawned around `pos`. They
+ *     wander a `patrolRadius` and shoot down the nearest in-range ship of
+ *     ANY owner, but never capture planets. Their own units die when killed
+ *     in a 1:1 exchange; they respawn slowly so the swarm thins under
+ *     sustained attack.
+ */
+export type HazardSpec =
+  | { type: 'driftingPlanet'; planetId: number; vx: number; vy: number }
+  | { type: 'asteroidField'; pos: Vec2; radius: number; slowdown: number; seed: number }
+  | { type: 'neutralSwarm'; pos: Vec2; count: number; patrolRadius: number; seed: number };
+
+export interface AsteroidField {
+  pos: Vec2;
+  radius: number;
+  slowdown: number;
+  seed: number;
 }
 
 export interface WorldEvents {
@@ -50,6 +85,8 @@ export interface WorldEvents {
   onShipArrive?: (planetId: number, owner: number, friendly: boolean) => void;
   /** Fired when a ship is consumed by absorb at its parent planet's center. */
   onShipAbsorbed?: (planetId: number, owner: number) => void;
+  /** Fired when a neutral hostile is destroyed. Carries world-space death point. */
+  onNeutralDeath?: (x: number, y: number) => void;
   /**
    * Fired every time an absorbed unit ticks up a ring's fill counter. Distinct
    * from `onRingFilled` which only fires on the final unit that completes the ring.
@@ -122,6 +159,13 @@ export class World {
   neighbors: Map<number, number[]>;
   streams: ShipStream[] = [];
   ships: ShipPool = new ShipPool();
+  /**
+   * Static hazard zones (asteroid belts). Currently 0 or 1 per match;
+   * `stepTransit` consults this list to apply a per-zone speed multiplier.
+   */
+  asteroidFields: AsteroidField[] = [];
+  /** Pool of green hostile units spawned by the `neutralSwarm` hazard. */
+  neutrals: NeutralPool = new NeutralPool();
   time = 0;
   width: number;
   height: number;
@@ -129,6 +173,17 @@ export class World {
   winner: number | null = null;
   private events: WorldEvents;
   private playersSeen = new Set<number>();
+  /**
+   * Anchor points for any spawned neutral swarms. Neutrals patrol around
+   * these anchors and respawn slowly if killed below the swarm's nominal
+   * size, keeping the hazard a persistent threat rather than a one-shot.
+   */
+  private neutralAnchors: Array<{
+    pos: Vec2;
+    patrolRadius: number;
+    targetCount: number;
+    respawnAcc: number;
+  }> = [];
 
   constructor(map: MapSpec, players: Player[], events: WorldEvents = {}) {
     this.players = players;
@@ -160,6 +215,8 @@ export class World {
         absorbFlushAcc: 0,
         health: maxHealth,
         maxHealth,
+        vx: 0,
+        vy: 0,
       };
     });
     this.edges = new Set();
@@ -169,6 +226,35 @@ export class World {
       this.edges.add(edgeKey(a, b));
       this.neighbors.get(a)!.push(b);
       this.neighbors.get(b)!.push(a);
+    }
+    // Apply hazards from the spec. Discriminated union — only the variant
+    // matched by `type` carries the relevant data.
+    for (const h of map.hazards ?? []) {
+      if (h.type === 'driftingPlanet') {
+        const p = this.planets[h.planetId];
+        if (p) {
+          p.vx = h.vx;
+          p.vy = h.vy;
+        }
+      } else if (h.type === 'asteroidField') {
+        this.asteroidFields.push({
+          pos: { ...h.pos },
+          radius: h.radius,
+          slowdown: h.slowdown,
+          seed: h.seed,
+        });
+      } else if (h.type === 'neutralSwarm') {
+        const anchorIdx = this.neutralAnchors.length;
+        this.neutralAnchors.push({
+          pos: { ...h.pos },
+          patrolRadius: h.patrolRadius,
+          targetCount: h.count,
+          respawnAcc: 0,
+        });
+        for (let i = 0; i < h.count; i++) {
+          this.spawnNeutralAt(anchorIdx);
+        }
+      }
     }
   }
 
@@ -404,6 +490,34 @@ export class World {
     if (this.gameOver) return;
     this.time += dt;
 
+    // Drift — almost always a no-op (vx == vy == 0). When a planet has the
+    // `driftingPlanet` hazard, this advances its position and bounces off
+    // the world bounds so it stays in play. Bounds are inset by the planet's
+    // radius so it never half-clips the edge.
+    for (const p of this.planets) {
+      if (p.vx === 0 && p.vy === 0) continue;
+      p.pos.x += p.vx * dt;
+      p.pos.y += p.vy * dt;
+      const minX = p.radius;
+      const minY = p.radius;
+      const maxX = this.width - p.radius;
+      const maxY = this.height - p.radius;
+      if (p.pos.x < minX) {
+        p.pos.x = minX;
+        p.vx = Math.abs(p.vx);
+      } else if (p.pos.x > maxX) {
+        p.pos.x = maxX;
+        p.vx = -Math.abs(p.vx);
+      }
+      if (p.pos.y < minY) {
+        p.pos.y = minY;
+        p.vy = Math.abs(p.vy);
+      } else if (p.pos.y > maxY) {
+        p.pos.y = maxY;
+        p.vy = -Math.abs(p.vy);
+      }
+    }
+
     // Production. Bigger planets produce meaningfully faster; growth comes
     // from evolving the planet via ring fill (Auralux: Constellations' "explode
     // into a bigger size" mechanic), not from a ring-count multiplier.
@@ -491,7 +605,121 @@ export class World {
     // Mid-flight combat: enemy streams that cross destroy each other 1:1.
     this.stepShipCombat();
 
+    // Neutral hostile pass — wandering green units that attack any ship in
+    // range regardless of owner, and never capture planets.
+    this.stepNeutrals(dt);
+
     this.checkGameOver();
+  }
+
+  /**
+   * Spawn one neutral hostile somewhere in the patrol zone of `anchorIdx`.
+   * Spawn position is jittered inside the patrol radius so the swarm reads
+   * as a loose cloud rather than a perfect circle.
+   */
+  private spawnNeutralAt(anchorIdx: number): void {
+    const anchor = this.neutralAnchors[anchorIdx];
+    if (!anchor) return;
+    const a = Math.random() * Math.PI * 2;
+    const r = anchor.patrolRadius * Math.sqrt(Math.random());
+    this.neutrals.spawn(
+      anchor.pos.x + Math.cos(a) * r,
+      anchor.pos.y + Math.sin(a) * r,
+      Math.random() * Math.PI * 2,
+      anchorIdx,
+    );
+  }
+
+  /**
+   * Per-tick neutral hostiles update. Every active neutral wanders inside its
+   * anchor's patrol radius, scans for the nearest in-range ship of ANY owner,
+   * and destroys it 1:1 (the neutral dies in the exchange). Slow respawn
+   * behind the scenes keeps the swarm a persistent threat without flooding
+   * the map.
+   */
+  private stepNeutrals(dt: number): void {
+    if (this.neutralAnchors.length === 0 && this.neutrals.activeCount() === 0) return;
+    const NEUTRAL_SPEED = 22;
+    const ATTACK_RADIUS = 22;
+    const ATTACK_R2 = ATTACK_RADIUS * ATTACK_RADIUS;
+    const RESPAWN_INTERVAL = 6.5;
+
+    const all = this.neutrals.all;
+    const ships = this.ships.all;
+
+    for (let i = 0; i < all.length; i++) {
+      const n = all[i];
+      if (!n.active) continue;
+      const anchor = this.neutralAnchors[n.anchorIdx];
+      if (!anchor) {
+        this.neutrals.kill(i);
+        continue;
+      }
+
+      // Pull gently toward the anchor when wandering past the patrol band so
+      // the swarm holds territory rather than dispersing across the map.
+      const adx = anchor.pos.x - n.x;
+      const ady = anchor.pos.y - n.y;
+      const ad = Math.hypot(adx, ady);
+      const outside = ad - anchor.patrolRadius;
+      const pullDir = ad > 0 ? { x: adx / ad, y: ady / ad } : { x: 0, y: 0 };
+      // Slow heading drift — a sine wander around the current heading.
+      n.heading += Math.sin(this.time * 0.7 + n.phase) * dt * 0.6;
+      let vx = Math.cos(n.heading) * NEUTRAL_SPEED;
+      let vy = Math.sin(n.heading) * NEUTRAL_SPEED;
+      if (outside > 0) {
+        // Bias toward the anchor proportional to how far out we drifted.
+        const k = Math.min(1, outside / anchor.patrolRadius);
+        vx = vx * (1 - k) + pullDir.x * NEUTRAL_SPEED * k;
+        vy = vy * (1 - k) + pullDir.y * NEUTRAL_SPEED * k;
+        // Lock the heading back onto the new direction so it stays coherent.
+        n.heading = Math.atan2(vy, vx);
+      }
+      n.x += vx * dt;
+      n.y += vy * dt;
+
+      // Scan for the nearest live combatant ship inside attack radius. Treat
+      // every owner as hostile — the green swarm is everyone's problem.
+      let bestIdx = -1;
+      let bestD2 = ATTACK_R2;
+      for (let j = 0; j < ships.length; j++) {
+        const s = ships[j];
+        if (!s.active) continue;
+        if (s.state === 'absorbing') continue; // can't intercept a ship inside its own planet.
+        const dx = s.x - n.x;
+        const dy = s.y - n.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < bestD2) {
+          bestD2 = d2;
+          bestIdx = j;
+        }
+      }
+      if (bestIdx >= 0) {
+        const victim = ships[bestIdx];
+        this.events.onShipDeath?.(victim.owner, victim.x, victim.y);
+        this.ships.kill(bestIdx);
+        // Mutual kill keeps the swarm beatable and rewards sustained pushes.
+        this.events.onNeutralDeath?.(n.x, n.y);
+        this.neutrals.kill(i);
+      }
+    }
+
+    // Slow respawn — top each anchor's swarm back up to its target count over
+    // time. RESPAWN_INTERVAL governs how often a single missing slot refills,
+    // so a heavily-thinned swarm takes meaningfully longer to recover.
+    for (let ai = 0; ai < this.neutralAnchors.length; ai++) {
+      const a = this.neutralAnchors[ai];
+      const live = this.neutrals.countAtAnchor(ai);
+      if (live >= a.targetCount) {
+        a.respawnAcc = 0;
+        continue;
+      }
+      a.respawnAcc += dt;
+      if (a.respawnAcc >= RESPAWN_INTERVAL) {
+        a.respawnAcc -= RESPAWN_INTERVAL;
+        this.spawnNeutralAt(ai);
+      }
+    }
   }
 
   /**
@@ -929,11 +1157,19 @@ export class World {
     ship.vx += (fx - ship.vx) * blend;
     ship.vy += (fy - ship.vy) * blend;
 
-    // Cap speed to the ship's nominal speed.
+    // Asteroid drag — if the ship is currently inside any field, scale its
+    // effective speed down so the player physically watches it crawl through
+    // the rocks. We apply the multiplier to the speed cap (so steering still
+    // works normally) and to the per-frame translation (so a ship that would
+    // have arrived in one frame waits longer).
+    const drag = this.asteroidDragAt(ship.x, ship.y);
+
+    // Cap speed to the ship's nominal speed (scaled by drag).
     const sp = Math.hypot(ship.vx, ship.vy);
-    if (sp > ship.speed) {
-      ship.vx = (ship.vx / sp) * ship.speed;
-      ship.vy = (ship.vy / sp) * ship.speed;
+    const effectiveSpeed = ship.speed * drag;
+    if (sp > effectiveSpeed) {
+      ship.vx = (ship.vx / sp) * effectiveSpeed;
+      ship.vy = (ship.vy / sp) * effectiveSpeed;
     }
 
     const step = Math.hypot(ship.vx, ship.vy) * dt;
@@ -944,6 +1180,23 @@ export class World {
       ship.x += ship.vx * dt;
       ship.y += ship.vy * dt;
     }
+  }
+
+  /**
+   * Effective speed multiplier for a ship at (x, y). Returns 1 when no
+   * asteroid field overlaps the position; the smallest field's slowdown
+   * otherwise (overlapping fields stack to the most punishing factor).
+   */
+  private asteroidDragAt(x: number, y: number): number {
+    let drag = 1;
+    for (const f of this.asteroidFields) {
+      const dx = x - f.pos.x;
+      const dy = y - f.pos.y;
+      if (dx * dx + dy * dy <= f.radius * f.radius && f.slowdown < drag) {
+        drag = f.slowdown;
+      }
+    }
+    return drag;
   }
 
   private beginHover(ship: Ship): void {

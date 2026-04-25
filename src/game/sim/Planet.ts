@@ -98,6 +98,15 @@ export interface Planet {
   /** HP for absorb-to-heal routing. */
   health: number;
   maxHealth: number;
+  /**
+   * Per-frame drift velocity in world units / second. Almost always 0; only
+   * non-zero on the planet picked by the per-match `driftingPlanet` hazard,
+   * which makes that one world physically wander across the map and bounce
+   * off the bounds. Pathfinding stays graph-based on `edges`, so the drift
+   * is purely a positional effect.
+   */
+  vx: number;
+  vy: number;
 }
 
 /** True when the planet has rings and every one is at capacity. */

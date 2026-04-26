@@ -1,14 +1,17 @@
-import { Application, Container, Graphics, Sprite, Texture } from 'pixi.js';
+import { Application, Container, Graphics, MeshRope, Point, type RopeGeometry, Sprite, Texture } from 'pixi.js';
 import { adjustColor, hueJitter, paletteFor, toward } from '../../util/color.js';
 import { RING_CAPACITY_FOR_SIZE, type PlanetType } from '../sim/Planet.js';
 import type { World } from '../sim/World.js';
 import {
   assignPlanetArchetypes,
   bakedBodyDiameter,
+  makeBrushStrokeTexture,
   makePlanetBodyTexture,
   makePlanetHaloTexture,
   makeShipGlowTexture,
   makeShipTexture,
+  makeSpikeTexture,
+  makeTendrilBodyTexture,
 } from './textures.js';
 import { planetAssetsReady } from './planetAssets.js';
 
@@ -130,6 +133,70 @@ interface Orbiter {
   birthAngle: number;
 }
 
+/** How many sample points each `MeshRope` uses along its arc. */
+const ROPE_SAMPLES = 36;
+/** Pool slack: max extra points needed for depth-zero boundary insertions. */
+const ROPE_POOL_SLACK = 6;
+
+/**
+ * One painterly brush stroke wrapping (part of) the ring. `back` and `front`
+ * are two `MeshRope` instances sharing the same brush texture but each
+ * receiving only the points whose depth puts them behind / in front of the
+ * planet body. The two ropes' point counts can vary every frame as spin
+ * advances, so each rope keeps a fixed-size point pool of `ROPE_SAMPLES + 2`
+ * (room for both depth-zero crossings) and an `activeBack` / `activeFront`
+ * count clamping how many of those points are currently in use.
+ */
+interface StrokeRope {
+  /** Visual role — drives which tint the updater applies each frame. */
+  kind: 'base' | 'accent' | 'body';
+  /** Local arc start angle (radians, before spin). */
+  startTheta: number;
+  /** Arc length in radians. */
+  length: number;
+  /** Radial offset of the rope's centre from `rMid`, in fractions of ringWidth. */
+  radialOffset: number;
+  /** Half-width of the rope, in fractions of ringWidth. */
+  halfWidth: number;
+  /** Whether to taper width to zero at the ends (false for closed loops). */
+  taperEnds: boolean;
+  back: MeshRope;
+  front: MeshRope;
+  /** Mutable point pools updated each frame in place. */
+  backPoints: Point[];
+  frontPoints: Point[];
+}
+
+/**
+ * One outward-pointing spike sprite for the spiky-tendril ring style. The
+ * sprite's anchor is at the base centre so it can be rotated to follow the
+ * outward normal at its root angle.
+ */
+interface SpikeStamp {
+  /** Local angle on the ring (radians, before spin). */
+  theta: number;
+  /** Multiplier of the planet's per-ring base spike length. */
+  lengthFactor: number;
+  /** Multiplier of the per-ring base spike width. */
+  widthFactor: number;
+  /** Whether this spike uses the accent tint (lighter glint). */
+  accent: boolean;
+  /** Rendered sprite — re-parented between back/front each frame. */
+  sprite: Sprite;
+}
+
+/**
+ * Per-ring-slot pool of textured ring geometry. Style-specific layout is
+ * picked once at planet init (the planet's `ringStyle[k]`); after that we
+ * just animate the existing pool. `body`, when present, is a closed-loop
+ * rope used as the spiky-tendril ring's solid backbone.
+ */
+interface RingPool {
+  strokes: StrokeRope[];
+  spikes: SpikeStamp[];
+  body?: StrokeRope;
+}
+
 interface PlanetView {
   planetId: number;
   container: Container;
@@ -137,13 +204,20 @@ interface PlanetView {
   body: Sprite;
   ring: Graphics;
   /**
-   * Capacity rings split into two layers so the wispy strands look like they
-   * orbit the planet in 3D — strands whose depth puts them behind the body
-   * draw to `ringsBack` (rendered before the body), strands in front of the
-   * body draw to `ringsFront` (rendered after).
+   * Capacity rings split into two layers so the textured brush strokes look
+   * like they orbit the planet in 3D — geometry whose depth puts it behind
+   * the body lives under `ringsBack` (rendered before the body), in-front
+   * geometry lives under `ringsFront` (rendered after). Each container holds
+   * `MeshRope` instances per stroke plus a `Graphics` overlay for the
+   * progress beads.
    */
-  ringsBack: Graphics;
-  ringsFront: Graphics;
+  ringsBack: Container;
+  ringsFront: Container;
+  /** Bead overlays drawn on top of the ropes inside each layer. */
+  ringBeadsBack: Graphics;
+  ringBeadsFront: Graphics;
+  /** Per-ring-slot stroke + spike pool, allocated lazily per ringStyle. */
+  ringPools: RingPool[];
   atomPaths: Graphics; // faint orbit ellipses that the electrons follow
   shockwave: Graphics;
   /** Subtle strength bar beneath the planet — visual stand-in for garrison. */
@@ -210,6 +284,9 @@ export class PlanetLayer extends Container {
   private selectedSources = new Set<number>();
   private shipTex: Texture;
   private shipGlowTex: Texture;
+  private brushTex: Texture;
+  private tendrilBodyTex: Texture;
+  private spikeTex: Texture;
   private time = 0;
 
   constructor(app: Application, world: World) {
@@ -218,6 +295,9 @@ export class PlanetLayer extends Container {
     this.world = world;
     this.shipTex = makeShipTexture(app);
     this.shipGlowTex = makeShipGlowTexture(app);
+    this.brushTex = makeBrushStrokeTexture(app);
+    this.tendrilBodyTex = makeTendrilBodyTexture(app);
+    this.spikeTex = makeSpikeTexture(app);
 
     // Assign every planet a distinct archetype from the pool before baking
     // any body textures, so no two worlds in the same match share a surface.
@@ -242,8 +322,12 @@ export class PlanetLayer extends Container {
       body.anchor.set(0.5);
 
       const ring = new Graphics();
-      const ringsBack = new Graphics();
-      const ringsFront = new Graphics();
+      const ringsBack = new Container();
+      const ringsFront = new Container();
+      const ringBeadsBack = new Graphics();
+      const ringBeadsFront = new Graphics();
+      ringsBack.addChild(ringBeadsBack);
+      ringsFront.addChild(ringBeadsFront);
       const atomPaths = new Graphics();
       const shockwave = new Graphics();
       const strengthBar = new Graphics();
@@ -251,9 +335,9 @@ export class PlanetLayer extends Container {
 
       const orbitRoot = new Container();
 
-      // Z-order — the wispy capacity rings split across the body so back-half
-      // strands occlude behind it and front-half strands cross over it,
-      // selling a 3D rotating gas ring rather than a flat overlay.
+      // Z-order — the textured capacity rings split across the body so the
+      // back-half geometry occludes behind it and the front-half crosses over
+      // it, selling a 3D rotating ring rather than a flat overlay.
       container.addChild(
         halo,
         ring,
@@ -281,6 +365,11 @@ export class PlanetLayer extends Container {
         (Math.random() < 0.5 ? -1 : 1);
       const stylePick = (k: number): 'brushstroke' | 'spiky' =>
         seeded(tiltSeed + k * 29 + 41) < 0.5 ? 'brushstroke' : 'spiky';
+      const ringStyles: Array<'brushstroke' | 'spiky'> = [stylePick(0), stylePick(1)];
+      const ringPools: RingPool[] = [
+        this.buildRingPool(ringStyles[0], planet.id * 13 + 0, ringsBack, ringsFront),
+        this.buildRingPool(ringStyles[1], planet.id * 13 + 1, ringsBack, ringsFront),
+      ];
       this.views.push({
         planetId: planet.id,
         container,
@@ -289,6 +378,9 @@ export class PlanetLayer extends Container {
         ring,
         ringsBack,
         ringsFront,
+        ringBeadsBack,
+        ringBeadsFront,
+        ringPools,
         atomPaths,
         shockwave,
         strengthBar,
@@ -321,7 +413,7 @@ export class PlanetLayer extends Container {
           seeded(tiltSeed + 17) * Math.PI * 2,
         ],
         capRingSpinSpeed: [speedPick(0), speedPick(1)],
-        ringStyle: [stylePick(0), stylePick(1)],
+        ringStyle: ringStyles,
       });
     }
   }
@@ -412,14 +504,22 @@ export class PlanetLayer extends Container {
       this.drawStrengthBar(v, p.garrison, p.maxUnitCapacity, effRadius, pal, p.owner, dt);
 
       // Capacity rings: wispy gas-cloud strands wrapping the planet, drawn
-      // across a back/front pair so the ring visibly orbits the body in 3D.
-      // Each ring's tilt + spin phase live on the planet view; we advance the
-      // spin every tick so strands flow continuously around the world.
-      v.ringsBack.clear();
-      v.ringsFront.clear();
+      // Capacity rings: textured brush strokes / dragon-spine tendrils
+      // wrapping the planet, split across a back/front layer pair so the
+      // ring visibly orbits the body in 3D. Each ring's tilt + spin phase
+      // live on the planet view; we advance the spin every tick so the
+      // ropes flow continuously around the world. The bead overlays are the
+      // only thing redrawn through Graphics — the ropes/spikes are textured
+      // sprite/mesh objects whose transforms we just update each frame.
+      v.ringBeadsBack.clear();
+      v.ringBeadsFront.clear();
       const RING_WIDTH = Math.max(4, v.baseRadius * 0.35);
       const RING_GAP = Math.max(3, v.baseRadius * 0.12);
       const RING_INSET = Math.max(6, v.baseRadius * 0.22);
+      // Hide every rope/spike by default; the active ring slots will reveal
+      // (and update) their own pool entries below.
+      for (let k = 0; k < v.ringPools.length; k++) hideRingPool(v.ringPools[k]);
+
       if (p.ringCount > 0) {
         const cap = RING_CAPACITY_FOR_SIZE[p.type];
         for (let k = 0; k < p.ringCount; k++) {
@@ -438,9 +538,10 @@ export class PlanetLayer extends Container {
 
           v.capRingSpin[k] += (v.capRingSpinSpeed[k] ?? 0.25) * dt;
 
-          // Two-tone colors per ring: a darker base + a lighter accent, both
-          // jittered per planet so two worlds owned by the same player feel
-          // individually distinct without losing their owner-color identity.
+          // Two-tone colours per ring: a darker base + a lighter accent,
+          // both jittered per planet so two worlds owned by the same player
+          // feel individually distinct without losing their owner-colour
+          // identity.
           const jitterSeed = p.id * 73 + k * 19;
           const baseColor = adjustColor(
             hueJitter(pal.ring, jitterSeed, 0.18),
@@ -451,24 +552,34 @@ export class PlanetLayer extends Container {
             0xffffff,
             0.4,
           );
-          const draw =
-            v.ringStyle[k] === 'spiky'
-              ? drawSpikyTendrilRing
-              : drawBrushstrokeRing;
-          draw(
+
+          updateRingPool(
+            v.ringPools[k],
             v.ringsBack,
             v.ringsFront,
             rMid,
             RING_WIDTH,
-            progress,
             baseColor,
             accentColor,
-            pal.glow,
-            p.id * 13 + k,
-            this.time,
             v.capRingTilt[k] ?? 0.6,
             v.capRingYaw[k] ?? 0,
             v.capRingSpin[k] ?? 0,
+          );
+
+          drawFillBeads(
+            v.ringBeadsBack,
+            v.ringBeadsFront,
+            rMid,
+            RING_WIDTH,
+            progress,
+            pal.glow,
+            p.id * 13 + k,
+            this.time,
+            v.capRingSpin[k] ?? 0,
+            Math.sin(v.capRingTilt[k] ?? 0.6),
+            Math.cos(v.capRingTilt[k] ?? 0.6),
+            Math.cos(v.capRingYaw[k] ?? 0),
+            Math.sin(v.capRingYaw[k] ?? 0),
           );
         }
       }
@@ -878,6 +989,114 @@ export class PlanetLayer extends Container {
     }
     v.orbiters.length = 0;
   }
+
+  /**
+   * Allocate the textured rope/spike pool for one ring slot. Style is fixed
+   * for the lifetime of the planet so we just create everything up-front and
+   * later toggle visibility based on whether the slot is active. The ropes
+   * start parented to `ringsFront`; each frame the updater re-parents each
+   * rope/spike to the correct (back/front) container based on its midpoint
+   * depth.
+   */
+  private buildRingPool(
+    style: 'brushstroke' | 'spiky',
+    seed: number,
+    ringsBack: Container,
+    ringsFront: Container,
+  ): RingPool {
+    const strokes: StrokeRope[] = [];
+    const spikes: SpikeStamp[] = [];
+    let body: StrokeRope | undefined;
+
+    const makeStroke = (
+      kind: 'base' | 'accent' | 'body',
+      texture: Texture,
+      startTheta: number,
+      length: number,
+      radialOffset: number,
+      halfWidth: number,
+      taperEnds: boolean,
+    ): StrokeRope => {
+      const backPoints: Point[] = [];
+      const frontPoints: Point[] = [];
+      for (let i = 0; i < ROPE_SAMPLES + ROPE_POOL_SLACK; i++) {
+        backPoints.push(new Point(0, 0));
+        frontPoints.push(new Point(0, 0));
+      }
+      const back = new MeshRope({ texture, points: backPoints });
+      const front = new MeshRope({ texture, points: frontPoints });
+      back.visible = false;
+      front.visible = false;
+      ringsBack.addChild(back);
+      ringsFront.addChild(front);
+      return {
+        kind,
+        startTheta,
+        length,
+        radialOffset,
+        halfWidth,
+        taperEnds,
+        back,
+        front,
+        backPoints,
+        frontPoints,
+      };
+    };
+
+    if (style === 'brushstroke') {
+      const BASE_STROKES = 2;
+      for (let s = 0; s < BASE_STROKES; s++) {
+        const sSeed = seed * 41 + s * 13 + 3;
+        const startTheta =
+          (s / BASE_STROKES) * Math.PI * 2 + (seeded(sSeed) - 0.5) * 0.6;
+        const length = 1.6 + seeded(sSeed * 7) * 0.8;
+        const halfWidth = 0.42 + seeded(sSeed * 11) * 0.18;
+        const radialOffset = (seeded(sSeed * 17) - 0.5) * 0.32;
+        strokes.push(
+          makeStroke('base', this.brushTex, startTheta, length, radialOffset, halfWidth, true),
+        );
+      }
+      const ACCENT_STROKES = 4;
+      for (let s = 0; s < ACCENT_STROKES; s++) {
+        const sSeed = seed * 53 + s * 17 + 11;
+        const startTheta =
+          (s / ACCENT_STROKES) * Math.PI * 2 + (seeded(sSeed) - 0.5) * 0.7;
+        const length = 0.7 + seeded(sSeed * 7) * 0.9;
+        const halfWidth = 0.26 + seeded(sSeed * 11) * 0.14;
+        const radialOffset = (seeded(sSeed * 17) - 0.5) * 0.44;
+        strokes.push(
+          makeStroke('accent', this.brushTex, startTheta, length, radialOffset, halfWidth, true),
+        );
+      }
+    } else {
+      // Spiky tendril: one solid body rope wrapping the full ellipse plus
+      // an array of triangular spike sprites along its outer edge.
+      body = makeStroke('body', this.tendrilBodyTex, 0, Math.PI * 2, 0, 0.22, false);
+      const SPIKE_COUNT = 56;
+      for (let i = 0; i < SPIKE_COUNT; i++) {
+        // Skip ~22% of slots so the silhouette reads as an irregular
+        // dragon-spine rather than a uniform comb.
+        if (seeded(seed * 23 + i * 7) < 0.22) continue;
+        const lengthFactor = 0.55 + seeded(seed * 31 + i * 11) * 0.7;
+        const widthFactor = 0.92 + seeded(seed * 37 + i * 13) * 0.32;
+        const accent = i % 3 === 0;
+        const sprite = new Sprite(this.spikeTex);
+        sprite.anchor.set(0.5, 1); // base centre — rotation pivots the tip
+        sprite.tint = 0xffffff;
+        sprite.visible = false;
+        ringsFront.addChild(sprite);
+        spikes.push({
+          theta: (i / SPIKE_COUNT) * Math.PI * 2,
+          lengthFactor,
+          widthFactor,
+          accent,
+          sprite,
+        });
+      }
+    }
+
+    return { strokes, spikes, body };
+  }
 }
 
 /**
@@ -916,12 +1135,6 @@ const projectRing = (
 };
 
 const FILL_START = -Math.PI / 2;
-const isFilled = (theta: number, progress: number): boolean => {
-  if (progress >= 0.999) return true;
-  const sweep = Math.PI * 2 * progress;
-  const d = ((theta - FILL_START) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2);
-  return d <= sweep;
-};
 
 /**
  * Draw a glowing leading-edge arc along the filled portion of the ring.
@@ -961,86 +1174,150 @@ const drawFillBeads = (
 };
 
 /**
- * Draw a single sweeping ribbon stroke as a sequence of solid filled quads
- * along the tilted ellipse. The stroke is broken into small segments so each
- * quad can be assigned to the back or front layer based on its depth — that
- * keeps the orbit-around-planet illusion while the stroke itself reads as a
- * crisp, opaque vector mark rather than a hazy halo.
- *
- * `peakHalfWidth` sets the radial half-width at the middle of the stroke.
- * When `taperEnds` is true, the stroke's width follows `sin(t·π)` so it
- * fades to a fine point at both ends — that's what makes it look like a
- * brush mark rather than a band.
+ * Hide every rope and spike in a pool. Called each frame before the active
+ * ring slots reveal their own pool entries — anything not actively shown
+ * stays hidden, so a planet whose ringCount drops doesn't keep rendering
+ * stale geometry.
  */
-const drawRibbonStroke = (
-  back: import('pixi.js').Graphics,
-  front: import('pixi.js').Graphics,
+const hideRingPool = (pool: RingPool): void => {
+  for (const s of pool.strokes) {
+    s.back.visible = false;
+    s.front.visible = false;
+  }
+  if (pool.body) {
+    pool.body.back.visible = false;
+    pool.body.front.visible = false;
+  }
+  for (const sp of pool.spikes) sp.sprite.visible = false;
+};
+
+/**
+ * Move a point pool entry to coordinates `(x, y)` without allocating. Used
+ * by `setRopePoints` to repopulate the existing `Point[]` instances each
+ * frame — `MeshRope` watches the array contents and re-triangulates on its
+ * own when `autoUpdate` is true.
+ */
+const setPt = (points: Point[], i: number, x: number, y: number): void => {
+  points[i].x = x;
+  points[i].y = y;
+};
+
+/**
+ * Sample `samples` evenly-spaced points along the rope's arc and split them
+ * into two sequences based on depth sign — front-half points (depth ≥ 0) go
+ * into the front rope, back-half points into the back rope, with linearly
+ * interpolated boundary points at every depth-zero crossing so neither rope
+ * has a visible seam where the band re-emerges from behind the planet.
+ *
+ * The rope's vertical thickness is whatever the texture's natural height
+ * is; we don't try to vary width per-point. End-tapering for brush strokes
+ * is baked into the texture itself.
+ *
+ * Both rope point pools have ROPE_SAMPLES + 2 slots; unused slots are
+ * collapsed onto the last active point so the rope's tail doesn't smear off
+ * to the origin. `autoUpdate` does the rest.
+ */
+const setRopePoints = (
+  rope: StrokeRope,
   rMid: number,
-  peakHalfWidth: number,
-  radialOffset: number,
-  thetaStart: number,
-  length: number,
+  ringWidth: number,
   spin: number,
   sinT: number,
   cosT: number,
   cosY: number,
   sinY: number,
-  color: number,
-  alpha: number,
-  segments: number,
-  taperEnds: boolean,
 ): void => {
-  for (let i = 0; i < segments; i++) {
-    const t0 = i / segments;
-    const t1 = (i + 1) / segments;
-    const a0 = thetaStart + length * t0 + spin;
-    const a1 = thetaStart + length * t1 + spin;
-    const taper0 = taperEnds ? Math.sin(t0 * Math.PI) : 1;
-    const taper1 = taperEnds ? Math.sin(t1 * Math.PI) : 1;
-    const w0 = peakHalfWidth * taper0;
-    const w1 = peakHalfWidth * taper1;
-    const r00 = rMid + radialOffset + w0;
-    const r01 = rMid + radialOffset + w1;
-    const r10 = rMid + radialOffset - w0;
-    const r11 = rMid + radialOffset - w1;
-    const outerA = projectRing(a0, r00, sinT, cosT, cosY, sinY);
-    const outerB = projectRing(a1, r01, sinT, cosT, cosY, sinY);
-    const innerB = projectRing(a1, r11, sinT, cosT, cosY, sinY);
-    const innerA = projectRing(a0, r10, sinT, cosT, cosY, sinY);
-    if (w0 < 0.05 && w1 < 0.05) continue;
-    const midDepth = (outerA.depth + outerB.depth) * 0.5;
-    const target = midDepth >= 0 ? front : back;
-    target
-      .poly([
-        outerA.x, outerA.y,
-        outerB.x, outerB.y,
-        innerB.x, innerB.y,
-        innerA.x, innerA.y,
-      ])
-      .fill({ color, alpha });
+  const r = rMid + rope.radialOffset * ringWidth;
+  const samples = ROPE_SAMPLES;
+  // Sample positions and depths along the arc.
+  type Sample = { x: number; y: number; depth: number };
+  const samplesArr: Sample[] = [];
+  for (let i = 0; i <= samples; i++) {
+    const t = i / samples;
+    const a = rope.startTheta + rope.length * t + spin;
+    const p = projectRing(a, r, sinT, cosT, cosY, sinY);
+    samplesArr.push({ x: p.x, y: p.y, depth: p.depth });
   }
+
+  const backPts: Sample[] = [];
+  const frontPts: Sample[] = [];
+  for (let i = 0; i < samplesArr.length; i++) {
+    const cur = samplesArr[i];
+    const target = cur.depth >= 0 ? frontPts : backPts;
+    target.push(cur);
+    // At every depth-zero crossing, push an interpolated point onto BOTH
+    // sides so neither rope has a visible gap at the planet's silhouette.
+    if (i + 1 < samplesArr.length) {
+      const nxt = samplesArr[i + 1];
+      if ((cur.depth >= 0) !== (nxt.depth >= 0)) {
+        const t = cur.depth / (cur.depth - nxt.depth);
+        const xi = cur.x + (nxt.x - cur.x) * t;
+        const yi = cur.y + (nxt.y - cur.y) * t;
+        const cross: Sample = { x: xi, y: yi, depth: 0 };
+        backPts.push(cross);
+        frontPts.push({ ...cross });
+      }
+    }
+  }
+
+  // A MeshRope needs at least 2 points and breaks on coincident neighbours.
+  // If a side is empty or has only one point, hide that rope and skip
+  // updating its points (they retain their last-frame values, which is
+  // harmless when invisible).
+  if (frontPts.length >= 2) {
+    rope.front.visible = true;
+    writeRopePoints(rope.frontPoints, frontPts);
+  } else {
+    rope.front.visible = false;
+  }
+  if (backPts.length >= 2) {
+    rope.back.visible = true;
+    writeRopePoints(rope.backPoints, backPts);
+  } else {
+    rope.back.visible = false;
+  }
+  // Rope thickness comes from RopeGeometry._width — set it per-frame so
+  // the brush band matches `ringWidth * 2 * halfWidth`. We mutate the
+  // internal field directly because the public getter is read-only and the
+  // alternative (scale.y) would also scale the path coordinates and warp
+  // the ellipse off-axis. `update()` refreshes vertices on the GPU.
+  const desiredWidth = ringWidth * rope.halfWidth * 2;
+  setRopeWidth(rope.front.geometry as RopeGeometry, desiredWidth);
+  setRopeWidth(rope.back.geometry as RopeGeometry, desiredWidth);
+};
+
+const setRopeWidth = (geom: RopeGeometry, width: number): void => {
+  if (geom._width === width) return;
+  geom._width = width;
+  geom.update();
 };
 
 /**
- * Brushstroke ring (image-2 reference): a band built from a small number of
- * distinct sweeping brush marks. Two broad base-tone strokes sweep most of
- * the ring; a handful of shorter accent-tone strokes layer on top at varied
- * radial offsets so the band reads as overlapping pigments rather than a
- * single annulus. All strokes are solid filled polygons with tapered ends,
- * matching the "single confident brush mark" look in the reference rather
- * than the previous hazy circle-dab approach.
+ * Repopulate a fixed-size point pool with `pts.length` real points and pin
+ * the rest onto the final point so the rope's tail doesn't smear off-screen.
+ * Mutates `pool` in place — never reallocates.
  */
-const drawBrushstrokeRing = (
-  back: import('pixi.js').Graphics,
-  front: import('pixi.js').Graphics,
+const writeRopePoints = (pool: Point[], pts: Array<{ x: number; y: number }>): void => {
+  const n = Math.min(pts.length, pool.length);
+  for (let i = 0; i < n; i++) setPt(pool, i, pts[i].x, pts[i].y);
+  const lastX = pts[n - 1].x;
+  const lastY = pts[n - 1].y;
+  for (let i = n; i < pool.length; i++) setPt(pool, i, lastX, lastY);
+};
+
+/**
+ * Drive the rope point arrays and spike sprite transforms for one ring slot
+ * each frame. Tints are re-applied because owner colour can change on
+ * capture; depth-based back/front re-parenting is done per spike.
+ */
+const updateRingPool = (
+  pool: RingPool,
+  ringsBack: Container,
+  ringsFront: Container,
   rMid: number,
   ringWidth: number,
-  progress: number,
   baseColor: number,
   accentColor: number,
-  glowColor: number,
-  seed: number,
-  time: number,
   tilt: number,
   yaw: number,
   spin: number,
@@ -1050,151 +1327,32 @@ const drawBrushstrokeRing = (
   const cosY = Math.cos(yaw);
   const sinY = Math.sin(yaw);
 
-  // Base strokes: two broad sweeping marks in the darker pigment. Each
-  // covers most of the ring (1.6–2.4 rad) at a slight radial offset, so
-  // overlapping they form the band's foundation.
-  const BASE_STROKES = 2;
-  for (let s = 0; s < BASE_STROKES; s++) {
-    const sSeed = seed * 41 + s * 13 + 3;
-    const startOffset = (s / BASE_STROKES) * Math.PI * 2 + (seeded(sSeed) - 0.5) * 0.6;
-    const length = 1.6 + seeded(sSeed * 7) * 0.8; // 1.6..2.4 rad
-    const peakHalf = ringWidth * (0.42 + seeded(sSeed * 11) * 0.18);
-    const radialOffset = (seeded(sSeed * 17) - 0.5) * ringWidth * 0.32;
-    drawRibbonStroke(
-      back, front,
-      rMid, peakHalf, radialOffset,
-      startOffset, length,
-      spin, sinT, cosT, cosY, sinY,
-      baseColor, 0.92,
-      48, true,
-    );
+  // Order strokes back-to-front by kind so accents always paint over the
+  // base layer. We don't reorder children here (Pixi keeps insertion order)
+  // because buildRingPool already pushed bases first, then accents.
+  for (const s of pool.strokes) {
+    const tint = s.kind === 'accent' ? accentColor : baseColor;
+    s.back.tint = tint;
+    s.front.tint = tint;
+    setRopePoints(s, rMid, ringWidth, spin, sinT, cosT, cosY, sinY);
   }
 
-  // Accent strokes: shorter, narrower marks in the lighter pigment, scattered
-  // around the ring at different radial offsets. These give the layered
-  // "two-pigment" feel from the reference.
-  const ACCENT_STROKES = 4;
-  for (let s = 0; s < ACCENT_STROKES; s++) {
-    const sSeed = seed * 53 + s * 17 + 11;
-    const startOffset = (s / ACCENT_STROKES) * Math.PI * 2 + (seeded(sSeed) - 0.5) * 0.7;
-    const length = 0.7 + seeded(sSeed * 7) * 0.9; // 0.7..1.6 rad
-    const peakHalf = ringWidth * (0.26 + seeded(sSeed * 11) * 0.14);
-    const radialOffset = (seeded(sSeed * 17) - 0.5) * ringWidth * 0.44;
-    drawRibbonStroke(
-      back, front,
-      rMid, peakHalf, radialOffset,
-      startOffset, length,
-      spin, sinT, cosT, cosY, sinY,
-      accentColor, 0.88,
-      32, true,
-    );
+  if (pool.body) {
+    pool.body.back.tint = baseColor;
+    pool.body.front.tint = baseColor;
+    setRopePoints(pool.body, rMid, ringWidth, spin, sinT, cosT, cosY, sinY);
   }
 
-  // Highlight stroke along the filled portion: a single bright ribbon mark
-  // covering exactly the filled arc, so progress reads as a glowing brushstroke
-  // sitting on top of the base.
-  if (progress > 0.01) {
-    const sweep = Math.PI * 2 * progress;
-    drawRibbonStroke(
-      back, front,
-      rMid, ringWidth * 0.3, 0,
-      FILL_START, sweep,
-      spin, sinT, cosT, cosY, sinY,
-      glowColor, 0.85,
-      Math.max(12, Math.floor(48 * progress)), false,
-    );
-  }
-
-  drawFillBeads(
-    back, front, rMid, ringWidth, progress, glowColor,
-    seed, time, spin, sinT, cosT, cosY, sinY,
-  );
-};
-
-/**
- * Spiky tendril ring (image-1 reference): a continuous solid ribbon wrapping
- * the planet plus outward-pointing triangular spikes along its outer edge.
- * The body is one closed-width ribbon (drawn as solid filled quads, segmented
- * for the back/front depth split) so it reads as a single dark band rather
- * than a cloud of dots; spikes are individual filled triangles. A subset of
- * spikes get an accent-tone inner triangle for the dual-pigment glint visible
- * on the reference.
- */
-const drawSpikyTendrilRing = (
-  back: import('pixi.js').Graphics,
-  front: import('pixi.js').Graphics,
-  rMid: number,
-  ringWidth: number,
-  progress: number,
-  baseColor: number,
-  accentColor: number,
-  glowColor: number,
-  seed: number,
-  time: number,
-  tilt: number,
-  yaw: number,
-  spin: number,
-): void => {
-  const sinT = Math.sin(tilt);
-  const cosT = Math.cos(tilt);
-  const cosY = Math.cos(yaw);
-  const sinY = Math.sin(yaw);
-
-  // Solid tendril body — full ellipse at near-constant width with a tiny
-  // organic wobble, drawn as 80 segmented filled quads. No taper because the
-  // ribbon closes on itself.
-  const BODY_SEGMENTS = 80;
-  const bodyHalf = ringWidth * 0.22;
-  for (let i = 0; i < BODY_SEGMENTS; i++) {
-    const t0 = i / BODY_SEGMENTS;
-    const t1 = (i + 1) / BODY_SEGMENTS;
-    const theta0 = t0 * Math.PI * 2;
-    const theta1 = t1 * Math.PI * 2;
-    const a0 = theta0 + spin;
-    const a1 = theta1 + spin;
-    const wobble0 = Math.sin(theta0 * 5 + seed) * (ringWidth * 0.1);
-    const wobble1 = Math.sin(theta1 * 5 + seed) * (ringWidth * 0.1);
-    const widthMod0 = 1 + Math.sin(theta0 * 3 + seed * 1.3) * 0.18;
-    const widthMod1 = 1 + Math.sin(theta1 * 3 + seed * 1.3) * 0.18;
-    const w0 = bodyHalf * widthMod0;
-    const w1 = bodyHalf * widthMod1;
-    const outerA = projectRing(a0, rMid + wobble0 + w0, sinT, cosT, cosY, sinY);
-    const outerB = projectRing(a1, rMid + wobble1 + w1, sinT, cosT, cosY, sinY);
-    const innerB = projectRing(a1, rMid + wobble1 - w1, sinT, cosT, cosY, sinY);
-    const innerA = projectRing(a0, rMid + wobble0 - w0, sinT, cosT, cosY, sinY);
-    const midDepth = (outerA.depth + outerB.depth) * 0.5;
-    const target = midDepth >= 0 ? front : back;
-    const inFill = isFilled((a0 + a1) * 0.5, progress);
-    target
-      .poly([
-        outerA.x, outerA.y,
-        outerB.x, outerB.y,
-        innerB.x, innerB.y,
-        innerA.x, innerA.y,
-      ])
-      .fill({ color: inFill ? glowColor : baseColor, alpha: 0.95 });
-  }
-
-  // Spikes — solid filled triangles rooted on the ribbon's outer edge,
-  // pointing along the outward normal. Irregularly skipped so the silhouette
-  // reads as a dragon-spine rather than a comb.
-  const SPIKE_COUNT = 56;
-  for (let i = 0; i < SPIKE_COUNT; i++) {
-    const theta = (i / SPIKE_COUNT) * Math.PI * 2;
-    const a = theta + spin;
-    if (seeded(seed * 23 + i * 7) < 0.22) continue;
-
-    const inFill = isFilled(a, progress);
-    const lengthJitter = seeded(seed * 31 + i * 11);
-    const spikeLen =
-      ringWidth * (0.55 + lengthJitter * 0.7) * (inFill ? 1.18 : 1);
-    const halfBase = ringWidth * 0.16;
-
+  // Spike sprites — for each spike, project its root angle, derive the
+  // outward normal from a tangent estimate, and position/rotate/scale the
+  // sprite. Re-parent to the depth-appropriate container so the sprite
+  // really gets occluded by the body when behind the planet.
+  for (const sp of pool.spikes) {
+    const a = sp.theta + spin;
     const dTheta = 0.05;
     const pPrev = projectRing(a - dTheta, rMid, sinT, cosT, cosY, sinY);
     const pNext = projectRing(a + dTheta, rMid, sinT, cosT, cosY, sinY);
-    const pMid = projectRing(a, rMid + bodyHalf * 0.7, sinT, cosT, cosY, sinY);
-
+    const pMid = projectRing(a, rMid + ringWidth * 0.18, sinT, cosT, cosY, sinY);
     const tx = pNext.x - pPrev.x;
     const ty = pNext.y - pPrev.y;
     const tLen = Math.hypot(tx, ty) || 1;
@@ -1206,42 +1364,28 @@ const drawSpikyTendrilRing = (
       nx = -nx;
       ny = -ny;
     }
+    const sprite = sp.sprite;
+    sprite.visible = true;
+    sprite.x = pMid.x;
+    sprite.y = pMid.y;
+    // Sprite texture's tip points up (−y); with anchor at (0.5, 1) and the
+    // Pixi rotation matrix [cos −sin / sin cos], the tip lands at offset
+    // (H sin θ, −H cos θ) — solving for that to align with (nx, ny) gives
+    // θ = atan2(ny, nx) + π/2, so the spike grows outward along the normal.
+    sprite.rotation = Math.atan2(ny, nx) + Math.PI / 2;
+    const spikeLen = ringWidth * sp.lengthFactor;
+    const spikeWidth = ringWidth * 0.32 * sp.widthFactor;
+    sprite.scale.set(
+      spikeWidth / sprite.texture.width,
+      spikeLen / sprite.texture.height,
+    );
+    sprite.tint = sp.accent ? accentColor : baseColor;
 
-    const tipX = pMid.x + nx * spikeLen;
-    const tipY = pMid.y + ny * spikeLen;
-    const baseAx = pMid.x + tnx * halfBase;
-    const baseAy = pMid.y + tny * halfBase;
-    const baseBx = pMid.x - tnx * halfBase;
-    const baseBy = pMid.y - tny * halfBase;
-
-    const target = pMid.depth >= 0 ? front : back;
-    const tone = inFill ? glowColor : baseColor;
-    target
-      .poly([baseAx, baseAy, baseBx, baseBy, tipX, tipY])
-      .fill({ color: tone, alpha: 0.95 });
-
-    // Inner accent triangle on every ~3rd spike — the lighter glint visible
-    // on the spikes in the reference.
-    if (i % 3 === 0) {
-      const innerLen = spikeLen * 0.55;
-      const innerHalf = halfBase * 0.55;
-      const innerTipX = pMid.x + nx * innerLen;
-      const innerTipY = pMid.y + ny * innerLen;
-      const innerAx = pMid.x + tnx * innerHalf;
-      const innerAy = pMid.y + tny * innerHalf;
-      const innerBx = pMid.x - tnx * innerHalf;
-      const innerBy = pMid.y - tny * innerHalf;
-      target
-        .poly([innerAx, innerAy, innerBx, innerBy, innerTipX, innerTipY])
-        .fill({
-          color: inFill ? glowColor : accentColor,
-          alpha: 0.95,
-        });
+    // Re-parent based on depth at the spike root.
+    const desired = pMid.depth >= 0 ? ringsFront : ringsBack;
+    if (sprite.parent !== desired) {
+      sprite.parent?.removeChild(sprite);
+      desired.addChild(sprite);
     }
   }
-
-  drawFillBeads(
-    back, front, rMid, ringWidth, progress, glowColor,
-    seed, time, spin, sinT, cosT, cosY, sinY,
-  );
 };

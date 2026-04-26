@@ -961,12 +961,74 @@ const drawFillBeads = (
 };
 
 /**
- * Brushstroke ring (image-2 reference): a watercolour band built from a few
- * broad sweeping base strokes plus shorter, lighter accent strokes laid on
- * top. The base strokes draw the full ellipse so the ring always reads as a
- * confident loop; the accents add the painterly "two pigments overlapping"
- * texture visible in the reference. Tilt/yaw/spin/progress drive the same
- * orbit illusion as before.
+ * Draw a single sweeping ribbon stroke as a sequence of solid filled quads
+ * along the tilted ellipse. The stroke is broken into small segments so each
+ * quad can be assigned to the back or front layer based on its depth — that
+ * keeps the orbit-around-planet illusion while the stroke itself reads as a
+ * crisp, opaque vector mark rather than a hazy halo.
+ *
+ * `peakHalfWidth` sets the radial half-width at the middle of the stroke.
+ * When `taperEnds` is true, the stroke's width follows `sin(t·π)` so it
+ * fades to a fine point at both ends — that's what makes it look like a
+ * brush mark rather than a band.
+ */
+const drawRibbonStroke = (
+  back: import('pixi.js').Graphics,
+  front: import('pixi.js').Graphics,
+  rMid: number,
+  peakHalfWidth: number,
+  radialOffset: number,
+  thetaStart: number,
+  length: number,
+  spin: number,
+  sinT: number,
+  cosT: number,
+  cosY: number,
+  sinY: number,
+  color: number,
+  alpha: number,
+  segments: number,
+  taperEnds: boolean,
+): void => {
+  for (let i = 0; i < segments; i++) {
+    const t0 = i / segments;
+    const t1 = (i + 1) / segments;
+    const a0 = thetaStart + length * t0 + spin;
+    const a1 = thetaStart + length * t1 + spin;
+    const taper0 = taperEnds ? Math.sin(t0 * Math.PI) : 1;
+    const taper1 = taperEnds ? Math.sin(t1 * Math.PI) : 1;
+    const w0 = peakHalfWidth * taper0;
+    const w1 = peakHalfWidth * taper1;
+    const r00 = rMid + radialOffset + w0;
+    const r01 = rMid + radialOffset + w1;
+    const r10 = rMid + radialOffset - w0;
+    const r11 = rMid + radialOffset - w1;
+    const outerA = projectRing(a0, r00, sinT, cosT, cosY, sinY);
+    const outerB = projectRing(a1, r01, sinT, cosT, cosY, sinY);
+    const innerB = projectRing(a1, r11, sinT, cosT, cosY, sinY);
+    const innerA = projectRing(a0, r10, sinT, cosT, cosY, sinY);
+    if (w0 < 0.05 && w1 < 0.05) continue;
+    const midDepth = (outerA.depth + outerB.depth) * 0.5;
+    const target = midDepth >= 0 ? front : back;
+    target
+      .poly([
+        outerA.x, outerA.y,
+        outerB.x, outerB.y,
+        innerB.x, innerB.y,
+        innerA.x, innerA.y,
+      ])
+      .fill({ color, alpha });
+  }
+};
+
+/**
+ * Brushstroke ring (image-2 reference): a band built from a small number of
+ * distinct sweeping brush marks. Two broad base-tone strokes sweep most of
+ * the ring; a handful of shorter accent-tone strokes layer on top at varied
+ * radial offsets so the band reads as overlapping pigments rather than a
+ * single annulus. All strokes are solid filled polygons with tapered ends,
+ * matching the "single confident brush mark" look in the reference rather
+ * than the previous hazy circle-dab approach.
  */
 const drawBrushstrokeRing = (
   back: import('pixi.js').Graphics,
@@ -988,70 +1050,59 @@ const drawBrushstrokeRing = (
   const cosY = Math.cos(yaw);
   const sinY = Math.sin(yaw);
 
-  // Base strokes — broad, low-alpha sweeps drawn around the full ellipse.
-  // Two of them at slightly different radial offsets blend into a band that
-  // reads as the darker pigment in the reference.
+  // Base strokes: two broad sweeping marks in the darker pigment. Each
+  // covers most of the ring (1.6–2.4 rad) at a slight radial offset, so
+  // overlapping they form the band's foundation.
   const BASE_STROKES = 2;
-  const BASE_SAMPLES = 64;
   for (let s = 0; s < BASE_STROKES; s++) {
     const sSeed = seed * 41 + s * 13 + 3;
-    const radialOffset = (s - (BASE_STROKES - 1) / 2) * ringWidth * 0.32;
-    const wobblePhase = seeded(sSeed) * Math.PI * 2;
-    const wobbleAmp = ringWidth * (0.08 + seeded(sSeed * 7) * 0.12);
-    for (let i = 0; i < BASE_SAMPLES; i++) {
-      const theta = (i / BASE_SAMPLES) * Math.PI * 2;
-      const a = theta + spin;
-      // Slow radial wobble keeps the band from reading as a perfect ellipse.
-      const r =
-        rMid +
-        radialOffset +
-        Math.sin(theta * 3 + wobblePhase) * wobbleAmp;
-      const p = projectRing(a, r, sinT, cosT, cosY, sinY);
-      const target = p.depth >= 0 ? front : back;
-      const inFill = isFilled(a, progress);
-      const depthShade = 0.7 + 0.3 * (p.depth / rMid + 0.5);
-      const flicker = 0.85 + 0.15 * Math.sin(time * 0.6 + sSeed + theta * 1.5);
-      const tone = inFill ? glowColor : baseColor;
-      const alpha =
-        (inFill ? 0.55 : 0.32) * depthShade * flicker;
-      target
-        .circle(p.x, p.y, ringWidth * 0.55)
-        .fill({ color: tone, alpha });
-    }
+    const startOffset = (s / BASE_STROKES) * Math.PI * 2 + (seeded(sSeed) - 0.5) * 0.6;
+    const length = 1.6 + seeded(sSeed * 7) * 0.8; // 1.6..2.4 rad
+    const peakHalf = ringWidth * (0.42 + seeded(sSeed * 11) * 0.18);
+    const radialOffset = (seeded(sSeed * 17) - 0.5) * ringWidth * 0.32;
+    drawRibbonStroke(
+      back, front,
+      rMid, peakHalf, radialOffset,
+      startOffset, length,
+      spin, sinT, cosT, cosY, sinY,
+      baseColor, 0.92,
+      48, true,
+    );
   }
 
-  // Accent strokes — shorter, brighter arcs of the lighter pigment, tapered
-  // at the ends so each stroke reads as an individual brush mark on top of
-  // the base.
-  const ACCENT_STROKES = 5;
+  // Accent strokes: shorter, narrower marks in the lighter pigment, scattered
+  // around the ring at different radial offsets. These give the layered
+  // "two-pigment" feel from the reference.
+  const ACCENT_STROKES = 4;
   for (let s = 0; s < ACCENT_STROKES; s++) {
     const sSeed = seed * 53 + s * 17 + 11;
-    const baseTheta = (s / ACCENT_STROKES) * Math.PI * 2 + (seeded(sSeed) - 0.5) * 0.6;
+    const startOffset = (s / ACCENT_STROKES) * Math.PI * 2 + (seeded(sSeed) - 0.5) * 0.7;
     const length = 0.7 + seeded(sSeed * 7) * 0.9; // 0.7..1.6 rad
-    const radialBias = (seeded(sSeed * 11) - 0.5) * ringWidth * 0.5;
-    const strokeAlpha = 0.5 + seeded(sSeed * 17) * 0.2;
-    const strokeWidth = ringWidth * (0.22 + seeded(sSeed * 19) * 0.14);
-    const samples = 24;
-    for (let i = 0; i <= samples; i++) {
-      const t = i / samples;
-      const a = baseTheta + length * t + spin;
-      const sweepBend = Math.sin(t * Math.PI) * (ringWidth * 0.22);
-      const r = rMid + radialBias + sweepBend;
-      const p = projectRing(a, r, sinT, cosT, cosY, sinY);
-      const target = p.depth >= 0 ? front : back;
-      const taper = Math.pow(Math.sin(t * Math.PI), 0.6);
-      const inFill = isFilled(a, progress);
-      const depthShade = 0.7 + 0.3 * (p.depth / rMid + 0.5);
-      const tone = inFill ? glowColor : accentColor;
-      const dabAlpha =
-        strokeAlpha *
-        taper *
-        depthShade *
-        (inFill ? 1 : 0.85) *
-        (0.85 + 0.15 * Math.sin(time * 1.2 + sSeed + i * 0.5));
-      const dabR = strokeWidth * (0.9 + 0.3 * taper);
-      target.circle(p.x, p.y, dabR).fill({ color: tone, alpha: dabAlpha });
-    }
+    const peakHalf = ringWidth * (0.26 + seeded(sSeed * 11) * 0.14);
+    const radialOffset = (seeded(sSeed * 17) - 0.5) * ringWidth * 0.44;
+    drawRibbonStroke(
+      back, front,
+      rMid, peakHalf, radialOffset,
+      startOffset, length,
+      spin, sinT, cosT, cosY, sinY,
+      accentColor, 0.88,
+      32, true,
+    );
+  }
+
+  // Highlight stroke along the filled portion: a single bright ribbon mark
+  // covering exactly the filled arc, so progress reads as a glowing brushstroke
+  // sitting on top of the base.
+  if (progress > 0.01) {
+    const sweep = Math.PI * 2 * progress;
+    drawRibbonStroke(
+      back, front,
+      rMid, ringWidth * 0.3, 0,
+      FILL_START, sweep,
+      spin, sinT, cosT, cosY, sinY,
+      glowColor, 0.85,
+      Math.max(12, Math.floor(48 * progress)), false,
+    );
   }
 
   drawFillBeads(
@@ -1061,13 +1112,13 @@ const drawBrushstrokeRing = (
 };
 
 /**
- * Spiky tendril ring (image-1 reference): a continuous tendril ellipse with
- * outward-pointing triangular spikes along its length, dragon-spine style.
- * The tendril body is a sequence of overlapping dabs in the darker pigment;
- * spikes are filled triangles whose tip points away from the planet centre.
- * A subset of spikes get a smaller inner triangle in the lighter pigment so
- * each spike reads as two-tone like the reference. Tilt/yaw/spin/progress
- * still drive the orbit illusion via the shared `projectRing` helper.
+ * Spiky tendril ring (image-1 reference): a continuous solid ribbon wrapping
+ * the planet plus outward-pointing triangular spikes along its outer edge.
+ * The body is one closed-width ribbon (drawn as solid filled quads, segmented
+ * for the back/front depth split) so it reads as a single dark band rather
+ * than a cloud of dots; spikes are individual filled triangles. A subset of
+ * spikes get an accent-tone inner triangle for the dual-pigment glint visible
+ * on the reference.
  */
 const drawSpikyTendrilRing = (
   back: import('pixi.js').Graphics,
@@ -1089,53 +1140,66 @@ const drawSpikyTendrilRing = (
   const cosY = Math.cos(yaw);
   const sinY = Math.sin(yaw);
 
-  // Tendril body — overlapping dabs sweeping the full ellipse. Slightly
-  // thicker than the brushstroke base so the spikes have a continuous
-  // backbone to root in.
-  const BODY_SAMPLES = 80;
-  for (let i = 0; i < BODY_SAMPLES; i++) {
-    const theta = (i / BODY_SAMPLES) * Math.PI * 2;
-    const a = theta + spin;
-    const wobble = Math.sin(theta * 5 + seed) * (ringWidth * 0.08);
-    const p = projectRing(a, rMid + wobble, sinT, cosT, cosY, sinY);
-    const target = p.depth >= 0 ? front : back;
-    const inFill = isFilled(a, progress);
-    const depthShade = 0.7 + 0.3 * (p.depth / rMid + 0.5);
-    const tone = inFill ? glowColor : baseColor;
-    const alpha = (inFill ? 0.85 : 0.7) * depthShade;
+  // Solid tendril body — full ellipse at near-constant width with a tiny
+  // organic wobble, drawn as 80 segmented filled quads. No taper because the
+  // ribbon closes on itself.
+  const BODY_SEGMENTS = 80;
+  const bodyHalf = ringWidth * 0.22;
+  for (let i = 0; i < BODY_SEGMENTS; i++) {
+    const t0 = i / BODY_SEGMENTS;
+    const t1 = (i + 1) / BODY_SEGMENTS;
+    const theta0 = t0 * Math.PI * 2;
+    const theta1 = t1 * Math.PI * 2;
+    const a0 = theta0 + spin;
+    const a1 = theta1 + spin;
+    const wobble0 = Math.sin(theta0 * 5 + seed) * (ringWidth * 0.1);
+    const wobble1 = Math.sin(theta1 * 5 + seed) * (ringWidth * 0.1);
+    const widthMod0 = 1 + Math.sin(theta0 * 3 + seed * 1.3) * 0.18;
+    const widthMod1 = 1 + Math.sin(theta1 * 3 + seed * 1.3) * 0.18;
+    const w0 = bodyHalf * widthMod0;
+    const w1 = bodyHalf * widthMod1;
+    const outerA = projectRing(a0, rMid + wobble0 + w0, sinT, cosT, cosY, sinY);
+    const outerB = projectRing(a1, rMid + wobble1 + w1, sinT, cosT, cosY, sinY);
+    const innerB = projectRing(a1, rMid + wobble1 - w1, sinT, cosT, cosY, sinY);
+    const innerA = projectRing(a0, rMid + wobble0 - w0, sinT, cosT, cosY, sinY);
+    const midDepth = (outerA.depth + outerB.depth) * 0.5;
+    const target = midDepth >= 0 ? front : back;
+    const inFill = isFilled((a0 + a1) * 0.5, progress);
     target
-      .circle(p.x, p.y, ringWidth * 0.42)
-      .fill({ color: tone, alpha });
+      .poly([
+        outerA.x, outerA.y,
+        outerB.x, outerB.y,
+        innerB.x, innerB.y,
+        innerA.x, innerA.y,
+      ])
+      .fill({ color: inFill ? glowColor : baseColor, alpha: 0.95 });
   }
 
-  // Spikes — triangular protrusions pointing outward from the ring midline.
-  // Each spike samples two adjacent ring points to derive a tangent, then
-  // emits a tip along the outward normal.
-  const SPIKE_COUNT = 60;
+  // Spikes — solid filled triangles rooted on the ribbon's outer edge,
+  // pointing along the outward normal. Irregularly skipped so the silhouette
+  // reads as a dragon-spine rather than a comb.
+  const SPIKE_COUNT = 56;
   for (let i = 0; i < SPIKE_COUNT; i++) {
     const theta = (i / SPIKE_COUNT) * Math.PI * 2;
     const a = theta + spin;
-    // Skip ~25% of slots to give the dragon-spine an irregular silhouette.
-    if (seeded(seed * 23 + i * 7) < 0.25) continue;
+    if (seeded(seed * 23 + i * 7) < 0.22) continue;
 
     const inFill = isFilled(a, progress);
     const lengthJitter = seeded(seed * 31 + i * 11);
     const spikeLen =
-      ringWidth * (0.6 + lengthJitter * 0.7) * (inFill ? 1.2 : 1);
-    const halfBase = ringWidth * 0.18;
+      ringWidth * (0.55 + lengthJitter * 0.7) * (inFill ? 1.18 : 1);
+    const halfBase = ringWidth * 0.16;
 
-    // Tangent estimated from a small Δθ on either side of the spike root.
     const dTheta = 0.05;
     const pPrev = projectRing(a - dTheta, rMid, sinT, cosT, cosY, sinY);
     const pNext = projectRing(a + dTheta, rMid, sinT, cosT, cosY, sinY);
-    const pMid = projectRing(a, rMid, sinT, cosT, cosY, sinY);
+    const pMid = projectRing(a, rMid + bodyHalf * 0.7, sinT, cosT, cosY, sinY);
 
     const tx = pNext.x - pPrev.x;
     const ty = pNext.y - pPrev.y;
     const tLen = Math.hypot(tx, ty) || 1;
     const tnx = tx / tLen;
     const tny = ty / tLen;
-    // Outward normal: rotate tangent 90° and flip if it points toward origin.
     let nx = -tny;
     let ny = tnx;
     if (nx * pMid.x + ny * pMid.y < 0) {
@@ -1151,17 +1215,16 @@ const drawSpikyTendrilRing = (
     const baseBy = pMid.y - tny * halfBase;
 
     const target = pMid.depth >= 0 ? front : back;
-    const depthShade = 0.7 + 0.3 * (pMid.depth / rMid + 0.5);
     const tone = inFill ? glowColor : baseColor;
     target
       .poly([baseAx, baseAy, baseBx, baseBy, tipX, tipY])
-      .fill({ color: tone, alpha: 0.85 * depthShade });
+      .fill({ color: tone, alpha: 0.95 });
 
-    // Every ~4th spike gets a smaller inner triangle in the accent tone for
-    // the dual-pigment glint visible on the reference image.
-    if (i % 4 === 0) {
+    // Inner accent triangle on every ~3rd spike — the lighter glint visible
+    // on the spikes in the reference.
+    if (i % 3 === 0) {
       const innerLen = spikeLen * 0.55;
-      const innerHalf = halfBase * 0.5;
+      const innerHalf = halfBase * 0.55;
       const innerTipX = pMid.x + nx * innerLen;
       const innerTipY = pMid.y + ny * innerLen;
       const innerAx = pMid.x + tnx * innerHalf;
@@ -1172,7 +1235,7 @@ const drawSpikyTendrilRing = (
         .poly([innerAx, innerAy, innerBx, innerBy, innerTipX, innerTipY])
         .fill({
           color: inFill ? glowColor : accentColor,
-          alpha: 0.9 * depthShade,
+          alpha: 0.95,
         });
     }
   }

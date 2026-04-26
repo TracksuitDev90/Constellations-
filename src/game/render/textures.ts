@@ -290,6 +290,174 @@ export const makeStarfieldTexture = (app: Application, size = 512): Texture => {
   });
 };
 
+/**
+ * Bake a Graphics build into a fixed-size RenderTexture. Differs from
+ * `makeGlowTexture` in that the output size is the caller-supplied (w, h)
+ * rather than the build's bounding box — important when the texture has to
+ * have a known aspect ratio (e.g. a brush stroke that will be warped along
+ * a path by `MeshRope`).
+ */
+const bakeFixedTexture = (
+  app: Application,
+  key: string,
+  width: number,
+  height: number,
+  build: (g: Graphics) => void,
+): Texture => {
+  const hit = cache.get(key);
+  if (hit) return hit;
+  const g = new Graphics();
+  build(g);
+  const rt = RenderTexture.create({
+    width,
+    height,
+    resolution: app.renderer.resolution,
+    antialias: true,
+  });
+  app.renderer.render({ container: g, target: rt });
+  cache.set(key, rt);
+  return rt;
+};
+
+/**
+ * Painterly brush stroke baked into a long horizontal texture. Designed to be
+ * stretched along a path via `MeshRope`: the horizontal axis of the texture
+ * follows the path, the vertical axis becomes the stroke's perpendicular
+ * width. The shape tapers to fine points at both ends and has irregular
+ * top/bottom edges plus internal bristle streaks so the result reads as a
+ * confident, hand-painted mark rather than a clean ribbon. White only — the
+ * caller tints the rope at runtime.
+ */
+export const makeBrushStrokeTexture = (app: Application): Texture => {
+  const W = 512;
+  const H = 64;
+  return bakeFixedTexture(app, 'ring-brush-stroke', W, H, (g) => {
+    const rng = mulberry32(0xb20a51);
+    const cy = H / 2;
+
+    // Build the stroke as a polygon with irregular top/bottom edges. Walking
+    // along x, perturb the half-height by a low-frequency noise so the edge
+    // looks bristled rather than ruler-straight.
+    const samples = 64;
+    const top: number[] = [];
+    const bottom: number[] = [];
+    for (let i = 0; i <= samples; i++) {
+      const t = i / samples;
+      const x = t * W;
+      // Tapered width: 0 at ends, ~max in the middle, with the peak biased
+      // slightly off-centre so the mark feels human rather than mathematical.
+      const taperPeak = Math.pow(Math.sin(Math.pow(t, 0.85) * Math.PI), 0.7);
+      const halfH = (H * 0.42) * taperPeak;
+      // Per-edge noise: independent low-frequency wobbles for top vs bottom
+      // so the stroke doesn't look symmetric.
+      const topNoise = (rng() - 0.5) * 1.6 + Math.sin(t * 11 + 1.3) * 1.4;
+      const botNoise = (rng() - 0.5) * 1.6 + Math.sin(t * 13 + 4.7) * 1.4;
+      top.push(x, cy - halfH + topNoise);
+      bottom.push(x, cy + halfH + botNoise);
+    }
+    const poly: number[] = top.slice();
+    for (let i = bottom.length - 2; i >= 0; i -= 2) {
+      poly.push(bottom[i], bottom[i + 1]);
+    }
+    g.poly(poly).fill({ color: 0xffffff, alpha: 1 });
+
+    // Internal bristle streaks — a few thin alpha stripes parallel to the
+    // stroke direction give the painterly grain you'd see in a real brush
+    // mark on textured paper.
+    for (let i = 0; i < 14; i++) {
+      const t0 = rng() * 0.85 + 0.05;
+      const t1 = Math.min(1, t0 + rng() * 0.35 + 0.08);
+      const yOff = (rng() - 0.5) * H * 0.45;
+      g.rect(t0 * W, cy + yOff - 0.6, (t1 - t0) * W, 1.2)
+        .fill({ color: 0xffffff, alpha: 0.45 });
+    }
+
+    // Pigment specks scattered just outside the main mark — sells the
+    // watercolour "splatter" feel without overpowering the silhouette.
+    for (let i = 0; i < 22; i++) {
+      const x = rng() * W;
+      const y = cy + (rng() - 0.5) * H * 0.95;
+      const r = rng() * 1.6 + 0.4;
+      g.circle(x, y, r).fill({ color: 0xffffff, alpha: 0.55 });
+    }
+  });
+};
+
+/**
+ * Solid tendril band baked as a long horizontal texture, used for the body
+ * of the spiky-tendril ring. Differs from the brush stroke in that it has
+ * full width all the way across (no end taper) — the rope wraps the full
+ * ellipse, so the stroke is a closed loop. Slight thickness wobble keeps the
+ * silhouette organic, and a darker outline along top/bottom edges produces
+ * the visible rim seen on the reference dragon-spine band.
+ */
+export const makeTendrilBodyTexture = (app: Application): Texture => {
+  const W = 512;
+  const H = 32;
+  return bakeFixedTexture(app, 'ring-tendril-body', W, H, (g) => {
+    const rng = mulberry32(0x7e7d12);
+    const cy = H / 2;
+    const samples = 64;
+    const top: number[] = [];
+    const bottom: number[] = [];
+    for (let i = 0; i <= samples; i++) {
+      const t = i / samples;
+      const x = t * W;
+      const halfH = H * 0.36 * (1 + Math.sin(t * 7.2) * 0.18 + (rng() - 0.5) * 0.12);
+      top.push(x, cy - halfH);
+      bottom.push(x, cy + halfH);
+    }
+    const poly: number[] = top.slice();
+    for (let i = bottom.length - 2; i >= 0; i -= 2) {
+      poly.push(bottom[i], bottom[i + 1]);
+    }
+    g.poly(poly).fill({ color: 0xffffff, alpha: 1 });
+
+    // Faint inner streaks for painterly texture along the band.
+    for (let i = 0; i < 10; i++) {
+      const t0 = rng();
+      const t1 = Math.min(1, t0 + rng() * 0.25 + 0.06);
+      const yOff = (rng() - 0.5) * H * 0.3;
+      g.rect(t0 * W, cy + yOff - 0.5, (t1 - t0) * W, 1)
+        .fill({ color: 0xffffff, alpha: 0.4 });
+    }
+  });
+};
+
+/**
+ * Painterly triangular spike used for the dragon-spine spikes on the
+ * spiky-tendril ring. Tip points up (texture's −y), base spans the bottom.
+ * Sprites stamp this with anchor at the base centre and rotate so the tip
+ * follows each spike's outward normal. White only — caller tints.
+ */
+export const makeSpikeTexture = (app: Application): Texture => {
+  const W = 48;
+  const H = 96;
+  return bakeFixedTexture(app, 'ring-spike', W, H, (g) => {
+    const rng = mulberry32(0x312fae);
+    const cx = W / 2;
+    // Slightly asymmetric base so the spike doesn't look mathematically
+    // perfect — left/right base offsets are independently jittered.
+    const baseLeftX = cx - W * 0.42 + (rng() - 0.5) * 2;
+    const baseRightX = cx + W * 0.42 + (rng() - 0.5) * 2;
+    const baseY = H - 1;
+    const tipX = cx + (rng() - 0.5) * 3;
+    const tipY = 1;
+
+    g.poly([baseLeftX, baseY, baseRightX, baseY, tipX, tipY])
+      .fill({ color: 0xffffff, alpha: 1 });
+
+    // Inner highlight — a narrower, slightly shorter triangle in lighter
+    // alpha down the middle, like a wet-edge gloss on the spike.
+    const innerLeftX = cx - W * 0.18;
+    const innerRightX = cx + W * 0.18;
+    const innerBaseY = H * 0.72;
+    const innerTipY = H * 0.18;
+    g.poly([innerLeftX, innerBaseY, innerRightX, innerBaseY, cx, innerTipY])
+      .fill({ color: 0xffffff, alpha: 0.4 });
+  });
+};
+
 const mulberry32 = (seed: number) => {
   let a = seed;
   return () => {

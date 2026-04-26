@@ -7,9 +7,41 @@
  *
  * Texture set: 39 numbered planet stickers (IMG_0314 … IMG_0352) in
  * public/textures. See public/textures/CREDITS.md.
+ *
+ * Two of those stickers (IMG_0327 brushstroke ring, IMG_0344 tendril ring)
+ * have hand-painted rings around their planet bodies. We load them as the
+ * canonical reference for what a ring should look like in this game and
+ * extract a body-removed ring-only texture from each, used by PlanetLayer
+ * to overlay on every planet rather than re-deriving the look procedurally.
  */
 import { Texture } from 'pixi.js';
 import { PHOTOGRAPHIC_ARCHETYPES, PROCEDURAL_ONLY, type PlanetArchetype } from './textures.js';
+
+export type RingOverlayStyle = 'brushstroke' | 'spiky';
+
+export interface RingOverlayInfo {
+  texture: Texture;
+  /** Source image edge length in pixels (square). */
+  srcSize: number;
+  /** Diameter of the body bbox in source pixels. */
+  bodyDiameter: number;
+  /** Body bbox center in source pixels. */
+  bodyCx: number;
+  bodyCy: number;
+}
+
+/**
+ * The two reference stickers whose painted rings we lift as overlay textures.
+ * IMG_0327 is the soft blue brushstroke Saturn ring; IMG_0344 is the teal
+ * thorny tendril. PlanetLayer applies one of these on every planet, tinted
+ * to the owner's palette.
+ */
+const RING_OVERLAY_SOURCES: Record<RingOverlayStyle, PlanetArchetype> = {
+  brushstroke: 'IMG_0327',
+  spiky: 'IMG_0344',
+};
+
+const ringOverlays = new Map<RingOverlayStyle, RingOverlayInfo>();
 
 /**
  * Source equirectangular maps for every archetype in the pool. Each archetype
@@ -55,9 +87,175 @@ export const loadPlanetAssets = (): Promise<void> => {
         sources.set(arch, { img, ...bounds });
       }),
     );
+
+    // After the body sources are loaded, lift the painted rings off the two
+    // reference stickers and store them as standalone overlay textures.
+    for (const [style, archetype] of Object.entries(RING_OVERLAY_SOURCES) as Array<
+      [RingOverlayStyle, PlanetArchetype]
+    >) {
+      const src = sources.get(archetype);
+      if (!src) continue;
+      ringOverlays.set(style, extractRingOverlay(src.img, src));
+    }
+
     bakedSourceCount = baked;
   })();
   return loadPromise;
+};
+
+/**
+ * Look up the runtime-baked ring overlay for a given style. Throws if
+ * loadPlanetAssets hasn't resolved yet — callers must gate on
+ * planetAssetsReady().
+ */
+export const getRingOverlay = (style: RingOverlayStyle): RingOverlayInfo => {
+  const hit = ringOverlays.get(style);
+  if (!hit) throw new Error(`Ring overlay '${style}' not loaded — call loadPlanetAssets() first.`);
+  return hit;
+};
+
+/**
+ * Lift the painted ring artwork off a sticker and return it as a Texture
+ * with the planet body cleared to alpha=0. The body silhouette is detected
+ * by colour-similarity floodfill from the bbox centre — the body has a tight
+ * cluster of related fill colours, the ring is a clearly different hue, and
+ * the heavy black outline between them stops the floodfill at the body's
+ * boundary. We then erode that outline by sweeping a few BFS layers outward
+ * from the floodfilled body region, but *only* into pixels whose luminance
+ * falls below a threshold, so the body's dark stroke is consumed without
+ * eating into the ring's mid-luminance teal/blue paint.
+ *
+ * Pieces of the ring that cross over the body face survive because their
+ * colour is far from the body seed colour — the floodfill stops at them as
+ * if they were an outline, and the dark-only outline expansion ignores them.
+ */
+const extractRingOverlay = (
+  img: HTMLImageElement,
+  body: { bx: number; by: number; bsize: number },
+): RingOverlayInfo => {
+  const W = img.naturalWidth;
+  const H = img.naturalHeight;
+  const canvas = document.createElement('canvas');
+  canvas.width = W;
+  canvas.height = H;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) throw new Error('2D context unavailable');
+  ctx.drawImage(img, 0, 0);
+  const imgData = ctx.getImageData(0, 0, W, H);
+  const data = imgData.data;
+
+  const bodyCx = body.bx + (body.bsize >> 1);
+  const bodyCy = body.by + (body.bsize >> 1);
+
+  // Sample a 5×5 block of pixels at the body centre and average them — picks
+  // up a stable seed colour even if the centre pixel happens to land on a
+  // surface-detail streak rather than the bulk body fill.
+  let sR = 0;
+  let sG = 0;
+  let sB = 0;
+  let sN = 0;
+  for (let dy = -2; dy <= 2; dy++) {
+    for (let dx = -2; dx <= 2; dx++) {
+      const x = bodyCx + dx;
+      const y = bodyCy + dy;
+      if (x < 0 || y < 0 || x >= W || y >= H) continue;
+      const idx = (y * W + x) * 4;
+      sR += data[idx];
+      sG += data[idx + 1];
+      sB += data[idx + 2];
+      sN++;
+    }
+  }
+  const seedR = sR / sN;
+  const seedG = sG / sN;
+  const seedB = sB / sN;
+
+  const total = W * H;
+  const isBody = new Uint8Array(total);
+  // Manhattan-distance threshold from seed colour. Calibrated for the two
+  // reference stickers' palettes (pink/magenta body vs blue ring; purple
+  // body vs teal ring) so the body fills cluster well below it and the ring
+  // hues sit safely above.
+  const COLOR_THRESHOLD = 140;
+
+  // Iterative BFS to avoid blowing the JS stack on large source images.
+  const stack: number[] = [];
+  const seedIdx = bodyCy * W + bodyCx;
+  isBody[seedIdx] = 1;
+  stack.push(seedIdx);
+  while (stack.length > 0) {
+    const p = stack.pop() as number;
+    const py = (p / W) | 0;
+    const px = p - py * W;
+    const left = px > 0 ? p - 1 : -1;
+    const right = px < W - 1 ? p + 1 : -1;
+    const up = py > 0 ? p - W : -1;
+    const down = py < H - 1 ? p + W : -1;
+    for (const n of [left, right, up, down]) {
+      if (n < 0 || isBody[n]) continue;
+      const nidx = n * 4;
+      if (data[nidx + 3] < 100) continue;
+      const dr = Math.abs(data[nidx] - seedR);
+      const dg = Math.abs(data[nidx + 1] - seedG);
+      const db = Math.abs(data[nidx + 2] - seedB);
+      if (dr + dg + db > COLOR_THRESHOLD) continue;
+      isBody[n] = 1;
+      stack.push(n);
+    }
+  }
+
+  // Walk a few BFS layers outward from the body region, marking only dark
+  // (low-luminance) pixels as part of the body's outline so we erase them.
+  // Mid-luminance ring paint is left untouched even if it sits adjacent to
+  // the body region.
+  const isOutline = new Uint8Array(total);
+  const OUTLINE_LUMINANCE_MAX = 110;
+  const OUTLINE_EXPAND_LAYERS = 6;
+  let frontier: number[] = [];
+  for (let i = 0; i < total; i++) if (isBody[i]) frontier.push(i);
+  for (let layer = 0; layer < OUTLINE_EXPAND_LAYERS; layer++) {
+    const next: number[] = [];
+    for (const p of frontier) {
+      const py = (p / W) | 0;
+      const px = p - py * W;
+      const candidates = [
+        px > 0 ? p - 1 : -1,
+        px < W - 1 ? p + 1 : -1,
+        py > 0 ? p - W : -1,
+        py < H - 1 ? p + W : -1,
+      ];
+      for (const n of candidates) {
+        if (n < 0 || isBody[n] || isOutline[n]) continue;
+        const nidx = n * 4;
+        const a = data[nidx + 3];
+        if (a < 60) continue;
+        const lum = (data[nidx] + data[nidx + 1] + data[nidx + 2]) / 3;
+        if (lum > OUTLINE_LUMINANCE_MAX) continue;
+        isOutline[n] = 1;
+        next.push(n);
+      }
+    }
+    if (next.length === 0) break;
+    frontier = next;
+  }
+
+  // Clear body + outline pixels to fully transparent. The remaining painted
+  // ring artwork (and any drop-shadow) is what we want as the overlay; the
+  // shadow is faint enough not to cause issues when composited on top of a
+  // new planet body.
+  for (let i = 0; i < total; i++) {
+    if (isBody[i] || isOutline[i]) data[i * 4 + 3] = 0;
+  }
+
+  ctx.putImageData(imgData, 0, 0);
+  const texture = Texture.from(canvas);
+  return {
+    texture,
+    srcSize: Math.min(W, H),
+    bodyDiameter: body.bsize,
+    bodyCx,
+    bodyCy,
+  };
 };
 
 let bakedSourceCount = 0;

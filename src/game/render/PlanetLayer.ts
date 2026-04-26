@@ -1,19 +1,17 @@
-import { Application, Container, Graphics, MeshRope, Point, type RopeGeometry, Sprite, Texture } from 'pixi.js';
-import { adjustColor, hueJitter, paletteFor, toward } from '../../util/color.js';
+import { Application, Container, Graphics, Sprite } from 'pixi.js';
+import type { Texture } from 'pixi.js';
+import { adjustColor, hueJitter, paletteFor } from '../../util/color.js';
 import { RING_CAPACITY_FOR_SIZE, type PlanetType } from '../sim/Planet.js';
 import type { World } from '../sim/World.js';
 import {
   assignPlanetArchetypes,
   bakedBodyDiameter,
-  makeBrushStrokeTexture,
   makePlanetBodyTexture,
   makePlanetHaloTexture,
   makeShipGlowTexture,
   makeShipTexture,
-  makeSpikeTexture,
-  makeTendrilBodyTexture,
 } from './textures.js';
-import { planetAssetsReady } from './planetAssets.js';
+import { getRingOverlay, planetAssetsReady, type RingOverlayStyle } from './planetAssets.js';
 
 /**
  * Upper bound on atom-electron sprites per planet. Bigger planets get more
@@ -133,68 +131,26 @@ interface Orbiter {
   birthAngle: number;
 }
 
-/** How many sample points each `MeshRope` uses along its arc. */
-const ROPE_SAMPLES = 36;
-/** Pool slack: max extra points needed for depth-zero boundary insertions. */
-const ROPE_POOL_SLACK = 6;
-
 /**
- * One painterly brush stroke wrapping (part of) the ring. `back` and `front`
- * are two `MeshRope` instances sharing the same brush texture but each
- * receiving only the points whose depth puts them behind / in front of the
- * planet body. The two ropes' point counts can vary every frame as spin
- * advances, so each rope keeps a fixed-size point pool of `ROPE_SAMPLES + 2`
- * (room for both depth-zero crossings) and an `activeBack` / `activeFront`
- * count clamping how many of those points are currently in use.
+ * One painted ring overlay slot for a planet — the artwork lifted from
+ * IMG_0327 (brushstroke) or IMG_0344 (tendril) by planetAssets, rendered as
+ * a pair of sprites split around the body sprite so the overlay reads as
+ * "in front of the body" without needing a mask. Both sprites share the
+ * same texture; the per-slot scale + rotation is recomputed each frame.
+ *
+ * `back` is parented under the planet's `ringsBack` container so it draws
+ * before the body sprite (the rim of the ring that orbits behind the world);
+ * `front` is parented under `ringsFront` and draws after the body (the rim
+ * crossing in front). The painted overlay's natural front/back composition
+ * already handles the visual occlusion — duplicating it across both layers
+ * gives the same painted strokes a consistent silhouette regardless of where
+ * the body lands in the Z order.
  */
-interface StrokeRope {
-  /** Visual role — drives which tint the updater applies each frame. */
-  kind: 'base' | 'accent' | 'body';
-  /** Local arc start angle (radians, before spin). */
-  startTheta: number;
-  /** Arc length in radians. */
-  length: number;
-  /** Radial offset of the rope's centre from `rMid`, in fractions of ringWidth. */
-  radialOffset: number;
-  /** Half-width of the rope, in fractions of ringWidth. */
-  halfWidth: number;
-  /** Whether to taper width to zero at the ends (false for closed loops). */
-  taperEnds: boolean;
-  back: MeshRope;
-  front: MeshRope;
-  /** Mutable point pools updated each frame in place. */
-  backPoints: Point[];
-  frontPoints: Point[];
-}
-
-/**
- * One outward-pointing spike sprite for the spiky-tendril ring style. The
- * sprite's anchor is at the base centre so it can be rotated to follow the
- * outward normal at its root angle.
- */
-interface SpikeStamp {
-  /** Local angle on the ring (radians, before spin). */
-  theta: number;
-  /** Multiplier of the planet's per-ring base spike length. */
-  lengthFactor: number;
-  /** Multiplier of the per-ring base spike width. */
-  widthFactor: number;
-  /** Whether this spike uses the accent tint (lighter glint). */
-  accent: boolean;
-  /** Rendered sprite — re-parented between back/front each frame. */
-  sprite: Sprite;
-}
-
-/**
- * Per-ring-slot pool of textured ring geometry. Style-specific layout is
- * picked once at planet init (the planet's `ringStyle[k]`); after that we
- * just animate the existing pool. `body`, when present, is a closed-loop
- * rope used as the spiky-tendril ring's solid backbone.
- */
-interface RingPool {
-  strokes: StrokeRope[];
-  spikes: SpikeStamp[];
-  body?: StrokeRope;
+interface RingOverlay {
+  back: Sprite;
+  front: Sprite;
+  /** Random ±1 horizontal flip baked at construction so identical archetypes don't all face the same direction. */
+  flip: number;
 }
 
 interface PlanetView {
@@ -204,20 +160,20 @@ interface PlanetView {
   body: Sprite;
   ring: Graphics;
   /**
-   * Capacity rings split into two layers so the textured brush strokes look
-   * like they orbit the planet in 3D — geometry whose depth puts it behind
-   * the body lives under `ringsBack` (rendered before the body), in-front
-   * geometry lives under `ringsFront` (rendered after). Each container holds
-   * `MeshRope` instances per stroke plus a `Graphics` overlay for the
-   * progress beads.
+   * Painted ring overlay split across a back/front layer pair — the back
+   * sprite is parented before the body so the painted strokes that fall
+   * outside the planet silhouette read as orbiting behind it; the front
+   * sprite is parented after the body so the painted strokes crossing the
+   * planet face composite over the body. Both share the same overlay
+   * texture lifted from IMG_0327 / IMG_0344 by planetAssets.
    */
   ringsBack: Container;
   ringsFront: Container;
-  /** Bead overlays drawn on top of the ropes inside each layer. */
+  /** Capacity-progress bead glow drawn on top of the overlay in each layer. */
   ringBeadsBack: Graphics;
   ringBeadsFront: Graphics;
-  /** Per-ring-slot stroke + spike pool, allocated lazily per ringStyle. */
-  ringPools: RingPool[];
+  /** Per-ring-slot painted overlay sprite pair. */
+  ringOverlays: RingOverlay[];
   atomPaths: Graphics; // faint orbit ellipses that the electrons follow
   shockwave: Graphics;
   /** Subtle strength bar beneath the planet — visual stand-in for garrison. */
@@ -274,7 +230,7 @@ interface PlanetView {
    * because it's derived from the planet id, so a given world's rings never
    * "swap looks" between frames.
    */
-  ringStyle: Array<'brushstroke' | 'spiky'>;
+  ringStyle: RingOverlayStyle[];
 }
 
 export class PlanetLayer extends Container {
@@ -284,9 +240,6 @@ export class PlanetLayer extends Container {
   private selectedSources = new Set<number>();
   private shipTex: Texture;
   private shipGlowTex: Texture;
-  private brushTex: Texture;
-  private tendrilBodyTex: Texture;
-  private spikeTex: Texture;
   private time = 0;
 
   constructor(app: Application, world: World) {
@@ -295,9 +248,6 @@ export class PlanetLayer extends Container {
     this.world = world;
     this.shipTex = makeShipTexture(app);
     this.shipGlowTex = makeShipGlowTexture(app);
-    this.brushTex = makeBrushStrokeTexture(app);
-    this.tendrilBodyTex = makeTendrilBodyTexture(app);
-    this.spikeTex = makeSpikeTexture(app);
 
     // Assign every planet a distinct archetype from the pool before baking
     // any body textures, so no two worlds in the same match share a surface.
@@ -363,12 +313,13 @@ export class PlanetLayer extends Container {
       const speedPick = (k: number): number =>
         (0.18 + seeded(tiltSeed + k * 23 + 3) * 0.18) *
         (Math.random() < 0.5 ? -1 : 1);
-      const stylePick = (k: number): 'brushstroke' | 'spiky' =>
+      const stylePick = (k: number): RingOverlayStyle =>
         seeded(tiltSeed + k * 29 + 41) < 0.5 ? 'brushstroke' : 'spiky';
-      const ringStyles: Array<'brushstroke' | 'spiky'> = [stylePick(0), stylePick(1)];
-      const ringPools: RingPool[] = [
-        this.buildRingPool(ringStyles[0], planet.id * 13 + 0, ringsBack, ringsFront),
-        this.buildRingPool(ringStyles[1], planet.id * 13 + 1, ringsBack, ringsFront),
+      const ringStyles: RingOverlayStyle[] = [stylePick(0), stylePick(1), stylePick(2)];
+      const ringOverlays: RingOverlay[] = [
+        buildRingOverlay(ringStyles[0], planet.id * 13 + 0, ringsBack, ringsFront),
+        buildRingOverlay(ringStyles[1], planet.id * 13 + 1, ringsBack, ringsFront),
+        buildRingOverlay(ringStyles[2], planet.id * 13 + 2, ringsBack, ringsFront),
       ];
       this.views.push({
         planetId: planet.id,
@@ -380,7 +331,7 @@ export class PlanetLayer extends Container {
         ringsFront,
         ringBeadsBack,
         ringBeadsFront,
-        ringPools,
+        ringOverlays,
         atomPaths,
         shockwave,
         strengthBar,
@@ -503,22 +454,24 @@ export class PlanetLayer extends Container {
       // 1.0 it overflows into a pulsing "saturated" glow).
       this.drawStrengthBar(v, p.garrison, p.maxUnitCapacity, effRadius, pal, p.owner, dt);
 
-      // Capacity rings: wispy gas-cloud strands wrapping the planet, drawn
-      // Capacity rings: textured brush strokes / dragon-spine tendrils
-      // wrapping the planet, split across a back/front layer pair so the
-      // ring visibly orbits the body in 3D. Each ring's tilt + spin phase
-      // live on the planet view; we advance the spin every tick so the
-      // ropes flow continuously around the world. The bead overlays are the
-      // only thing redrawn through Graphics — the ropes/spikes are textured
-      // sprite/mesh objects whose transforms we just update each frame.
+      // Capacity rings: hand-painted overlay sprites lifted from the
+      // reference stickers (IMG_0327 brushstroke, IMG_0344 tendril), one
+      // pair per ring slot, tinted to the owner palette. Sprites are split
+      // across a back/front layer so painted strokes that should orbit
+      // behind the body draw before it and strokes crossing the planet
+      // face draw after. Capacity progress reads via the bead glow on top.
       v.ringBeadsBack.clear();
       v.ringBeadsFront.clear();
       const RING_WIDTH = Math.max(4, v.baseRadius * 0.35);
       const RING_GAP = Math.max(3, v.baseRadius * 0.12);
       const RING_INSET = Math.max(6, v.baseRadius * 0.22);
-      // Hide every rope/spike by default; the active ring slots will reveal
-      // (and update) their own pool entries below.
-      for (let k = 0; k < v.ringPools.length; k++) hideRingPool(v.ringPools[k]);
+      // Hide every overlay sprite by default; active ring slots reveal
+      // their own below so a planet that loses ring slots stops drawing
+      // stale art.
+      for (const overlay of v.ringOverlays) {
+        overlay.back.visible = false;
+        overlay.front.visible = false;
+      }
 
       if (p.ringCount > 0) {
         const cap = RING_CAPACITY_FOR_SIZE[p.type];
@@ -538,33 +491,30 @@ export class PlanetLayer extends Container {
 
           v.capRingSpin[k] += (v.capRingSpinSpeed[k] ?? 0.25) * dt;
 
-          // Two-tone colours per ring: a darker base + a lighter accent,
-          // both jittered per planet so two worlds owned by the same player
-          // feel individually distinct without losing their owner-colour
-          // identity.
+          // Owner-tinted overlay. The brushstroke artwork is already light
+          // blue, so pal.ring (a saturated owner hue) reads cleanly when
+          // multiplied. The tendril artwork is a darker teal, so we darken
+          // the owner ring colour slightly so its tendril stays as a
+          // contrast accent rather than washing out against the body.
+          const style = v.ringStyle[k] ?? 'brushstroke';
           const jitterSeed = p.id * 73 + k * 19;
-          const baseColor = adjustColor(
-            hueJitter(pal.ring, jitterSeed, 0.18),
-            0.55,
-          );
-          const accentColor = toward(
-            hueJitter(pal.ring, jitterSeed + 11, 0.18),
-            0xffffff,
-            0.4,
-          );
+          const tint =
+            style === 'spiky'
+              ? adjustColor(hueJitter(pal.ring, jitterSeed, 0.18), 0.55)
+              : hueJitter(pal.ring, jitterSeed, 0.18);
 
-          updateRingPool(
-            v.ringPools[k],
-            v.ringsBack,
-            v.ringsFront,
-            rMid,
-            RING_WIDTH,
-            baseColor,
-            accentColor,
-            v.capRingTilt[k] ?? 0.6,
-            v.capRingYaw[k] ?? 0,
-            v.capRingSpin[k] ?? 0,
-          );
+          if (k < v.ringOverlays.length) {
+            updateRingOverlay(
+              v.ringOverlays[k],
+              style,
+              effRadius,
+              rMid,
+              tint,
+              v.capRingTilt[k] ?? 0.6,
+              v.capRingYaw[k] ?? 0,
+              v.capRingSpin[k] ?? 0,
+            );
+          }
 
           drawFillBeads(
             v.ringBeadsBack,
@@ -990,114 +940,52 @@ export class PlanetLayer extends Container {
     v.orbiters.length = 0;
   }
 
-  /**
-   * Allocate the textured rope/spike pool for one ring slot. Style is fixed
-   * for the lifetime of the planet so we just create everything up-front and
-   * later toggle visibility based on whether the slot is active. The ropes
-   * start parented to `ringsFront`; each frame the updater re-parents each
-   * rope/spike to the correct (back/front) container based on its midpoint
-   * depth.
-   */
-  private buildRingPool(
-    style: 'brushstroke' | 'spiky',
-    seed: number,
-    ringsBack: Container,
-    ringsFront: Container,
-  ): RingPool {
-    const strokes: StrokeRope[] = [];
-    const spikes: SpikeStamp[] = [];
-    let body: StrokeRope | undefined;
-
-    const makeStroke = (
-      kind: 'base' | 'accent' | 'body',
-      texture: Texture,
-      startTheta: number,
-      length: number,
-      radialOffset: number,
-      halfWidth: number,
-      taperEnds: boolean,
-    ): StrokeRope => {
-      const backPoints: Point[] = [];
-      const frontPoints: Point[] = [];
-      for (let i = 0; i < ROPE_SAMPLES + ROPE_POOL_SLACK; i++) {
-        backPoints.push(new Point(0, 0));
-        frontPoints.push(new Point(0, 0));
-      }
-      const back = new MeshRope({ texture, points: backPoints });
-      const front = new MeshRope({ texture, points: frontPoints });
-      back.visible = false;
-      front.visible = false;
-      ringsBack.addChild(back);
-      ringsFront.addChild(front);
-      return {
-        kind,
-        startTheta,
-        length,
-        radialOffset,
-        halfWidth,
-        taperEnds,
-        back,
-        front,
-        backPoints,
-        frontPoints,
-      };
-    };
-
-    if (style === 'brushstroke') {
-      const BASE_STROKES = 2;
-      for (let s = 0; s < BASE_STROKES; s++) {
-        const sSeed = seed * 41 + s * 13 + 3;
-        const startTheta =
-          (s / BASE_STROKES) * Math.PI * 2 + (seeded(sSeed) - 0.5) * 0.6;
-        const length = 1.6 + seeded(sSeed * 7) * 0.8;
-        const halfWidth = 0.42 + seeded(sSeed * 11) * 0.18;
-        const radialOffset = (seeded(sSeed * 17) - 0.5) * 0.32;
-        strokes.push(
-          makeStroke('base', this.brushTex, startTheta, length, radialOffset, halfWidth, true),
-        );
-      }
-      const ACCENT_STROKES = 4;
-      for (let s = 0; s < ACCENT_STROKES; s++) {
-        const sSeed = seed * 53 + s * 17 + 11;
-        const startTheta =
-          (s / ACCENT_STROKES) * Math.PI * 2 + (seeded(sSeed) - 0.5) * 0.7;
-        const length = 0.7 + seeded(sSeed * 7) * 0.9;
-        const halfWidth = 0.26 + seeded(sSeed * 11) * 0.14;
-        const radialOffset = (seeded(sSeed * 17) - 0.5) * 0.44;
-        strokes.push(
-          makeStroke('accent', this.brushTex, startTheta, length, radialOffset, halfWidth, true),
-        );
-      }
-    } else {
-      // Spiky tendril: one solid body rope wrapping the full ellipse plus
-      // an array of triangular spike sprites along its outer edge.
-      body = makeStroke('body', this.tendrilBodyTex, 0, Math.PI * 2, 0, 0.22, false);
-      const SPIKE_COUNT = 56;
-      for (let i = 0; i < SPIKE_COUNT; i++) {
-        // Skip ~22% of slots so the silhouette reads as an irregular
-        // dragon-spine rather than a uniform comb.
-        if (seeded(seed * 23 + i * 7) < 0.22) continue;
-        const lengthFactor = 0.55 + seeded(seed * 31 + i * 11) * 0.7;
-        const widthFactor = 0.92 + seeded(seed * 37 + i * 13) * 0.32;
-        const accent = i % 3 === 0;
-        const sprite = new Sprite(this.spikeTex);
-        sprite.anchor.set(0.5, 1); // base centre — rotation pivots the tip
-        sprite.tint = 0xffffff;
-        sprite.visible = false;
-        ringsFront.addChild(sprite);
-        spikes.push({
-          theta: (i / SPIKE_COUNT) * Math.PI * 2,
-          lengthFactor,
-          widthFactor,
-          accent,
-          sprite,
-        });
-      }
-    }
-
-    return { strokes, spikes, body };
-  }
 }
+
+/**
+ * Allocate one painted-overlay sprite pair for a single ring slot. The pair
+ * shares the same texture lifted off the reference sticker by planetAssets;
+ * the back sprite is parented under `ringsBack` (drawn before the body),
+ * the front sprite under `ringsFront` (drawn after). Both stay invisible
+ * until `updateRingOverlay` reveals them when the planet has at least
+ * `k+1` ring slots active.
+ *
+ * Each pair gets a deterministic 50% horizontal flip baked at construction
+ * so two same-style ring slots on the same planet (or different planets
+ * that happened to land on the same archetype) don't all face the same
+ * direction.
+ */
+const buildRingOverlay = (
+  style: RingOverlayStyle,
+  seed: number,
+  ringsBack: Container,
+  ringsFront: Container,
+): RingOverlay => {
+  const overlay = planetAssetsReady() ? getRingOverlay(style) : null;
+  const tex = overlay?.texture;
+  const back = new Sprite(tex ?? undefined);
+  const front = new Sprite(tex ?? undefined);
+  // Anchor the body centre of the source artwork at the sprite origin so
+  // scaling around (0, 0) keeps the painted body footprint locked to the
+  // planet centre. Falls back to (0.5, 0.5) if the overlay isn't ready yet
+  // (the sprite stays invisible in that case anyway).
+  if (overlay) {
+    back.anchor.set(overlay.bodyCx / tex!.width, overlay.bodyCy / tex!.height);
+    front.anchor.set(overlay.bodyCx / tex!.width, overlay.bodyCy / tex!.height);
+  } else {
+    back.anchor.set(0.5);
+    front.anchor.set(0.5);
+  }
+  back.visible = false;
+  front.visible = false;
+  ringsBack.addChild(back);
+  ringsFront.addChild(front);
+  return {
+    back,
+    front,
+    flip: seeded(seed * 31 + 7) < 0.5 ? -1 : 1,
+  };
+};
 
 /**
  * Deterministic hash → [0, 1). Keeps each planet's ring pattern identical
@@ -1174,218 +1062,61 @@ const drawFillBeads = (
 };
 
 /**
- * Hide every rope and spike in a pool. Called each frame before the active
- * ring slots reveal their own pool entries — anything not actively shown
- * stays hidden, so a planet whose ringCount drops doesn't keep rendering
- * stale geometry.
+ * Position, scale, rotate and tint the painted overlay sprite pair for one
+ * ring slot. Both back/front sprites share identical transforms — having
+ * the same artwork parented under both layers ensures the overlay survives
+ * regardless of whether the body lands above or below it in the local Z
+ * order. The `effRadius`/`rMid` ratio determines how far outward (relative
+ * to the planet body) the painted ring rests; for stacked ring slots
+ * (`k > 0`) `rMid` is larger so the overlay scales up and the painted ring
+ * sits further out, matching the gameplay-defined ring spacing.
  */
-const hideRingPool = (pool: RingPool): void => {
-  for (const s of pool.strokes) {
-    s.back.visible = false;
-    s.front.visible = false;
-  }
-  if (pool.body) {
-    pool.body.back.visible = false;
-    pool.body.front.visible = false;
-  }
-  for (const sp of pool.spikes) sp.sprite.visible = false;
-};
-
-/**
- * Move a point pool entry to coordinates `(x, y)` without allocating. Used
- * by `setRopePoints` to repopulate the existing `Point[]` instances each
- * frame — `MeshRope` watches the array contents and re-triangulates on its
- * own when `autoUpdate` is true.
- */
-const setPt = (points: Point[], i: number, x: number, y: number): void => {
-  points[i].x = x;
-  points[i].y = y;
-};
-
-/**
- * Sample `samples` evenly-spaced points along the rope's arc and split them
- * into two sequences based on depth sign — front-half points (depth ≥ 0) go
- * into the front rope, back-half points into the back rope, with linearly
- * interpolated boundary points at every depth-zero crossing so neither rope
- * has a visible seam where the band re-emerges from behind the planet.
- *
- * The rope's vertical thickness is whatever the texture's natural height
- * is; we don't try to vary width per-point. End-tapering for brush strokes
- * is baked into the texture itself.
- *
- * Both rope point pools have ROPE_SAMPLES + 2 slots; unused slots are
- * collapsed onto the last active point so the rope's tail doesn't smear off
- * to the origin. `autoUpdate` does the rest.
- */
-const setRopePoints = (
-  rope: StrokeRope,
+const updateRingOverlay = (
+  overlay: RingOverlay,
+  style: RingOverlayStyle,
+  effRadius: number,
   rMid: number,
-  ringWidth: number,
-  spin: number,
-  sinT: number,
-  cosT: number,
-  cosY: number,
-  sinY: number,
-): void => {
-  const r = rMid + rope.radialOffset * ringWidth;
-  const samples = ROPE_SAMPLES;
-  // Sample positions and depths along the arc.
-  type Sample = { x: number; y: number; depth: number };
-  const samplesArr: Sample[] = [];
-  for (let i = 0; i <= samples; i++) {
-    const t = i / samples;
-    const a = rope.startTheta + rope.length * t + spin;
-    const p = projectRing(a, r, sinT, cosT, cosY, sinY);
-    samplesArr.push({ x: p.x, y: p.y, depth: p.depth });
-  }
-
-  const backPts: Sample[] = [];
-  const frontPts: Sample[] = [];
-  for (let i = 0; i < samplesArr.length; i++) {
-    const cur = samplesArr[i];
-    const target = cur.depth >= 0 ? frontPts : backPts;
-    target.push(cur);
-    // At every depth-zero crossing, push an interpolated point onto BOTH
-    // sides so neither rope has a visible gap at the planet's silhouette.
-    if (i + 1 < samplesArr.length) {
-      const nxt = samplesArr[i + 1];
-      if ((cur.depth >= 0) !== (nxt.depth >= 0)) {
-        const t = cur.depth / (cur.depth - nxt.depth);
-        const xi = cur.x + (nxt.x - cur.x) * t;
-        const yi = cur.y + (nxt.y - cur.y) * t;
-        const cross: Sample = { x: xi, y: yi, depth: 0 };
-        backPts.push(cross);
-        frontPts.push({ ...cross });
-      }
-    }
-  }
-
-  // A MeshRope needs at least 2 points and breaks on coincident neighbours.
-  // If a side is empty or has only one point, hide that rope and skip
-  // updating its points (they retain their last-frame values, which is
-  // harmless when invisible).
-  if (frontPts.length >= 2) {
-    rope.front.visible = true;
-    writeRopePoints(rope.frontPoints, frontPts);
-  } else {
-    rope.front.visible = false;
-  }
-  if (backPts.length >= 2) {
-    rope.back.visible = true;
-    writeRopePoints(rope.backPoints, backPts);
-  } else {
-    rope.back.visible = false;
-  }
-  // Rope thickness comes from RopeGeometry._width — set it per-frame so
-  // the brush band matches `ringWidth * 2 * halfWidth`. We mutate the
-  // internal field directly because the public getter is read-only and the
-  // alternative (scale.y) would also scale the path coordinates and warp
-  // the ellipse off-axis. `update()` refreshes vertices on the GPU.
-  const desiredWidth = ringWidth * rope.halfWidth * 2;
-  setRopeWidth(rope.front.geometry as RopeGeometry, desiredWidth);
-  setRopeWidth(rope.back.geometry as RopeGeometry, desiredWidth);
-};
-
-const setRopeWidth = (geom: RopeGeometry, width: number): void => {
-  if (geom._width === width) return;
-  geom._width = width;
-  geom.update();
-};
-
-/**
- * Repopulate a fixed-size point pool with `pts.length` real points and pin
- * the rest onto the final point so the rope's tail doesn't smear off-screen.
- * Mutates `pool` in place — never reallocates.
- */
-const writeRopePoints = (pool: Point[], pts: Array<{ x: number; y: number }>): void => {
-  const n = Math.min(pts.length, pool.length);
-  for (let i = 0; i < n; i++) setPt(pool, i, pts[i].x, pts[i].y);
-  const lastX = pts[n - 1].x;
-  const lastY = pts[n - 1].y;
-  for (let i = n; i < pool.length; i++) setPt(pool, i, lastX, lastY);
-};
-
-/**
- * Drive the rope point arrays and spike sprite transforms for one ring slot
- * each frame. Tints are re-applied because owner colour can change on
- * capture; depth-based back/front re-parenting is done per spike.
- */
-const updateRingPool = (
-  pool: RingPool,
-  ringsBack: Container,
-  ringsFront: Container,
-  rMid: number,
-  ringWidth: number,
-  baseColor: number,
-  accentColor: number,
+  tint: number,
   tilt: number,
   yaw: number,
   spin: number,
 ): void => {
-  const sinT = Math.sin(tilt);
-  const cosT = Math.cos(tilt);
-  const cosY = Math.cos(yaw);
-  const sinY = Math.sin(yaw);
-
-  // Order strokes back-to-front by kind so accents always paint over the
-  // base layer. We don't reorder children here (Pixi keeps insertion order)
-  // because buildRingPool already pushed bases first, then accents.
-  for (const s of pool.strokes) {
-    const tint = s.kind === 'accent' ? accentColor : baseColor;
-    s.back.tint = tint;
-    s.front.tint = tint;
-    setRopePoints(s, rMid, ringWidth, spin, sinT, cosT, cosY, sinY);
+  if (!planetAssetsReady()) {
+    overlay.back.visible = false;
+    overlay.front.visible = false;
+    return;
+  }
+  const info = getRingOverlay(style);
+  // Refresh texture/anchor on first reveal — buildRingOverlay may have run
+  // before assets finished loading, in which case the sprites were created
+  // with a placeholder texture.
+  if (overlay.back.texture !== info.texture) {
+    overlay.back.texture = info.texture;
+    overlay.front.texture = info.texture;
+    overlay.back.anchor.set(info.bodyCx / info.texture.width, info.bodyCy / info.texture.height);
+    overlay.front.anchor.set(info.bodyCx / info.texture.width, info.bodyCy / info.texture.height);
   }
 
-  if (pool.body) {
-    pool.body.back.tint = baseColor;
-    pool.body.front.tint = baseColor;
-    setRopePoints(pool.body, rMid, ringWidth, spin, sinT, cosT, cosY, sinY);
-  }
+  // Scale so the body cut-out region in the source matches the planet's
+  // current effective radius. With this scale the painted ring naturally
+  // lands at its source-art radius from the body centre, then we expand by
+  // `rMid / effRadius` to push the painted ring outward proportionally to
+  // the gameplay-defined ring radius for this slot — ring slot 1 sits
+  // wider than slot 0, slot 2 wider still.
+  const baseScale = (2 * effRadius) / info.bodyDiameter;
+  const radialScale = rMid / Math.max(1, effRadius);
+  const scale = baseScale * radialScale;
+  // Tilt is a mild vertical squash so the ring reads as a flattened orbit
+  // rather than a perfect circle. Subtle — the painted artwork already
+  // has its own perspective baked in, so we don't squash too aggressively.
+  const verticalSquash = 0.78 + 0.18 * Math.cos(tilt);
 
-  // Spike sprites — for each spike, project its root angle, derive the
-  // outward normal from a tangent estimate, and position/rotate/scale the
-  // sprite. Re-parent to the depth-appropriate container so the sprite
-  // really gets occluded by the body when behind the planet.
-  for (const sp of pool.spikes) {
-    const a = sp.theta + spin;
-    const dTheta = 0.05;
-    const pPrev = projectRing(a - dTheta, rMid, sinT, cosT, cosY, sinY);
-    const pNext = projectRing(a + dTheta, rMid, sinT, cosT, cosY, sinY);
-    const pMid = projectRing(a, rMid + ringWidth * 0.18, sinT, cosT, cosY, sinY);
-    const tx = pNext.x - pPrev.x;
-    const ty = pNext.y - pPrev.y;
-    const tLen = Math.hypot(tx, ty) || 1;
-    const tnx = tx / tLen;
-    const tny = ty / tLen;
-    let nx = -tny;
-    let ny = tnx;
-    if (nx * pMid.x + ny * pMid.y < 0) {
-      nx = -nx;
-      ny = -ny;
-    }
-    const sprite = sp.sprite;
+  for (const sprite of [overlay.back, overlay.front]) {
     sprite.visible = true;
-    sprite.x = pMid.x;
-    sprite.y = pMid.y;
-    // Sprite texture's tip points up (−y); with anchor at (0.5, 1) and the
-    // Pixi rotation matrix [cos −sin / sin cos], the tip lands at offset
-    // (H sin θ, −H cos θ) — solving for that to align with (nx, ny) gives
-    // θ = atan2(ny, nx) + π/2, so the spike grows outward along the normal.
-    sprite.rotation = Math.atan2(ny, nx) + Math.PI / 2;
-    const spikeLen = ringWidth * sp.lengthFactor;
-    const spikeWidth = ringWidth * 0.32 * sp.widthFactor;
-    sprite.scale.set(
-      spikeWidth / sprite.texture.width,
-      spikeLen / sprite.texture.height,
-    );
-    sprite.tint = sp.accent ? accentColor : baseColor;
-
-    // Re-parent based on depth at the spike root.
-    const desired = pMid.depth >= 0 ? ringsFront : ringsBack;
-    if (sprite.parent !== desired) {
-      sprite.parent?.removeChild(sprite);
-      desired.addChild(sprite);
-    }
+    sprite.tint = tint;
+    sprite.rotation = yaw + spin;
+    sprite.scale.set(scale * overlay.flip, scale * verticalSquash);
+    sprite.x = 0;
+    sprite.y = 0;
   }
 };

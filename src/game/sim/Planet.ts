@@ -50,6 +50,18 @@ export const RING_CAPACITY_FOR_SIZE: Record<PlanetType, number> = {
   3: 0, // XXL is terminal.
 };
 
+/**
+ * Per-ring difficulty multiplier — the second ring on a planet costs more
+ * units than the first, so two-ring worlds are a meaningful long-term
+ * investment that the opponent has time to contest. Index 0 is the inner
+ * ring, index 1 the outer.
+ */
+export const RING_CAPACITY_MULT: number[] = [1.0, 1.6];
+
+/** Absorbed-unit cost for a specific ring slot on a planet of the given size. */
+export const ringCapacity = (type: PlanetType, ringIdx: number): number =>
+  RING_CAPACITY_FOR_SIZE[type] * (RING_CAPACITY_MULT[ringIdx] ?? 1.0);
+
 /** Max ring count the size is allowed to author. */
 export const MAX_RING_COUNT: Record<PlanetType, RingCount> = {
   0: 1,
@@ -109,12 +121,11 @@ export interface Planet {
   vy: number;
 }
 
-/** True when the planet has rings and every one is at capacity. */
+/** True when the planet has rings and every one is at its per-slot capacity. */
 export const ringsComplete = (planet: Planet): boolean => {
   if (planet.ringCount === 0) return false;
-  const cap = RING_CAPACITY_FOR_SIZE[planet.type];
   for (let i = 0; i < planet.ringCount; i++) {
-    if ((planet.ringFillProgress[i] ?? 0) < cap) return false;
+    if ((planet.ringFillProgress[i] ?? 0) < ringCapacity(planet.type, i)) return false;
   }
   return true;
 };

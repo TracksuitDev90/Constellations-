@@ -1,7 +1,7 @@
 import { Application, Container, Graphics, Sprite } from 'pixi.js';
 import type { Texture } from 'pixi.js';
 import { adjustColor, hueJitter, paletteFor } from '../../util/color.js';
-import { RING_CAPACITY_FOR_SIZE, type PlanetType } from '../sim/Planet.js';
+import { ringCapacity, type PlanetType } from '../sim/Planet.js';
 import type { World } from '../sim/World.js';
 import {
   assignPlanetArchetypes,
@@ -11,7 +11,7 @@ import {
   makeShipGlowTexture,
   makeShipTexture,
 } from './textures.js';
-import { getRingOverlay, planetAssetsReady, type RingOverlayStyle } from './planetAssets.js';
+import { planetAssetsReady } from './planetAssets.js';
 
 /**
  * Upper bound on atom-electron sprites per planet. Bigger planets get more
@@ -131,28 +131,6 @@ interface Orbiter {
   birthAngle: number;
 }
 
-/**
- * One painted ring overlay slot for a planet — the artwork lifted from
- * IMG_0327 (brushstroke) or IMG_0344 (tendril) by planetAssets, rendered as
- * a pair of sprites split around the body sprite so the overlay reads as
- * "in front of the body" without needing a mask. Both sprites share the
- * same texture; the per-slot scale + rotation is recomputed each frame.
- *
- * `back` is parented under the planet's `ringsBack` container so it draws
- * before the body sprite (the rim of the ring that orbits behind the world);
- * `front` is parented under `ringsFront` and draws after the body (the rim
- * crossing in front). The painted overlay's natural front/back composition
- * already handles the visual occlusion — duplicating it across both layers
- * gives the same painted strokes a consistent silhouette regardless of where
- * the body lands in the Z order.
- */
-interface RingOverlay {
-  back: Sprite;
-  front: Sprite;
-  /** Random ±1 horizontal flip baked at construction so identical archetypes don't all face the same direction. */
-  flip: number;
-}
-
 interface PlanetView {
   planetId: number;
   container: Container;
@@ -160,20 +138,14 @@ interface PlanetView {
   body: Sprite;
   ring: Graphics;
   /**
-   * Painted ring overlay split across a back/front layer pair — the back
-   * sprite is parented before the body so the painted strokes that fall
-   * outside the planet silhouette read as orbiting behind it; the front
-   * sprite is parented after the body so the painted strokes crossing the
-   * planet face composite over the body. Both share the same overlay
-   * texture lifted from IMG_0327 / IMG_0344 by planetAssets.
+   * Capacity-ring strokes split across two Graphics so the rear half of each
+   * tilted ring draws before the body sprite (occluded behind the world) and
+   * the front half draws after, giving each ring a 3D orbit silhouette. The
+   * leading-edge fill beads share the same Graphics so progress reads at the
+   * same depth as the painted stroke.
    */
-  ringsBack: Container;
-  ringsFront: Container;
-  /** Capacity-progress bead glow drawn on top of the overlay in each layer. */
-  ringBeadsBack: Graphics;
-  ringBeadsFront: Graphics;
-  /** Per-ring-slot painted overlay sprite pair. */
-  ringOverlays: RingOverlay[];
+  ringsBack: Graphics;
+  ringsFront: Graphics;
   atomPaths: Graphics; // faint orbit ellipses that the electrons follow
   shockwave: Graphics;
   /** Subtle strength bar beneath the planet — visual stand-in for garrison. */
@@ -225,12 +197,6 @@ interface PlanetView {
   capRingSpin: number[];
   /** Per-ring rotation speed (rad/sec). Slight variance keeps stacked rings independent. */
   capRingSpinSpeed: number[];
-  /**
-   * Visual style picked per capacity ring slot. Stable across re-renders
-   * because it's derived from the planet id, so a given world's rings never
-   * "swap looks" between frames.
-   */
-  ringStyle: RingOverlayStyle[];
 }
 
 export class PlanetLayer extends Container {
@@ -272,12 +238,8 @@ export class PlanetLayer extends Container {
       body.anchor.set(0.5);
 
       const ring = new Graphics();
-      const ringsBack = new Container();
-      const ringsFront = new Container();
-      const ringBeadsBack = new Graphics();
-      const ringBeadsFront = new Graphics();
-      ringsBack.addChild(ringBeadsBack);
-      ringsFront.addChild(ringBeadsFront);
+      const ringsBack = new Graphics();
+      const ringsFront = new Graphics();
       const atomPaths = new Graphics();
       const shockwave = new Graphics();
       const strengthBar = new Graphics();
@@ -285,9 +247,9 @@ export class PlanetLayer extends Container {
 
       const orbitRoot = new Container();
 
-      // Z-order — the textured capacity rings split across the body so the
-      // back-half geometry occludes behind it and the front-half crosses over
-      // it, selling a 3D rotating ring rather than a flat overlay.
+      // Z-order — `ringsBack` draws before the body so the rear half of each
+      // tilted capacity ring is occluded by the world; `ringsFront` draws
+      // after so the near half crosses over the body, selling 3D depth.
       container.addChild(
         halo,
         ring,
@@ -312,15 +274,7 @@ export class PlanetLayer extends Container {
         seeded(tiltSeed + k * 19 + 5) * Math.PI;
       const speedPick = (k: number): number =>
         (0.18 + seeded(tiltSeed + k * 23 + 3) * 0.18) *
-        (Math.random() < 0.5 ? -1 : 1);
-      const stylePick = (k: number): RingOverlayStyle =>
-        seeded(tiltSeed + k * 29 + 41) < 0.5 ? 'brushstroke' : 'spiky';
-      const ringStyles: RingOverlayStyle[] = [stylePick(0), stylePick(1), stylePick(2)];
-      const ringOverlays: RingOverlay[] = [
-        buildRingOverlay(ringStyles[0], planet.id * 13 + 0, ringsBack, ringsFront),
-        buildRingOverlay(ringStyles[1], planet.id * 13 + 1, ringsBack, ringsFront),
-        buildRingOverlay(ringStyles[2], planet.id * 13 + 2, ringsBack, ringsFront),
-      ];
+        (seeded(tiltSeed + k * 31 + 9) < 0.5 ? -1 : 1);
       this.views.push({
         planetId: planet.id,
         container,
@@ -329,9 +283,6 @@ export class PlanetLayer extends Container {
         ring,
         ringsBack,
         ringsFront,
-        ringBeadsBack,
-        ringBeadsFront,
-        ringOverlays,
         atomPaths,
         shockwave,
         strengthBar,
@@ -364,7 +315,6 @@ export class PlanetLayer extends Container {
           seeded(tiltSeed + 17) * Math.PI * 2,
         ],
         capRingSpinSpeed: [speedPick(0), speedPick(1)],
-        ringStyle: ringStyles,
       });
     }
   }
@@ -454,28 +404,20 @@ export class PlanetLayer extends Container {
       // 1.0 it overflows into a pulsing "saturated" glow).
       this.drawStrengthBar(v, p.garrison, p.maxUnitCapacity, effRadius, pal, p.owner, dt);
 
-      // Capacity rings: hand-painted overlay sprites lifted from the
-      // reference stickers (IMG_0327 brushstroke, IMG_0344 tendril), one
-      // pair per ring slot, tinted to the owner palette. Sprites are split
-      // across a back/front layer so painted strokes that should orbit
-      // behind the body draw before it and strokes crossing the planet
-      // face draw after. Capacity progress reads via the bead glow on top.
-      v.ringBeadsBack.clear();
-      v.ringBeadsFront.clear();
+      // Capacity rings: drawn procedurally as 3D-tilted brushstroke arcs,
+      // split across `ringsBack` (rear half, behind the body) and
+      // `ringsFront` (near half, over the body) so each ring reads as
+      // orbiting around the world. Fill progress paints a coloured arc
+      // along the leading edge with sparkle beads on top.
+      v.ringsBack.clear();
+      v.ringsFront.clear();
       const RING_WIDTH = Math.max(4, v.baseRadius * 0.35);
       const RING_GAP = Math.max(3, v.baseRadius * 0.12);
       const RING_INSET = Math.max(6, v.baseRadius * 0.22);
-      // Hide every overlay sprite by default; active ring slots reveal
-      // their own below so a planet that loses ring slots stops drawing
-      // stale art.
-      for (const overlay of v.ringOverlays) {
-        overlay.back.visible = false;
-        overlay.front.visible = false;
-      }
 
       if (p.ringCount > 0) {
-        const cap = RING_CAPACITY_FOR_SIZE[p.type];
         for (let k = 0; k < p.ringCount; k++) {
+          const cap = ringCapacity(p.type, k);
           const fill = p.ringFillProgress[k] ?? 0;
           const target = cap > 0 ? Math.max(0, Math.min(1, fill / cap)) : 0;
           const prog = v.ringProgress[k] ?? 0;
@@ -491,45 +433,22 @@ export class PlanetLayer extends Container {
 
           v.capRingSpin[k] += (v.capRingSpinSpeed[k] ?? 0.25) * dt;
 
-          // Owner-tinted overlay. The brushstroke artwork is already light
-          // blue, so pal.ring (a saturated owner hue) reads cleanly when
-          // multiplied. The tendril artwork is a darker teal, so we darken
-          // the owner ring colour slightly so its tendril stays as a
-          // contrast accent rather than washing out against the body.
-          const style = v.ringStyle[k] ?? 'brushstroke';
           const jitterSeed = p.id * 73 + k * 19;
-          const tint =
-            style === 'spiky'
-              ? adjustColor(hueJitter(pal.ring, jitterSeed, 0.18), 0.55)
-              : hueJitter(pal.ring, jitterSeed, 0.18);
+          const baseColor = hueJitter(pal.ring, jitterSeed, 0.18);
 
-          if (k < v.ringOverlays.length) {
-            updateRingOverlay(
-              v.ringOverlays[k],
-              style,
-              effRadius,
-              rMid,
-              tint,
-              v.capRingTilt[k] ?? 0.6,
-              v.capRingYaw[k] ?? 0,
-              v.capRingSpin[k] ?? 0,
-            );
-          }
-
-          drawFillBeads(
-            v.ringBeadsBack,
-            v.ringBeadsFront,
+          drawProceduralRing(
+            v.ringsBack,
+            v.ringsFront,
             rMid,
             RING_WIDTH,
-            progress,
-            pal.glow,
-            p.id * 13 + k,
-            this.time,
+            v.capRingTilt[k] ?? 0.6,
+            v.capRingYaw[k] ?? 0,
             v.capRingSpin[k] ?? 0,
-            Math.sin(v.capRingTilt[k] ?? 0.6),
-            Math.cos(v.capRingTilt[k] ?? 0.6),
-            Math.cos(v.capRingYaw[k] ?? 0),
-            Math.sin(v.capRingYaw[k] ?? 0),
+            baseColor,
+            pal.glow,
+            progress,
+            this.time,
+            p.id * 13 + k,
           );
         }
       }
@@ -548,6 +467,19 @@ export class PlanetLayer extends Container {
         v.shockwave
           .circle(0, 0, shockR * 0.72)
           .stroke({ width: 2, color: pal.ring, alpha: alpha * 0.6 });
+      }
+      // Capture flash: a soft radial bloom that expands outward and fades
+      // as `capturePulse` decays. Adds weight to the moment of ownership
+      // change without needing extra event wiring — the sim already drives
+      // capturePulse on capture, we just light it up here.
+      if (p.capturePulse > 0.01) {
+        const flashR = effRadius * (1 + (1 - p.capturePulse) * 1.6);
+        v.shockwave
+          .circle(0, 0, flashR)
+          .fill({ color: pal.glow, alpha: p.capturePulse * 0.45 });
+        v.shockwave
+          .circle(0, 0, flashR * 0.6)
+          .fill({ color: pal.ring, alpha: p.capturePulse * 0.25 });
       }
 
       // Selection ring (pulsing) sits outside the capacity rings.
@@ -943,51 +875,6 @@ export class PlanetLayer extends Container {
 }
 
 /**
- * Allocate one painted-overlay sprite pair for a single ring slot. The pair
- * shares the same texture lifted off the reference sticker by planetAssets;
- * the back sprite is parented under `ringsBack` (drawn before the body),
- * the front sprite under `ringsFront` (drawn after). Both stay invisible
- * until `updateRingOverlay` reveals them when the planet has at least
- * `k+1` ring slots active.
- *
- * Each pair gets a deterministic 50% horizontal flip baked at construction
- * so two same-style ring slots on the same planet (or different planets
- * that happened to land on the same archetype) don't all face the same
- * direction.
- */
-const buildRingOverlay = (
-  style: RingOverlayStyle,
-  seed: number,
-  ringsBack: Container,
-  ringsFront: Container,
-): RingOverlay => {
-  const overlay = planetAssetsReady() ? getRingOverlay(style) : null;
-  const tex = overlay?.texture;
-  const back = new Sprite(tex ?? undefined);
-  const front = new Sprite(tex ?? undefined);
-  // Anchor the body centre of the source artwork at the sprite origin so
-  // scaling around (0, 0) keeps the painted body footprint locked to the
-  // planet centre. Falls back to (0.5, 0.5) if the overlay isn't ready yet
-  // (the sprite stays invisible in that case anyway).
-  if (overlay) {
-    back.anchor.set(overlay.bodyCx / tex!.width, overlay.bodyCy / tex!.height);
-    front.anchor.set(overlay.bodyCx / tex!.width, overlay.bodyCy / tex!.height);
-  } else {
-    back.anchor.set(0.5);
-    front.anchor.set(0.5);
-  }
-  back.visible = false;
-  front.visible = false;
-  ringsBack.addChild(back);
-  ringsFront.addChild(front);
-  return {
-    back,
-    front,
-    flip: seeded(seed * 31 + 7) < 0.5 ? -1 : 1,
-  };
-};
-
-/**
  * Deterministic hash → [0, 1). Keeps each planet's ring pattern identical
  * frame-to-frame so sub-bands don't shimmer at the pixel level.
  */
@@ -1023,100 +910,123 @@ const projectRing = (
 };
 
 const FILL_START = -Math.PI / 2;
+/** Number of segments around each ring; high enough that the painterly
+ * jitter reads as continuous brushstroke rather than discrete dashes. */
+const RING_SEGMENTS = 72;
 
 /**
- * Draw a glowing leading-edge arc along the filled portion of the ring.
- * Shared between both ring styles so progress always reads at a glance.
+ * Draw one capacity ring as a 3D-tilted painterly stroke split between
+ * `back` (rear half, behind body) and `front` (near half, over body) so
+ * the result reads as orbiting around the planet. Layered passes — dark
+ * underglow, jittered body stroke, lit highlight, then the filled-arc
+ * progress pass with bead sparkle — give the rim a brushstroke look that
+ * matches the painted planet textures rather than a clean geometric arc.
  */
-const drawFillBeads = (
+const drawProceduralRing = (
   back: import('pixi.js').Graphics,
   front: import('pixi.js').Graphics,
   rMid: number,
   ringWidth: number,
-  progress: number,
-  glowColor: number,
-  seed: number,
-  time: number,
-  spin: number,
-  sinT: number,
-  cosT: number,
-  cosY: number,
-  sinY: number,
-): void => {
-  if (progress <= 0.01) return;
-  const sweep = Math.PI * 2 * progress;
-  const beadCount = Math.max(8, Math.floor(34 * progress));
-  const rimPulse = 0.65 + 0.25 * Math.sin(time * 2.2 + seed * 0.7);
-  for (let i = 0; i <= beadCount; i++) {
-    const t = i / beadCount;
-    const a = FILL_START + sweep * t + spin;
-    const p = projectRing(a, rMid, sinT, cosT, cosY, sinY);
-    const target = p.depth >= 0 ? front : back;
-    target
-      .circle(p.x, p.y, Math.max(1.2, ringWidth * 0.09))
-      .fill({ color: 0xffffff, alpha: 0.55 * rimPulse * progress });
-    target
-      .circle(p.x, p.y, Math.max(2.4, ringWidth * 0.18))
-      .fill({ color: glowColor, alpha: 0.22 * progress });
-  }
-};
-
-/**
- * Position, scale, rotate and tint the painted overlay sprite pair for one
- * ring slot. Both back/front sprites share identical transforms — having
- * the same artwork parented under both layers ensures the overlay survives
- * regardless of whether the body lands above or below it in the local Z
- * order. The `effRadius`/`rMid` ratio determines how far outward (relative
- * to the planet body) the painted ring rests; for stacked ring slots
- * (`k > 0`) `rMid` is larger so the overlay scales up and the painted ring
- * sits further out, matching the gameplay-defined ring spacing.
- */
-const updateRingOverlay = (
-  overlay: RingOverlay,
-  style: RingOverlayStyle,
-  effRadius: number,
-  rMid: number,
-  tint: number,
   tilt: number,
   yaw: number,
   spin: number,
+  baseColor: number,
+  fillColor: number,
+  progress: number,
+  time: number,
+  seed: number,
 ): void => {
-  if (!planetAssetsReady()) {
-    overlay.back.visible = false;
-    overlay.front.visible = false;
-    return;
-  }
-  const info = getRingOverlay(style);
-  // Refresh texture/anchor on first reveal — buildRingOverlay may have run
-  // before assets finished loading, in which case the sprites were created
-  // with a placeholder texture.
-  if (overlay.back.texture !== info.texture) {
-    overlay.back.texture = info.texture;
-    overlay.front.texture = info.texture;
-    overlay.back.anchor.set(info.bodyCx / info.texture.width, info.bodyCy / info.texture.height);
-    overlay.front.anchor.set(info.bodyCx / info.texture.width, info.bodyCy / info.texture.height);
+  const sinT = Math.sin(tilt);
+  const cosT = Math.cos(tilt);
+  const cosY = Math.cos(yaw);
+  const sinY = Math.sin(yaw);
+  const underColor = adjustColor(baseColor, -0.4);
+  const hiColor = adjustColor(baseColor, 0.45);
+
+  // Pre-sample each segment's screen position + depth + per-segment radial
+  // jitter so all four passes hit the exact same painterly silhouette.
+  const points: Array<{ x: number; y: number; depth: number; theta: number }> = [];
+  for (let i = 0; i <= RING_SEGMENTS; i++) {
+    const theta = (i / RING_SEGMENTS) * Math.PI * 2 + spin;
+    const jitter = (seeded(seed * 257 + i) - 0.5) * ringWidth * 0.3;
+    const r = rMid + jitter;
+    const p = projectRing(theta, r, sinT, cosT, cosY, sinY);
+    points.push({ x: p.x, y: p.y, depth: p.depth, theta });
   }
 
-  // Scale so the body cut-out region in the source matches the planet's
-  // current effective radius. With this scale the painted ring naturally
-  // lands at its source-art radius from the body centre, then we expand by
-  // `rMid / effRadius` to push the painted ring outward proportionally to
-  // the gameplay-defined ring radius for this slot — ring slot 1 sits
-  // wider than slot 0, slot 2 wider still.
-  const baseScale = (2 * effRadius) / info.bodyDiameter;
-  const radialScale = rMid / Math.max(1, effRadius);
-  const scale = baseScale * radialScale;
-  // Tilt is a mild vertical squash so the ring reads as a flattened orbit
-  // rather than a perfect circle. Subtle — the painted artwork already
-  // has its own perspective baked in, so we don't squash too aggressively.
-  const verticalSquash = 0.78 + 0.18 * Math.cos(tilt);
+  // Polyline pass: walk consecutive segments, swap targets when depth flips
+  // sign so the rear half lands on `back` and the near half on `front`.
+  // Each contiguous run on a single layer is stroked as one polyline.
+  const drawPass = (
+    width: number,
+    color: number,
+    alpha: number,
+    onlyFront: boolean,
+  ): void => {
+    let target: import('pixi.js').Graphics | null = null;
+    for (let i = 0; i < points.length - 1; i++) {
+      const a = points[i];
+      const b = points[i + 1];
+      const segFront = (a.depth + b.depth) >= 0;
+      if (onlyFront && !segFront) {
+        if (target) target.stroke({ width, color, alpha });
+        target = null;
+        continue;
+      }
+      const layer = segFront ? front : back;
+      if (layer !== target) {
+        if (target) target.stroke({ width, color, alpha });
+        target = layer;
+        target.moveTo(a.x, a.y);
+      }
+      target.lineTo(b.x, b.y);
+    }
+    if (target) target.stroke({ width, color, alpha });
+  };
 
-  for (const sprite of [overlay.back, overlay.front]) {
-    sprite.visible = true;
-    sprite.tint = tint;
-    sprite.rotation = yaw + spin;
-    sprite.scale.set(scale * overlay.flip, scale * verticalSquash);
-    sprite.x = 0;
-    sprite.y = 0;
+  // Pass 1: dark underline behind the body stroke — gives the ring weight.
+  drawPass(ringWidth * 1.1, underColor, 0.18, false);
+  // Pass 2: main body stroke at base color, the brushy silhouette.
+  drawPass(ringWidth, baseColor, 0.55, false);
+  // Pass 3: lit highlight, only on the near half — gives the ring the
+  // "sun-lit upper rim" look that sells the 3D tilt without any shader.
+  drawPass(ringWidth * 0.4, hiColor, 0.7, true);
+
+  // Pass 4: filled-arc progress paint along the leading edge.
+  if (progress > 0.01) {
+    const sweep = Math.PI * 2 * progress;
+    const fillSegs = Math.max(6, Math.floor(RING_SEGMENTS * progress));
+    let target: import('pixi.js').Graphics | null = null;
+    for (let i = 0; i <= fillSegs; i++) {
+      const t = i / fillSegs;
+      const theta = FILL_START + sweep * t + spin;
+      const p = projectRing(theta, rMid, sinT, cosT, cosY, sinY);
+      const layer = p.depth >= 0 ? front : back;
+      if (layer !== target) {
+        if (target) target.stroke({ width: ringWidth * 0.55, color: fillColor, alpha: 0.85 });
+        target = layer;
+        target.moveTo(p.x, p.y);
+      } else {
+        target.lineTo(p.x, p.y);
+      }
+    }
+    if (target) target.stroke({ width: ringWidth * 0.55, color: fillColor, alpha: 0.85 });
+
+    // Bead sparkle along the filled arc — same idea as the previous design,
+    // kept inline so all ring drawing flows through one helper.
+    const beadCount = Math.max(8, Math.floor(34 * progress));
+    const rimPulse = 0.65 + 0.25 * Math.sin(time * 2.2 + seed * 0.7);
+    for (let i = 0; i <= beadCount; i++) {
+      const t = i / beadCount;
+      const a = FILL_START + sweep * t + spin;
+      const p = projectRing(a, rMid, sinT, cosT, cosY, sinY);
+      const layer = p.depth >= 0 ? front : back;
+      layer
+        .circle(p.x, p.y, Math.max(1.2, ringWidth * 0.09))
+        .fill({ color: 0xffffff, alpha: 0.55 * rimPulse * progress });
+      layer
+        .circle(p.x, p.y, Math.max(2.4, ringWidth * 0.18))
+        .fill({ color: fillColor, alpha: 0.22 * progress });
+    }
   }
 };

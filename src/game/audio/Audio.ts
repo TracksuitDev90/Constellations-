@@ -38,6 +38,12 @@ export class Audio {
   private lastRingTickAt = new Map<number, number>();
   private lastAbsorbAt = new Map<number, number>();
   private lastDeathAt = 0;
+  private lastEvolveAt = 0;
+  /** Persistent low-rumble bus for ongoing combat density. */
+  private combatRumbleSource: AudioBufferSourceNode | null = null;
+  private combatRumbleGain: GainNode | null = null;
+  /** Last clock time the rumble target intensity was non-zero. */
+  private combatLastActiveAt = 0;
   private etherealTimer: number | null = null;
   muted = false;
   musicVolume = 0.35;
@@ -710,6 +716,108 @@ export class Audio {
     chirp.connect(chirpGain).connect(this.sfxGain);
     chirp.start(now);
     chirp.stop(now + 0.12);
+  }
+
+  /**
+   * Resonant ascending swell when a planet evolves to its next size — a
+   * bigger, bassier event than `ringFilled`. Three-osc chord (sub + root +
+   * fifth) with a sustain plateau so the moment lands.
+   */
+  planetEvolve(newType: number): void {
+    if (!this.ctx || !this.sfxGain || this.muted) return;
+    const now = this.ctx.currentTime;
+    if (now - this.lastEvolveAt < 0.15) return;
+    this.lastEvolveAt = now;
+
+    // Pitch climbs slightly per tier so back-to-back evolutions feel like a
+    // staircase rather than the same chime each time.
+    const root = 220 * Math.pow(2, newType * 0.25);
+    const partials = [
+      { freq: 60, peak: 0.16, sweep: 90 }, // sub-bass thump that rises a bit
+      { freq: root, peak: 0.22, sweep: root },
+      { freq: root * 1.5, peak: 0.14, sweep: root * 1.5 }, // perfect fifth
+    ];
+    for (let i = 0; i < partials.length; i++) {
+      const p = partials[i];
+      const osc = this.ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(p.freq, now);
+      if (i === 0) osc.frequency.exponentialRampToValueAtTime(p.sweep, now + 0.3);
+      const g = this.ctx.createGain();
+      g.gain.setValueAtTime(0.0001, now);
+      g.gain.exponentialRampToValueAtTime(p.peak, now + 0.05);
+      g.gain.setValueAtTime(p.peak, now + 0.45);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + 0.9);
+      osc.connect(g).connect(this.sfxGain);
+      osc.start(now);
+      osc.stop(now + 0.95);
+    }
+  }
+
+  /**
+   * Drive a persistent low-rumble that swells with combat density. `intensity`
+   * is 0..1 (see Game.ts: deaths-per-second over a 1s window normalized).
+   * Lazy-allocates a noise source on first non-zero call; tears it down once
+   * intensity has stayed at zero for >2s so silence really is silent.
+   */
+  combatTension(intensity: number): void {
+    if (!this.ctx || !this.sfxGain || this.muted) {
+      // Even if muted, ensure any active rumble is torn down.
+      if (this.combatRumbleSource) this.stopCombatRumble();
+      return;
+    }
+    const now = this.ctx.currentTime;
+    const target = Math.max(0, Math.min(1, intensity));
+    if (target > 0) this.combatLastActiveAt = now;
+
+    if (target > 0 && !this.combatRumbleSource) this.startCombatRumble();
+    if (this.combatRumbleGain) {
+      // Linear ramp tracks the intensity smoothly so spurts of deaths don't
+      // pop the level. 0.06 ceiling keeps the rumble felt-not-heard.
+      const peak = target * 0.06;
+      this.combatRumbleGain.gain.cancelScheduledValues(now);
+      this.combatRumbleGain.gain.setTargetAtTime(peak, now, 0.18);
+    }
+    if (this.combatRumbleSource && target === 0 && now - this.combatLastActiveAt > 2.0) {
+      this.stopCombatRumble();
+    }
+  }
+
+  private startCombatRumble(): void {
+    if (!this.ctx || !this.sfxGain) return;
+    const sr = this.ctx.sampleRate;
+    // ~2s loop of white noise; bandpass shaped into a sub rumble.
+    const sampleCount = Math.max(1, Math.floor(sr * 2));
+    const buf = this.ctx.createBuffer(1, sampleCount, sr);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < sampleCount; i++) data[i] = Math.random() * 2 - 1;
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    src.loop = true;
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 140;
+    bp.Q.value = 0.6;
+    const gain = this.ctx.createGain();
+    gain.gain.value = 0;
+    src.connect(bp).connect(gain).connect(this.sfxGain);
+    src.start();
+    this.combatRumbleSource = src;
+    this.combatRumbleGain = gain;
+  }
+
+  private stopCombatRumble(): void {
+    if (this.combatRumbleSource) {
+      try {
+        this.combatRumbleSource.stop();
+      } catch {
+        // already stopped
+      }
+      this.combatRumbleSource.disconnect();
+    }
+    if (this.combatRumbleGain) this.combatRumbleGain.disconnect();
+    this.combatRumbleSource = null;
+    this.combatRumbleGain = null;
   }
 
   endSting(win: boolean): void {

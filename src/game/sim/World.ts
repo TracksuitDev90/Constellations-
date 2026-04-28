@@ -4,9 +4,9 @@ import {
   BASE_MAX_HEALTH,
   BASE_PRODUCTION,
   BASE_UNIT_CAPACITY,
-  RING_CAPACITY_FOR_SIZE,
   SIZE_RADIUS,
   clampRingCount,
+  ringCapacity,
   ringsComplete,
   type Planet,
   type PlanetType,
@@ -1046,8 +1046,8 @@ export class World {
       return;
     }
     if (planet.ringCount === 0) return; // nothing to grow into; orbiter is still spent.
-    const cap = RING_CAPACITY_FOR_SIZE[planet.type];
     for (let i = 0; i < planet.ringCount; i++) {
+      const cap = ringCapacity(planet.type, i);
       const before = planet.ringFillProgress[i] ?? 0;
       if (before >= cap) continue;
       const after = before + 1;
@@ -1105,16 +1105,34 @@ export class World {
     const lead = tgt && tgtMoving > 0 ? Math.min(0.6, distToTgt / SHIP_SPEED) : 0;
     const targetX = tgt ? tgt.pos.x + tgt.vx * lead : ship.targetX;
     const targetY = tgt ? tgt.pos.y + tgt.vy * lead : ship.targetY;
-    const arriveDist = tgt
-      ? tgt.radius + 4 + tgtMoving * dt
-      : 6;
-    // Arrival check is against the planet's actual centre — a leading aim
-    // helps the ship CATCH the planet, but landing happens when the ship
-    // is on the body itself.
+    // Arrival tolerance has to account for both the planet drifting away
+    // *and* the ship crawling through asteroid drag — without compensating,
+    // a slowed ship can chase a drifting target forever, never closing the
+    // last few pixels because the planet wanders the same speed the ship
+    // approaches at. Take whichever speed deficit dominates and pad arrive
+    // dist by ~3 frames' worth of it.
+    const drag = this.asteroidDragAt(ship.x, ship.y);
+    const dragShortfall = (1 - drag) * ship.speed;
+    const slack = Math.max(tgtMoving, dragShortfall);
+    const arriveDist = tgt ? tgt.radius + 4 + slack * dt * 6 : 6;
     if (tgt) {
       if (distToTgt <= arriveDist) {
         this.arrive(idx, tgt);
         return;
+      }
+      // Closing-and-near snap: if the ship is already inside 1.5× the
+      // planet's body radius and still moving toward it (positive dot
+      // product with the toward-vector), count it as landed. Catches the
+      // case where boids separation has the ship orbiting the planet
+      // perimeter without crossing the strict arrival threshold.
+      const closeRange = tgt.radius * 1.5;
+      if (distToTgt <= closeRange) {
+        const towardX = tgt.pos.x - ship.x;
+        const towardY = tgt.pos.y - ship.y;
+        if (ship.vx * towardX + ship.vy * towardY > 0) {
+          this.arrive(idx, tgt);
+          return;
+        }
       }
     } else {
       const d0 = Math.hypot(targetX - ship.x, targetY - ship.y);
@@ -1186,12 +1204,10 @@ export class World {
     ship.vx += (fx - ship.vx) * blend;
     ship.vy += (fy - ship.vy) * blend;
 
-    // Asteroid drag — if the ship is currently inside any field, scale its
-    // effective speed down so the player physically watches it crawl through
-    // the rocks. We apply the multiplier to the speed cap (so steering still
-    // works normally) and to the per-frame translation (so a ship that would
-    // have arrived in one frame waits longer).
-    const drag = this.asteroidDragAt(ship.x, ship.y);
+    // Asteroid drag — `drag` was sampled at the top of this function for
+    // the arrive-tolerance widening. Reuse it here: cap speed to the ship's
+    // nominal speed scaled by drag so a ship physically crawls through the
+    // rocks while still steering normally.
 
     // Cap speed to the ship's nominal speed (scaled by drag).
     const sp = Math.hypot(ship.vx, ship.vy);

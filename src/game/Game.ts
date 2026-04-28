@@ -4,7 +4,7 @@ import { Audio } from './audio/Audio.js';
 import { Input } from './input/Input.js';
 import { Selection } from './input/Selection.js';
 import { generateOrionMap } from './maps/orion.js';
-import { RING_CAPACITY_FOR_SIZE, type Planet } from './sim/Planet.js';
+import { ringCapacity, type Planet } from './sim/Planet.js';
 import { loadPlanetAssets } from './render/planetAssets.js';
 import { Renderer } from './render/Renderer.js';
 import { World } from './sim/World.js';
@@ -25,6 +25,12 @@ export class Game {
   private accumulator = 0;
   private paused = false;
   private activeOverlay: HTMLDivElement | null = null;
+  /**
+   * Rolling 1.0s window of ship-death timestamps. Each frame the size of
+   * this window normalizes into a 0..1 combat-tension score that drives
+   * the persistent rumble in Audio so a brawl audibly swells and fades.
+   */
+  private deathTimestamps: number[] = [];
 
   constructor(app: Application, ui: HTMLElement) {
     this.app = app;
@@ -120,12 +126,11 @@ export class Game {
         },
         onShipDeath: () => {
           this.audio.shipDeath();
+          this.deathTimestamps.push(performance.now());
         },
-        onPlanetEvolve: (_planetId, owner) => {
+        onPlanetEvolve: (_planetId, owner, newType) => {
           if (owner !== 0) return;
-          // Reuse the capture sting — evolving a planet is a comparably
-          // meaningful moment and the cue already reads as "good news".
-          this.audio.planetCaptured();
+          this.audio.planetEvolve(newType);
         },
         onPlanetCapture: () => {
           this.audio.planetCaptured();
@@ -272,6 +277,15 @@ export class Game {
     this.renderer.planetLayer.setSelection(this.selection.ids);
     this.renderer.update(frameMs / 1000);
     this.hud.update(this.world);
+
+    // Combat tension: count ship deaths in the trailing 1s window and pass
+    // the normalized intensity to the audio rumble. ~8 deaths/s saturates.
+    const nowMs = performance.now();
+    const windowStart = nowMs - 1000;
+    while (this.deathTimestamps.length > 0 && this.deathTimestamps[0] < windowStart) {
+      this.deathTimestamps.shift();
+    }
+    this.audio.combatTension(Math.min(1, this.deathTimestamps.length / 8));
   };
 
   private showEndScreen(won: boolean): void {
@@ -328,9 +342,9 @@ export class Game {
 /** 0..1 progress toward filling the planet's next capacity ring. */
 const ringFillProgress = (planet: Planet): number => {
   if (planet.ringCount === 0) return 0;
-  const cap = RING_CAPACITY_FOR_SIZE[planet.type];
-  if (cap <= 0) return 0;
   for (let i = 0; i < planet.ringCount; i++) {
+    const cap = ringCapacity(planet.type, i);
+    if (cap <= 0) continue;
     const fill = planet.ringFillProgress[i] ?? 0;
     if (fill < cap) return Math.max(0, Math.min(1, fill / cap));
   }

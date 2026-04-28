@@ -169,6 +169,19 @@ interface NeutralSeed {
   garrison: number;
 }
 
+/**
+ * Independent roll for ring count: 70% no rings, 25% one ring, 5% two rings.
+ * Two-ring rolls require an XL planet (size 2) since the 0/1 size cap is one
+ * ring; downgrades to 1 if the planet is too small. Most worlds end up bare
+ * so a ringed planet feels like a meaningful target rather than the default.
+ */
+const rollRingCount = (type: PlanetType): 0 | 1 | 2 => {
+  const r = Math.random();
+  if (r < 0.7) return 0;
+  if (r < 0.95) return 1;
+  return type === 2 ? 2 : 1;
+};
+
 /** Roll one neutral planet's profile so the pool reads as a varied bunch. */
 const rollNeutralSeed = (): NeutralSeed => {
   // Bias toward Large; sprinkle Small and Extra-Large so size variety reads.
@@ -177,10 +190,9 @@ const rollNeutralSeed = (): NeutralSeed => {
     [1, 3],
     [2, 1.2],
   ]);
-  // Ring count gated by the type (Small/Large allow 1, XL allows up to 2).
-  const ringCount = type === 2 ? (Math.random() < 0.55 ? 2 : 1) : Math.random() < 0.5 ? 1 : 0;
+  const ringCount = rollRingCount(type);
   const garrison = type === 2 ? irange(12, 18) : type === 1 ? irange(8, 14) : irange(6, 10);
-  return { type, ringCount: ringCount as 0 | 1 | 2, garrison };
+  return { type, ringCount, garrison };
 };
 
 /**

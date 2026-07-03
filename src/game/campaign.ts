@@ -3,11 +3,13 @@ import type { MapGenConfig } from './maps/generator.js';
 
 /**
  * The campaign: eight named constellations with a deliberate difficulty
- * ramp. The first two are gentle on purpose — a passive AI, no hazards, a
- * garrison head start — so new players learn the swarm loop before the
- * game starts hitting back. From there each level adds one pressure at a
- * time: hazards, a sharper AI, then free-for-alls, then fierce
- * free-for-alls with everything turned on.
+ * ramp. The first two are gentle on purpose — a passive AI, mostly-calm
+ * skies, a garrison head start — so new players learn the swarm loop
+ * before the game starts hitting back. From there each level adds one
+ * pressure at a time: hazards, a sharper AI, then free-for-alls, then
+ * fierce free-for-alls with everything turned on. Every level's hazard
+ * pool is non-empty so drifting planets and asteroid belts have a chance
+ * of appearing anywhere in the campaign; only the odds ramp.
  */
 export interface LevelDef {
   id: string;
@@ -27,8 +29,10 @@ export const LEVELS: LevelDef[] = [
     map: {
       playerCount: 2,
       totalPlanets: [5, 6],
-      hazardPool: [],
-      calmChance: 1,
+      // Even the tutorial sky occasionally shows an asteroid belt — mostly
+      // calm, but the hazard elements should have a chance to appear anywhere.
+      hazardPool: ['asteroidField'],
+      calmChance: 0.7,
       playerGarrison: 25,
       enemyGarrison: 10,
       playerRing: true,
@@ -42,8 +46,8 @@ export const LEVELS: LevelDef[] = [
     map: {
       playerCount: 2,
       totalPlanets: [6, 7],
-      hazardPool: [],
-      calmChance: 1,
+      hazardPool: ['asteroidField', 'driftingPlanet'],
+      calmChance: 0.55,
       playerGarrison: 22,
       enemyGarrison: 12,
       playerRing: true,
@@ -87,8 +91,8 @@ export const LEVELS: LevelDef[] = [
     map: {
       playerCount: 3,
       totalPlanets: [8, 9],
-      hazardPool: [],
-      calmChance: 1,
+      hazardPool: ['driftingPlanet', 'asteroidField', 'neutralSwarm'],
+      calmChance: 0.45,
       playerGarrison: 20,
       enemyGarrison: 16,
       playerRing: true,

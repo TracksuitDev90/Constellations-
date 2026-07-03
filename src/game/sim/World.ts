@@ -37,9 +37,10 @@ export interface MapSpec {
   }>;
   edges: Array<[number, number]>;
   /**
-   * At most one entry today. Each match rolls a single hazard (drifting
-   * planet, asteroid belt, or neutral green swarm) so every level feels
-   * different without overwhelming the strategic read.
+   * Up to two entries of distinct kinds. Each hazardous match rolls one
+   * hazard (drifting planet, asteroid belt, or neutral green swarm), with
+   * a chance of a second — enough variety that every level feels different
+   * without overwhelming the strategic read.
    */
   hazards?: HazardSpec[];
 }
@@ -175,7 +176,7 @@ export class World {
   streams: ShipStream[] = [];
   ships: ShipPool = new ShipPool();
   /**
-   * Static hazard zones (asteroid belts). Currently 0 or 1 per match;
+   * Static hazard zones (asteroid belts), any number per match;
    * `stepTransit` consults this list to apply a per-zone speed multiplier.
    */
   asteroidFields: AsteroidField[] = [];

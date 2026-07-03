@@ -19,9 +19,9 @@ two conflicting models:
 The same tap can behave completely differently depending on whether a
 selection happens to contain live units. Pick one:
 
-- **Auralux-faithful**: drop the graph for movement entirely; keep the
-  constellation lines as decoration (they now render via `LinkLayer`).
-  `openStream` becomes "launch garrison as a direct wave."
+- **Auralux-faithful**: drop the graph for movement entirely; the edge
+  graph still routes stream waves but the constellation lines are no
+  longer drawn. `openStream` becomes "launch garrison as a direct wave."
 - **Identity-preserving**: keep graph routing for everything, including
   `commandSelectedTo` — lanes become the game's signature. Then hostile
   chokepoints (hazards on edges) become real strategy.

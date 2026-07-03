@@ -3,7 +3,6 @@ import { PLAYER_PALETTES } from '../../util/color.js';
 import type { World } from '../sim/World.js';
 import { BackgroundLayer } from './BackgroundLayer.js';
 import { HazardLayer } from './HazardLayer.js';
-import { LinkLayer } from './LinkLayer.js';
 import { PlanetLayer } from './PlanetLayer.js';
 import { ShipLayer } from './ShipLayer.js';
 
@@ -12,7 +11,6 @@ export class Renderer {
   world: World;
   bg: BackgroundLayer;
   worldLayer: Container;
-  linkLayer: LinkLayer;
   planetLayer: PlanetLayer;
   shipLayer: ShipLayer;
   hazardLayer: HazardLayer;
@@ -39,20 +37,19 @@ export class Renderer {
     this.worldLayer = new Container();
     app.stage.addChild(this.worldLayer);
 
-    this.linkLayer = new LinkLayer(world);
     this.shipLayer = new ShipLayer(app, world);
     this.hazardLayer = new HazardLayer(app, world);
     this.planetLayer = new PlanetLayer(app, world);
     this.lasso = new Graphics();
 
-    // Z-order: constellation edge lines at the very bottom, ship streams
-    // beneath asteroid debris, then planets and their halos on top, then
-    // hazard neutrals over everything so their dots stay legible against
-    // busy traffic. The HazardLayer internally splits its asteroid vs.
-    // neutral subroots, so we add it twice — once before planets (asteroids
-    // will be in their first child) and the neutral overlay sits inside the
-    // same container above planets via z-index.
-    this.worldLayer.addChild(this.linkLayer);
+    // Z-order: ship streams at the bottom, beneath asteroid debris, then
+    // planets and their halos on top, then hazard neutrals over everything
+    // so their dots stay legible against busy traffic. The HazardLayer
+    // internally splits its asteroid vs. neutral subroots, so we add it
+    // twice — once before planets (asteroids will be in their first child)
+    // and the neutral overlay sits inside the same container above planets
+    // via z-index. (The world's edge graph still exists for stream routing,
+    // but the constellation lines themselves are intentionally not drawn.)
     this.worldLayer.addChild(this.shipLayer);
     this.worldLayer.addChild(this.hazardLayer);
     this.worldLayer.addChild(this.planetLayer);
@@ -185,7 +182,6 @@ export class Renderer {
 
   update(dt: number): void {
     this.bg.update(this.viewX, this.viewY);
-    this.linkLayer.update();
     this.planetLayer.update(dt);
     this.hazardLayer.update(dt);
     this.shipLayer.update(dt);

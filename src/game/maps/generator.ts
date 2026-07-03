@@ -11,9 +11,10 @@ import { SIZE_RADIUS } from '../sim/Planet.js';
  *     minimum-separation so spacing varies between matches without ever
  *     letting two worlds visually overlap.
  *   - Edge connectivity by nearest-neighbor with a connectivity backstop.
- *     The lines are purely decorative (movement is free-flight), but they
- *     ARE the constellation — every map should read as one.
- *   - At most one hazard, drawn from the level's allowed pool.
+ *     The edges are invisible (movement is free-flight, and the line layer
+ *     is intentionally not rendered) but streams still route along them.
+ *   - Up to two hazards of distinct kinds, drawn from the level's allowed
+ *     pool: most hazardous matches roll one, some roll a pair.
  *
  * Planet ids 0..playerCount-1 are the start worlds, in player order.
  */
@@ -218,18 +219,18 @@ const rollNeutralSeed = (): NeutralSeed => {
   return { type, ringCount, garrison };
 };
 
+/** Chance a hazardous match rolls a second hazard of a different kind. */
+const SECOND_HAZARD_CHANCE = 0.3;
+
 /**
- * Roll the level's hazard from its allowed pool (or none). Placement keeps
- * hazards central so they interfere with contested space, never with a
- * start world.
+ * Roll one hazard of the given kind. Placement keeps hazards central so
+ * they interfere with contested space, never with a start world.
  */
-const rollHazard = (
+const rollHazardOfKind = (
+  variant: HazardKind,
   cfg: MapGenConfig,
   positions: ReadonlyArray<{ x: number; y: number; r: number }>,
 ): HazardSpec | null => {
-  if (cfg.hazardPool.length === 0) return null;
-  if (Math.random() < cfg.calmChance) return null;
-  const variant = cfg.hazardPool[Math.floor(Math.random() * cfg.hazardPool.length)];
   const starts = positions.slice(0, cfg.playerCount);
 
   if (variant === 'driftingPlanet') {
@@ -293,6 +294,36 @@ const rollHazard = (
   };
 };
 
+/**
+ * Roll the match's hazards from the level's allowed pool (or none). A
+ * hazardous match always gets one hazard; when the pool offers more than
+ * one kind there's a further chance of a second, distinct-kind hazard —
+ * so drifting planets and asteroid belts genuinely show up over a session
+ * rather than living only in a rare corner of the roll table.
+ */
+const rollHazards = (
+  cfg: MapGenConfig,
+  positions: ReadonlyArray<{ x: number; y: number; r: number }>,
+): HazardSpec[] => {
+  if (cfg.hazardPool.length === 0) return [];
+  if (Math.random() < cfg.calmChance) return [];
+  const pool = [...new Set(cfg.hazardPool)];
+  const first = pool[Math.floor(Math.random() * pool.length)];
+  const hazards: HazardSpec[] = [];
+  const rolled = rollHazardOfKind(first, cfg, positions);
+  if (rolled) hazards.push(rolled);
+  const rest = pool.filter((k) => k !== first);
+  if (hazards.length > 0 && rest.length > 0 && Math.random() < SECOND_HAZARD_CHANCE) {
+    const second = rollHazardOfKind(
+      rest[Math.floor(Math.random() * rest.length)],
+      cfg,
+      positions,
+    );
+    if (second) hazards.push(second);
+  }
+  return hazards;
+};
+
 /** Generate a fresh constellation for the given level configuration. */
 export const generateMap = (cfg: MapGenConfig): MapSpec => {
   const totalPlanets = Math.max(
@@ -343,13 +374,13 @@ export const generateMap = (cfg: MapGenConfig): MapSpec => {
   }
 
   const edges = buildEdges(placed);
-  const hazard = rollHazard(cfg, placed);
+  const hazards = rollHazards(cfg, placed);
 
   return {
     width: MAP_WIDTH,
     height: MAP_HEIGHT,
     planets,
     edges,
-    hazards: hazard ? [hazard] : [],
+    hazards,
   };
 };

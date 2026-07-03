@@ -1,4 +1,4 @@
-import { Application, Container, Graphics, Sprite } from 'pixi.js';
+import { Application, Container, Graphics, Sprite, Text } from 'pixi.js';
 import type { Texture } from 'pixi.js';
 import { adjustColor, hueJitter, paletteFor, toward } from '../../util/color.js';
 import { ringCapacity, type PlanetType } from '../sim/Planet.js';
@@ -172,6 +172,21 @@ interface PlanetView {
   /** Last strength-bar fill actually drawn — lets static bars skip redraw. */
   lastDrawnStrength: number;
   lastDrawnBarOwner: number | null;
+  /**
+   * Victory-cascade state: `celebrateDelay` counts down to this planet's
+   * turn in the winner's shockwave chain; `celebratePulse` then decays 1→0
+   * while an expanding ring renders. Renderer-driven (the sim is frozen at
+   * game over, so it can't reuse the sim's evolvePulse).
+   */
+  celebrateDelay: number;
+  celebratePulse: number;
+  /**
+   * "n/cap" readout for the current ring while the planet is the player's
+   * and has rings — makes the upgrade economy legible (Auralux always
+   * tells you how far a level-up is). Lazily created on first use.
+   */
+  costLabel: Text | null;
+  lastCostText: string;
   lastOwner: number | null;
   displayScale: number;
   baseRadius: number;
@@ -225,6 +240,8 @@ export class PlanetLayer extends Container {
   private shipTex: Texture;
   private shipGlowTex: Texture;
   private time = 0;
+  /** Ambient-music breathing (0..1), fed by Game each frame via setBeat. */
+  private beat = 0;
 
   constructor(app: Application, world: World) {
     super();
@@ -309,6 +326,10 @@ export class PlanetLayer extends Container {
         fxRedrawAcc: Math.random() * FX_REDRAW_INTERVAL,
         lastDrawnStrength: -1,
         lastDrawnBarOwner: null,
+        celebrateDelay: 0,
+        celebratePulse: 0,
+        costLabel: null,
+        lastCostText: '',
         lastOwner: planet.owner,
         displayScale: 1,
         baseRadius: planet.radius,
@@ -341,6 +362,29 @@ export class PlanetLayer extends Container {
 
   setSelection(ids: Iterable<number>): void {
     this.selectedSources = new Set(ids);
+  }
+
+  /**
+   * Ambient-music breathing (0..1), set once per frame by the Game so halo
+   * and electron glows swell with the soundtrack — the Auralux trick that
+   * makes the whole board feel alive.
+   */
+  setBeat(v: number): void {
+    this.beat = v;
+  }
+
+  /**
+   * Kick off the victory cascade: a staggered chain of shockwaves across
+   * every planet the winner owns. Purely renderer-side, since the sim is
+   * frozen once the match ends.
+   */
+  celebrate(owner: number): void {
+    let k = 0;
+    for (let i = 0; i < this.world.planets.length; i++) {
+      if (this.world.planets[i].owner !== owner) continue;
+      this.views[i].celebrateDelay = 0.12 + k * 0.22;
+      k++;
+    }
   }
 
   update(dt: number): void {
@@ -414,6 +458,9 @@ export class PlanetLayer extends Container {
       v.body.scale.set(v.bodyBaseScale * v.displayScale * pulse * swirlWobble * ringGrowth);
       v.body.rotation = anyRingActive ? Math.sin(v.swirlPhase * 0.5) * 0.06 : 0;
       v.halo.scale.set(v.displayScale * pulse * ringGrowth);
+      // Halo breathes with the ambient music bed so the whole board swells
+      // and settles together — subtle, but it ties sight to sound.
+      v.halo.alpha = 0.82 + 0.18 * this.beat;
 
       // Effective radius rings / count / selection should space themselves off.
       const effRadius = v.baseRadius * v.displayScale * ringGrowth;
@@ -519,6 +566,25 @@ export class PlanetLayer extends Container {
           .circle(0, 0, flashR * 0.6)
           .fill({ color: pal.ring, alpha: p.capturePulse * 0.25 });
       }
+      // Victory cascade: renderer-driven shockwaves chained across the
+      // winner's worlds (the sim is frozen at game over, so this can't ride
+      // on the sim's evolvePulse).
+      if (v.celebrateDelay > 0) {
+        v.celebrateDelay -= dt;
+        if (v.celebrateDelay <= 0) v.celebratePulse = 1;
+      }
+      if (v.celebratePulse > 0.01) {
+        v.celebratePulse = Math.max(0, v.celebratePulse - dt * 0.7);
+        const t = 1 - v.celebratePulse;
+        const shockR = effRadius * (1.1 + t * 3.2);
+        const alpha = v.celebratePulse * 0.8;
+        v.shockwave
+          .circle(0, 0, shockR)
+          .stroke({ width: 3 + v.celebratePulse * 5, color: pal.glow, alpha });
+        v.shockwave
+          .circle(0, 0, shockR * 0.8)
+          .stroke({ width: 2, color: 0xffffff, alpha: alpha * 0.5 });
+      }
 
       // Selection ring (pulsing) sits outside the capacity rings.
       v.ring.clear();
@@ -555,7 +621,57 @@ export class PlanetLayer extends Container {
       }
 
       this.drawProductionPulses(v, dt, effRadius, pal);
+      this.updateCostLabel(v, p, effRadius);
     }
+  }
+
+  /**
+   * "n / cap" readout for the player's ringed planets — the upgrade economy
+   * in plain numbers, so the cost of the next evolution is never a mystery.
+   * Lazily creates the Text and only touches it when the string changes.
+   */
+  private updateCostLabel(
+    v: PlanetView,
+    p: import('../sim/Planet.js').Planet,
+    effRadius: number,
+  ): void {
+    const show = p.owner === 0 && p.ringCount > 0;
+    if (!show) {
+      if (v.costLabel && v.costLabel.visible) v.costLabel.visible = false;
+      return;
+    }
+    // Status of the first unfilled ring (rings fill in order).
+    let fill = 0;
+    let cap = 0;
+    for (let k = 0; k < p.ringCount; k++) {
+      cap = ringCapacity(p.type, k);
+      fill = p.ringFillProgress[k] ?? 0;
+      if (fill < cap) break;
+    }
+    const text = `${Math.min(fill, cap)} / ${cap}`;
+    if (!v.costLabel) {
+      const label = new Text({
+        text,
+        style: {
+          fontFamily: '-apple-system, "Segoe UI", Roboto, sans-serif',
+          fontSize: 12,
+          fill: 0xdbe6f8,
+        },
+      });
+      label.resolution = 2;
+      label.anchor.set(0.5, 0);
+      label.alpha = 0.8;
+      v.container.addChild(label);
+      v.costLabel = label;
+      v.lastCostText = text;
+    } else if (text !== v.lastCostText) {
+      v.costLabel.text = text;
+      v.lastCostText = text;
+    }
+    v.costLabel.visible = true;
+    // Sits just below the strength bar (bar bottom ≈ effRadius + height + 6).
+    v.costLabel.x = 0;
+    v.costLabel.y = effRadius + Math.max(3, effRadius * 0.1) + 12;
   }
 
   /**
@@ -909,7 +1025,8 @@ export class PlanetLayer extends Container {
       o.glow.x = o.sprite.x;
       o.glow.y = o.sprite.y;
       const glowFlicker = 0.65 + 0.35 * Math.sin(this.time * 3.1 + o.phase * 1.7);
-      o.glow.alpha = 0.55 * glowFlicker * (bp < 1 ? bp : 1);
+      const breathe = 0.88 + 0.24 * this.beat;
+      o.glow.alpha = 0.55 * glowFlicker * breathe * (bp < 1 ? bp : 1);
       o.glow.scale.set(o.glowScale * (bp < 1 ? 0.4 + 0.6 * bp : 1));
     }
   }

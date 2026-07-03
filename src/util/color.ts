@@ -12,6 +12,11 @@ export const NEUTRAL: PlayerPalette = {
   ring: 0x6a7488,
 };
 
+/**
+ * Player colors: blue, pink, gold, violet. Green is deliberately absent —
+ * it's reserved for the neutral-swarm hazard hostiles (see HazardLayer), so
+ * in a 3–4 player free-for-all no rival can be confused with the swarm.
+ */
 export const PLAYER_PALETTES: PlayerPalette[] = [
   {
     core: 0x7ad4ff,
@@ -26,16 +31,16 @@ export const PLAYER_PALETTES: PlayerPalette[] = [
     ring: 0xe04a78,
   },
   {
-    core: 0x9cff7a,
-    glow: 0x2f8a1d,
-    ship: 0xc4ffae,
-    ring: 0x78d04a,
-  },
-  {
     core: 0xffd27a,
     glow: 0xb8861d,
     ship: 0xffe8ae,
     ring: 0xe0b24a,
+  },
+  {
+    core: 0xc79aff,
+    glow: 0x6b2fb8,
+    ship: 0xe0c8ff,
+    ring: 0xa76ae0,
   },
 ];
 

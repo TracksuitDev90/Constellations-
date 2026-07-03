@@ -36,7 +36,7 @@ interface NeutralVisual {
   active: boolean;
 }
 
-const NEUTRAL_TINT = 0x9cff7a; // Match PLAYER_PALETTES[2] core; reads as the swarm's banner color.
+const NEUTRAL_TINT = 0x9cff7a; // Green is reserved for the swarm — no player palette uses it.
 const NEUTRAL_GLOW = 0x2f8a1d;
 
 const ROCK_DENSITY = 1 / 1800; // rocks per square pixel of zone area.

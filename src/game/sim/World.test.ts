@@ -25,32 +25,21 @@ const linearMap: MapSpec = {
   ],
 };
 
-describe('World.findPath', () => {
-  it('returns shortest path along edges', () => {
+describe('free-flight streaming', () => {
+  it('reaches a distant planet directly, ignoring the edge graph', () => {
+    // Auralux-style movement: no routing — planet 2 is not edge-connected to
+    // planet 0 at all, and the wave still flies straight to it.
     const w = new World(linearMap, [
       { id: 0, isAI: false, name: 'P' },
       { id: 1, isAI: true, name: 'A' },
     ]);
-    expect(w.findPath(0, 2)).toEqual([0, 1, 2]);
-  });
-
-  it('returns empty when disconnected', () => {
-    const w = new World(
-      {
-        width: 100,
-        height: 100,
-        planets: [
-          { pos: { x: 10, y: 50 }, radius: 10, owner: 0, garrison: 1 },
-          { pos: { x: 90, y: 50 }, radius: 10, owner: 1, garrison: 1 },
-        ],
-        edges: [],
-      },
-      [
-        { id: 0, isAI: false, name: 'P' },
-        { id: 1, isAI: true, name: 'A' },
-      ],
-    );
-    expect(w.findPath(0, 1)).toEqual([]);
+    for (const p of w.planets) p.productionRate = 0;
+    w.openStream(0, 0, 2, 20);
+    for (let i = 0; i < 600; i++) w.step(0.05);
+    // Wave went straight for planet 2 — the intermediate planet 1 keeps its
+    // owner and full garrison because nothing routed through it.
+    expect(w.planets[1].garrison).toBe(5);
+    expect(w.planets[2].owner).toBe(0);
   });
 });
 
@@ -342,26 +331,29 @@ describe('neutral swarm hazard', () => {
         },
       ],
     };
-    const w = new World(map, [
-      { id: 0, isAI: false, name: 'P' },
-      { id: 1, isAI: true, name: 'A' },
-    ]);
+    let shipDeaths = 0;
+    let neutralDeaths = 0;
+    const w = new World(
+      map,
+      [
+        { id: 0, isAI: false, name: 'P' },
+        { id: 1, isAI: true, name: 'A' },
+      ],
+      {
+        onShipDeath: () => shipDeaths++,
+        onNeutralDeath: () => neutralDeaths++,
+      },
+    );
     expect(w.neutrals.activeCount()).toBe(3);
     // Send a wave through the swarm; expect ships and neutrals to trade.
     for (const p of w.planets) p.productionRate = 0;
     w.openStream(0, 0, 1, 10);
     for (let i = 0; i < 600; i++) w.step(0.05);
-    // At least one neutral should have died — i.e. live count is now < 3
-    // (respawn is slow enough that we shouldn't have fully refilled yet
-    // unless the wave passed without contact, which the geometry rules out).
-    const lostAtLeastOne = w.neutrals.activeCount() < 3;
-    // OR every neutral is still up but at least one ship died — both signal
-    // contact. Tally either signal as a pass.
-    const launched = 10;
-    const survivors = w.ships.all.filter(
-      (s) => s.active && s.owner === 0 && (s.state === 'transit' || s.state === 'orbiting'),
-    ).length;
-    expect(lostAtLeastOne || survivors < launched).toBe(true);
+    // Contact must have happened: the swarm shoots down passing ships and
+    // dies 1:1 in the exchange (respawn may have refilled the count, so we
+    // assert on the death events, not the final population).
+    expect(shipDeaths).toBeGreaterThan(0);
+    expect(neutralDeaths).toBeGreaterThan(0);
   });
 });
 
@@ -396,29 +388,35 @@ describe('World game over', () => {
   });
 });
 
-describe('multi-hop streaming through neutrals', () => {
-  it('chains a wave through an intermediate neutral once captured', () => {
-    // A → B → C: B starts neutral. Player streams from A toward C; the
-    // dormant B-leg should fire automatically the moment B flips.
+describe('human elimination in free-for-all', () => {
+  it('ends the match as soon as the human is out, even with AIs alive', () => {
     const map: MapSpec = {
       width: 600,
       height: 100,
       planets: [
-        { pos: { x: 50, y: 50 }, radius: 14, owner: 0, garrison: 60, type: 0 },
-        { pos: { x: 300, y: 50 }, radius: 14, owner: null, garrison: 4, type: 0 },
-        { pos: { x: 550, y: 50 }, radius: 14, owner: null, garrison: 4, type: 0 },
+        { pos: { x: 50, y: 50 }, radius: 14, owner: 0, garrison: 1, type: 0 },
+        { pos: { x: 300, y: 50 }, radius: 14, owner: 1, garrison: 30, type: 0 },
+        { pos: { x: 550, y: 50 }, radius: 14, owner: 2, garrison: 30, type: 0 },
       ],
-      edges: [
-        [0, 1],
-        [1, 2],
-      ],
+      edges: [],
     };
-    const w = new World(map, [{ id: 0, isAI: false, name: 'P' }]);
-    w.planets[0].productionRate = 0;
-    w.openStream(0, 0, 2);
-    for (let i = 0; i < 3000 && w.planets[2].owner !== 0; i++) w.step(0.05);
-    expect(w.planets[1].owner).toBe(0);
-    expect(w.planets[2].owner).toBe(0);
+    const w = new World(map, [
+      { id: 0, isAI: false, name: 'P' },
+      { id: 1, isAI: true, name: 'A' },
+      { id: 2, isAI: true, name: 'B' },
+    ]);
+    for (const p of w.planets) p.productionRate = 0;
+    // Let a step register all three owners as "seen", then wipe the human.
+    w.step(1 / 30);
+    expect(w.gameOver).toBe(false);
+    w.planets[0].owner = null;
+    w.planets[0].garrison = 0;
+    for (const s of w.ships.all) if (s.owner === 0) s.active = false;
+    w.step(1 / 30);
+    expect(w.gameOver).toBe(true);
+    // Two AIs still stand — the "winner" is a rival, never the human.
+    expect(w.winner).not.toBe(0);
+    expect(w.winner).not.toBeNull();
   });
 });
 
@@ -518,7 +516,47 @@ describe('ship combat at negative coordinates', () => {
       s.targetY = sy;
     }
     for (let i = 0; i < 150; i++) w.step(1 / 30);
-    const survivors = w.ships.all.filter((s) => s.active).length;
-    expect(survivors).toBe(0);
+    // Only the two hover combatants matter — seeded starting orbiters far
+    // away at the planets stay alive by design.
+    const hoverSurvivors = w.ships.all.filter(
+      (s) => s.active && s.state === 'hovering',
+    ).length;
+    expect(hoverSurvivors).toBe(0);
+  });
+});
+
+describe('fractional sends', () => {
+  it('half-selection keeps the unselected half of the swarm at home', () => {
+    const map: MapSpec = {
+      width: 400,
+      height: 200,
+      planets: [
+        { pos: { x: 50, y: 100 }, radius: 16, owner: 0, garrison: 0 },
+        { pos: { x: 350, y: 100 }, radius: 16, owner: null, garrison: 30 },
+      ],
+      edges: [[0, 1]],
+    };
+    const w = new World(map, [{ id: 0, isAI: false, name: 'P' }]);
+    // Build up a live swarm, then freeze production.
+    w.planets[0].productionRate = 6;
+    for (let i = 0; i < 120; i++) w.step(0.05);
+    w.planets[0].productionRate = 0;
+    const before = w.planets[0].garrison;
+    expect(before).toBeGreaterThanOrEqual(10);
+    // Select every other orbiter — exactly what Selection's half-stage does.
+    let i = 0;
+    for (const s of w.ships.all) {
+      if (s.active && s.state === 'orbiting' && s.parentPlanet === 0) {
+        if (i % 2 === 0) s.isSelected = true;
+        i++;
+      }
+    }
+    const sent = w.commandSelectedTo(0, { planetId: 1 });
+    // Roughly half went; the rest — including any production overflow —
+    // stayed garrisoned instead of being force-drained.
+    expect(sent).toBeGreaterThan(0);
+    expect(sent).toBeLessThan(before);
+    expect(w.planets[0].garrison).toBe(before - sent);
+    expect(w.planets[0].garrison).toBeGreaterThan(0);
   });
 });

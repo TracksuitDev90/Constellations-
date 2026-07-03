@@ -21,18 +21,23 @@ export class Hud {
   private bars: HTMLDivElement[] = [];
   private muteBtn: HTMLButtonElement;
   private pauseBtn: HTMLButtonElement;
+  private speedBtn: HTMLButtonElement;
   private pauseOverlay: HTMLDivElement;
   private onToggleMute: () => boolean;
   private onTogglePause: () => boolean;
+  private onCycleSpeed: () => number;
 
   constructor(
     container: HTMLElement,
     world: World,
     onToggleMute: () => boolean,
     onTogglePause: () => boolean,
+    onCycleSpeed: () => number,
+    initialSpeed = 1,
   ) {
     this.onToggleMute = onToggleMute;
     this.onTogglePause = onTogglePause;
+    this.onCycleSpeed = onCycleSpeed;
     this.root = document.createElement('div');
     Object.assign(this.root.style, {
       position: 'absolute',
@@ -48,9 +53,9 @@ export class Hud {
       color: '#cfd6e4',
     });
 
-    // Two bars (player 0, player 1)
-    for (let i = 0; i < 2; i++) {
-      const pal = paletteFor(i);
+    // One strength bar per player, in player order (human first).
+    for (const player of world.players) {
+      const pal = paletteFor(player.id);
       const bar = document.createElement('div');
       Object.assign(bar.style, {
         flex: '1',
@@ -71,6 +76,18 @@ export class Hud {
       this.bars.push(fill);
       this.root.appendChild(bar);
     }
+
+    // Sim-speed cycle (1× → 2× → 4×), an Auralux staple for the slow
+    // opening minutes of a match.
+    this.speedBtn = document.createElement('button');
+    this.speedBtn.textContent = `${initialSpeed}×`;
+    this.speedBtn.title = 'Game speed';
+    Object.assign(this.speedBtn.style, btnStyle, { fontSize: '15px' });
+    this.speedBtn.addEventListener('click', () => {
+      const speed = this.onCycleSpeed();
+      this.speedBtn.textContent = `${speed}×`;
+    });
+    this.root.appendChild(this.speedBtn);
 
     this.pauseBtn = document.createElement('button');
     this.pauseBtn.textContent = '❙❙';
@@ -127,11 +144,11 @@ export class Hud {
   }
 
   update(world: World): void {
-    const t0 = world.totalGarrison(0);
-    const t1 = world.totalGarrison(1);
-    const total = Math.max(1, t0 + t1);
-    this.bars[0].style.width = `${(t0 / total) * 100}%`;
-    this.bars[1].style.width = `${(t1 / total) * 100}%`;
+    const strengths = world.players.map((p) => world.totalGarrison(p.id));
+    const total = Math.max(1, strengths.reduce((a, b) => a + b, 0));
+    for (let i = 0; i < this.bars.length; i++) {
+      this.bars[i].style.width = `${((strengths[i] ?? 0) / total) * 100}%`;
+    }
   }
 
   destroy(): void {

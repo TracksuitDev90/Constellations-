@@ -62,7 +62,11 @@ export const loadPlanetAssets = (
 ): Promise<void> => {
   const jobs: Array<Promise<void>> = [];
   for (const arch of archetypes) {
-    if (sources.has(arch) || failed.has(arch)) continue;
+    if (sources.has(arch)) continue;
+    // A past failure (flaky network, dropped connection) gets one fresh
+    // attempt per load call — a single hiccup shouldn't consign an
+    // archetype to the procedural fallback for the whole session.
+    failed.delete(arch);
     let job = pending.get(arch);
     if (!job) {
       job = (async () => {

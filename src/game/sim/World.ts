@@ -254,6 +254,16 @@ export class World {
       this.neighbors.get(a)!.push(b);
       this.neighbors.get(b)!.push(a);
     }
+    // Seed live orbiters for authored starting garrisons so the opening
+    // swarm is real, tappable units (Auralux starts you with a swarm you
+    // can immediately gather) — not phantom garrison that only turns into
+    // ships as new production ticks in.
+    for (const p of this.planets) {
+      if (p.owner === null) continue;
+      const live = Math.min(p.garrison, p.maxUnitCapacity);
+      for (let i = 0; i < live; i++) this.seedOrbiter(p);
+    }
+
     // Apply hazards from the spec. Discriminated union — only the variant
     // matched by `type` carries the relevant data.
     for (const h of map.hazards ?? []) {
@@ -290,9 +300,12 @@ export class World {
   }
 
   /**
-   * Send a one-shot wave of ships from source -> target along constellation edges.
-   * If `count` is omitted, the entire current garrison of the source is launched.
-   * Streams are discrete — the player taps again for another wave.
+   * Send a one-shot wave of ships straight from source to target. Movement
+   * is free-flight (Auralux-style) — the constellation edge lines are purely
+   * decorative, so a wave crosses open space directly and can be intercepted
+   * anywhere along the way. If `count` is omitted, the entire current
+   * garrison of the source launches. Streams are discrete — the player taps
+   * again for another wave.
    */
   openStream(
     owner: number,
@@ -303,57 +316,21 @@ export class World {
   ): void {
     if (source === target) return;
     const src = this.planets[source];
-    if (src.owner !== owner) return;
-    const path = this.findPath(source, target);
-    if (path.length < 2) return;
-    const nextHop = path[1];
+    if (!src || src.owner !== owner) return;
+    if (!this.planets[target]) return;
     const remaining = count === undefined ? src.garrison : Math.min(count, src.garrison);
     if (remaining <= 0) return;
-    const absorbOnArrive = opts.absorbOnArrive ?? false;
     this.cancelStreamsFrom(source, owner);
-    // Only the final-hop stream (nextHop === target) should carry the absorb
-    // flag — mid-hop waypoints are friendly planets we just pass through.
     this.streams.push(
       createStream(
         owner,
         source,
-        nextHop,
+        target,
         DEFAULT_EMIT_INTERVAL,
         remaining,
-        absorbOnArrive && nextHop === target,
+        opts.absorbOnArrive ?? false,
       ),
     );
-    if (nextHop !== target) {
-      this.queueDownstream(owner, path, remaining, absorbOnArrive);
-    }
-  }
-
-  private queueDownstream(
-    owner: number,
-    path: number[],
-    remaining: number,
-    absorbOnArrive: boolean,
-  ): void {
-    // Queue every leg of the path. Legs whose source isn't yet owned by the
-    // streamer stay dormant — `step()` skips emission while ownership is
-    // wrong, then fires the wave automatically once the leading capture
-    // flips the planet. Lets the player tap a far world and watch a chain
-    // of captures unfold without re-issuing orders at each waypoint.
-    for (let i = 1; i < path.length - 1; i++) {
-      const s = path[i];
-      const t = path[i + 1];
-      this.cancelStreamsFrom(s, owner);
-      this.streams.push(
-        createStream(
-          owner,
-          s,
-          t,
-          DEFAULT_EMIT_INTERVAL,
-          remaining,
-          absorbOnArrive && t === path[path.length - 1],
-        ),
-      );
-    }
   }
 
   cancelStreamsFrom(source: number, owner: number): void {
@@ -362,34 +339,6 @@ export class World {
 
   cancelAllStreamsOf(owner: number): void {
     this.streams = this.streams.filter((s) => s.owner !== owner);
-  }
-
-  /** BFS shortest path along constellation edges. */
-  findPath(from: number, to: number): number[] {
-    if (from === to) return [from];
-    const prev = new Map<number, number>();
-    const queue: number[] = [from];
-    const visited = new Set<number>([from]);
-    while (queue.length) {
-      const cur = queue.shift()!;
-      if (cur === to) break;
-      for (const n of this.neighbors.get(cur) ?? []) {
-        if (visited.has(n)) continue;
-        visited.add(n);
-        prev.set(n, cur);
-        queue.push(n);
-      }
-    }
-    if (!prev.has(to) && from !== to) return [];
-    const path: number[] = [to];
-    let cur = to;
-    while (cur !== from) {
-      const p = prev.get(cur);
-      if (p === undefined) return [];
-      path.unshift(p);
-      cur = p;
-    }
-    return path;
   }
 
   /**
@@ -461,12 +410,15 @@ export class World {
     }
     // Drain residual garrison on source planets by spawning fresh transit
     // ships straight from the planet edge. Covers the production-overflow
-    // case (garrison > live-orbiter cap) so commanding a planet's units
-    // always leaves the planet at zero.
+    // case (garrison > live-orbiter cap) so commanding a planet's FULL
+    // swarm always leaves it at zero. Skipped while the planet still has
+    // live orbiters — that means this was a fractional (half) send and the
+    // remaining garrison is intentionally staying home.
     for (const pid of drained) {
       if (planetTarget && pid === target.planetId) continue;
       const src = this.planets[pid];
       if (!src || src.owner !== owner) continue;
+      if (this.countOrbitersOf(pid) > 0) continue;
       while (src.garrison > 0) {
         src.garrison -= 1;
         this.spawnTransitFromPlanet(src, target, absorbOnArrive);
@@ -615,16 +567,12 @@ export class World {
       }
     }
 
-    // Drop finished streams. Streams whose source is null-owned (neutral,
-    // not yet captured) stay alive so a queued forward-leg fires as soon as
-    // the leading wave flips the planet. Streams whose source has fallen to
-    // another player are dropped — they can no longer fire and would
-    // otherwise leak forever.
+    // Drop finished streams, and streams whose source planet the streamer no
+    // longer owns — they can never fire again and would otherwise leak.
     this.streams = this.streams.filter((s) => {
       if (s.remaining <= 0) return false;
       const src = this.planets[s.source];
-      if (!src) return false;
-      return src.owner === null || src.owner === s.owner;
+      return !!src && src.owner === s.owner;
     });
 
     // Ship simulation. Each state runs its own steering pass. Neighbor
@@ -846,6 +794,35 @@ export class World {
       this.events.onShipDeath?.(s.owner, s.x, s.y);
       this.ships.kill(idx);
     }
+  }
+
+  /**
+   * Spawn an orbiter already settled on its orbit band with tangential
+   * velocity — used at world construction so starting garrisons begin as a
+   * calm orbiting swarm instead of erupting from the planet center.
+   */
+  private seedOrbiter(planet: Planet): void {
+    if (planet.owner === null) return;
+    const angle = Math.random() * Math.PI * 2;
+    const orbitRadius = planet.radius * ORBIT_RADIUS_MULT + (Math.random() - 0.5) * 6;
+    const pos = vec(
+      planet.pos.x + Math.cos(angle) * orbitRadius,
+      planet.pos.y + Math.sin(angle) * orbitRadius,
+    );
+    const orbitDir = Math.random() < 0.5 ? 1 : -1;
+    const tangentSpeed = SHIP_SPEED * 0.75 * orbitDir;
+    this.ships.spawn(planet.owner, pos, -1, SHIP_SPEED, {
+      vx: (-Math.sin(angle)) * tangentSpeed,
+      vy: Math.cos(angle) * tangentSpeed,
+      turnRate: 2.2 + Math.random() * 1.6,
+      wobbleAmp: 0,
+      wobblePhase: 0,
+      state: 'orbiting',
+      parentPlanet: planet.id,
+      orbitRadius,
+      orbitDir,
+      wanderPhase: Math.random() * Math.PI * 2,
+    });
   }
 
   /** Spawn a new orbit unit emerging from the planet center. */
@@ -1486,9 +1463,32 @@ export class World {
     for (const a of alive) this.playersSeen.add(a);
     // Don't end the match until at least two players have actually entered.
     if (this.playersSeen.size < 2) return;
-    if (alive.size <= 1) {
+    // In a free-for-all the match also ends the moment every human is out —
+    // there's no reason to make the player spectate two AIs grinding each
+    // other down after their own defeat.
+    const humansEliminated = this.players.some(
+      (pl) => !pl.isAI && this.playersSeen.has(pl.id) && !alive.has(pl.id),
+    );
+    if (alive.size <= 1 || humansEliminated) {
       this.gameOver = true;
-      this.winner = alive.size === 1 ? [...alive][0] : null;
+      // Sole survivor wins; on human elimination with rivals still standing,
+      // credit the current strongest AI so the end screen has a face.
+      if (alive.size === 1) {
+        this.winner = [...alive][0];
+      } else if (alive.size === 0) {
+        this.winner = null;
+      } else {
+        let best: number | null = null;
+        let bestStrength = -1;
+        for (const id of alive) {
+          const strength = this.totalGarrison(id);
+          if (strength > bestStrength) {
+            bestStrength = strength;
+            best = id;
+          }
+        }
+        this.winner = best;
+      }
       this.events.onGameOver?.(this.winner);
     }
   }

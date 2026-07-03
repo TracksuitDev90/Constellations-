@@ -22,20 +22,28 @@ export const SIZE_RADIUS: Record<PlanetType, number> = {
   3: 66,
 };
 
-/** Base production rate (ships/sec) per size. Bigger = meaningfully faster. */
+/**
+ * Base production rate (ships/sec) per size. Roughly doubling per tier
+ * (Auralux's curve) so an evolved planet is genuinely scary — the flat old
+ * curve (0.8/1.3/1.9/2.6) made upgrading feel optional and matches drag on.
+ */
 export const BASE_PRODUCTION: Record<PlanetType, number> = {
   0: 0.8,
-  1: 1.3,
-  2: 1.9,
-  3: 2.6,
+  1: 1.6,
+  2: 3.0,
+  3: 5.0,
 };
 
-/** Soft cap on live orbit ships per size. */
+/**
+ * Soft cap on live orbit ships per size. Tightened at the top so late-game
+ * wins come from production tempo and map control, not from one planet
+ * hoarding an unbeatable stockpile.
+ */
 export const BASE_UNIT_CAPACITY: Record<PlanetType, number> = {
   0: 40,
   1: 70,
-  2: 110,
-  3: 160,
+  2: 100,
+  3: 130,
 };
 
 /**

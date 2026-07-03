@@ -31,6 +31,12 @@ export class ShipLayer extends Container {
   private glowRoot: Container;
   private shipRoot: Container;
   private time = 0;
+  /** Ambient-music breathing (0..1), fed by Game each frame via setBeat. */
+  private beat = 0;
+
+  setBeat(v: number): void {
+    this.beat = v;
+  }
 
   constructor(app: Application, world: World) {
     super();
@@ -99,7 +105,8 @@ export class ShipLayer extends Container {
         entry.glow.y = s.y;
         entry.glow.tint = tint;
         const flicker = 0.75 + 0.25 * Math.sin(this.time * 4.5 + entry.flickerPhase);
-        entry.glow.alpha = (s.isSelected ? 0.8 : 0.55) * flicker;
+        const breathe = 0.88 + 0.24 * this.beat;
+        entry.glow.alpha = (s.isSelected ? 0.8 : 0.55) * flicker * breathe;
         entry.glow.scale.set(entry.glowScale * (s.isSelected ? 1.35 : 1));
         entry.active = true;
       } else if (entry.active) {

@@ -77,27 +77,17 @@ export const makeShipGlowTexture = (app: Application): Texture => {
 export type PlanetArchetype = string;
 
 /**
- * Source files in public/textures whose painted artwork would clash with
- * the runtime ring overlay system. IMG_0327 (blue brushstroke ring) and
- * IMG_0344 (teal tendril) are still loaded — their painted rings are the
- * canonical reference that planetAssets.ts lifts and applies as overlays —
- * but we keep IMG_0320 (Saturn-style tan rings) out of the body pool because
- * its ring style doesn't match the unified overlay look.
- */
-const RING_PAINTED_TEXTURES: ReadonlySet<PlanetArchetype> = new Set([
-  'IMG_0320',
-]);
-
-/**
- * The full pool of available planet textures: IMG_0314 … IMG_0352 minus the
- * ones whose source artwork already contains rings or trails. Adding a new
+ * The full pool of available planet textures: IMG_0314 … IMG_0352. Stickers
+ * whose artwork carries painted rings (e.g. IMG_0320's Saturn-style tan
+ * rings) are included — the baker measures each sticker's ring extent and
+ * expands the baked canvas so the entire ring is displayed. Adding a new
  * map means dropping the file in public/textures and extending this list —
  * the baker keys off the id directly.
  */
 export const PHOTOGRAPHIC_ARCHETYPES: readonly PlanetArchetype[] = Array.from(
   { length: 39 },
   (_, i) => `IMG_${String(314 + i).padStart(4, '0')}`,
-).filter((id) => !RING_PAINTED_TEXTURES.has(id));
+);
 
 /**
  * Reserved for archetypes that should stay procedural instead of using a

@@ -68,6 +68,13 @@ export class Audio {
   /** Last clock time the rumble target intensity was non-zero. */
   private combatLastActiveAt = 0;
   private etherealTimer: number | null = null;
+  /**
+   * Shared bus for the whole ambient bed (pad, sub, shimmer, ghost voices,
+   * noise beds, ethereal one-shots, motif). A pair of ultra-slow LFOs ride
+   * its gain so the entire soundtrack ebbs and swells over multi-minute
+   * tides — the music breathes as one body instead of holding one level.
+   */
+  private bedGain: GainNode | null = null;
   /** Live pad oscillator pairs (main + detuned twin) for chord glides. */
   private padOscPairs: Array<{ a: OscillatorNode; b: OscillatorNode }> = [];
   private subOscNode: OscillatorNode | null = null;
@@ -143,6 +150,18 @@ export class Audio {
     if (!this.ctx || !this.musicGain) return;
     this.musicStarted = true;
 
+    // ── Tide bus ──────────────────────────────────────────────────────────
+    // Everything in the ambient bed routes through this gain, whose level
+    // drifts on two ultra-slow LFOs (~2- and ~4-minute cycles). Their sum
+    // never repeats cleanly, so the whole soundtrack ebbs away and swells
+    // back like a tide — the "comfy" macro-motion under all the detail.
+    const bed = this.ctx.createGain();
+    bed.gain.value = 0.88;
+    bed.connect(this.musicGain);
+    this.bedGain = bed;
+    this.attachSlowLfo(bed.gain, 0.0078, 0.16);
+    this.attachSlowLfo(bed.gain, 0.0043, 0.1);
+
     // ── Filter bus ────────────────────────────────────────────────────────
     // Main lowpass with THREE summed LFOs at prime-ish rates. The combined
     // modulation never repeats cleanly so the cutoff meanders instead of
@@ -151,7 +170,7 @@ export class Audio {
     filter.type = 'lowpass';
     filter.frequency.value = 820;
     filter.Q.value = 0.8;
-    filter.connect(this.musicGain);
+    filter.connect(bed);
 
     this.attachSlowLfo(filter.frequency, 0.067, 360);
     this.attachSlowLfo(filter.frequency, 0.023, 190);
@@ -184,7 +203,7 @@ export class Audio {
     this.subOscNode = subOsc;
     const subGain = this.ctx.createGain();
     subGain.gain.value = 0.045;
-    subOsc.connect(subGain).connect(this.musicGain);
+    subOsc.connect(subGain).connect(bed);
     subOsc.start();
     // Breath LFO on the sub gain — slow, deep.
     this.attachSlowLfo(subGain.gain, 0.011, 0.04);
@@ -355,7 +374,7 @@ export class Audio {
     lp.type = 'lowpass';
     lp.frequency.value = 1600;
     lp.Q.value = 0.5;
-    lp.connect(this.musicGain);
+    lp.connect(this.bedGain ?? this.musicGain);
     for (let n = 0; n < noteCount; n++) {
       const f = MOTIF_POOL[idx];
       const fade = 1 - (n / noteCount) * 0.45; // phrase decrescendo
@@ -437,7 +456,7 @@ export class Audio {
     g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
     osc1.connect(g);
     osc2.connect(g);
-    g.connect(this.musicGain);
+    g.connect(this.bedGain ?? this.musicGain);
     osc1.start(now);
     osc2.start(now);
     osc1.stop(now + dur + 0.1);
@@ -486,18 +505,18 @@ export class Audio {
     g.gain.setValueAtTime(0.0001, now);
     g.gain.exponentialRampToValueAtTime(peak, now + dur * 0.3);
     g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
-    src.connect(bp).connect(g).connect(this.musicGain);
+    src.connect(bp).connect(g).connect(this.bedGain ?? this.musicGain);
     src.start(now);
     src.stop(now + dur + 0.1);
   }
 
   /**
-   * Queue up the next sparse ambient one-shot. Variable gap (8..22s) so the
+   * Queue up the next sparse ambient one-shot. Variable gap (6..19s) so the
    * variance feels natural, never rhythmic. Reschedules itself forever.
    */
   private scheduleEthereal(): void {
     if (this.etherealTimer !== null) clearTimeout(this.etherealTimer);
-    const delay = 8000 + Math.random() * 14000;
+    const delay = 6000 + Math.random() * 13000;
     this.etherealTimer = window.setTimeout(() => {
       this.etherealTimer = null;
       if (!this.muted) this.playEthereal();
@@ -514,11 +533,15 @@ export class Audio {
     // Suspended context (page hidden): skip — scheduling against a frozen
     // clock would stack every missed one-shot onto the moment of resume.
     if (this.ctx.state !== 'running') return;
-    const pick = Math.floor(Math.random() * 4);
+    const pick = Math.floor(Math.random() * 8);
     if (pick === 0) this.etherealWindSwell();
     else if (pick === 1) this.etherealDistantChime();
     else if (pick === 2) this.etherealDeepSweep();
-    else this.etherealShimmer();
+    else if (pick === 3) this.etherealShimmer();
+    else if (pick === 4) this.etherealCometWhistle();
+    else if (pick === 5) this.etherealPulsarEchoes();
+    else if (pick === 6) this.etherealAuroraSwell();
+    else this.etherealVoidBreath();
   }
 
   /** Long, breathy filtered-noise swell — reads as solar wind / space air. */
@@ -545,7 +568,7 @@ export class Audio {
     g.gain.setValueAtTime(0.0001, now);
     g.gain.exponentialRampToValueAtTime(peak, now + dur * 0.4);
     g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
-    src.connect(lp).connect(g).connect(this.musicGain);
+    src.connect(lp).connect(g).connect(this.bedGain ?? this.musicGain);
     src.start(now);
     src.stop(now + dur + 0.05);
   }
@@ -568,7 +591,7 @@ export class Audio {
       g.gain.setValueAtTime(0.0001, now);
       g.gain.exponentialRampToValueAtTime(gains[i], now + 1.2);
       g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
-      osc.connect(g).connect(this.musicGain);
+      osc.connect(g).connect(this.bedGain ?? this.musicGain);
       osc.start(now);
       osc.stop(now + dur + 0.05);
     }
@@ -589,7 +612,7 @@ export class Audio {
     g.gain.setValueAtTime(0.0001, now);
     g.gain.exponentialRampToValueAtTime(0.08, now + dur * 0.35);
     g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
-    osc.connect(g).connect(this.musicGain);
+    osc.connect(g).connect(this.bedGain ?? this.musicGain);
     osc.start(now);
     osc.stop(now + dur + 0.05);
   }
@@ -610,10 +633,154 @@ export class Audio {
       g.gain.setValueAtTime(0.0001, start);
       g.gain.exponentialRampToValueAtTime(0.018 / (i + 1), start + 0.6);
       g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
-      osc.connect(g).connect(this.musicGain);
+      osc.connect(g).connect(this.bedGain ?? this.musicGain);
       osc.start(start);
       osc.stop(start + dur + 0.05);
     }
+  }
+
+  /**
+   * A slow, falling whistle with gentle vibrato and a faint noise tail —
+   * something small streaking past very far away. Quiet and lowpassed so it
+   * reads as atmosphere, not an SFX.
+   */
+  private etherealCometWhistle(): void {
+    if (!this.ctx || !this.musicGain) return;
+    const now = this.ctx.currentTime;
+    const bus = this.bedGain ?? this.musicGain;
+    const dur = 3.5 + Math.random() * 2.5;
+    const f0 = 900 + Math.random() * 500;
+    const f1 = f0 * (0.4 + Math.random() * 0.15);
+    const osc = this.ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(f0, now);
+    osc.frequency.exponentialRampToValueAtTime(f1, now + dur);
+    // Gentle vibrato so the whistle wavers like it's crossing thin air.
+    this.attachSlowLfo(osc.frequency, 4.6, f0 * 0.008);
+    const lp = this.ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = 1800;
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.0001, now);
+    g.gain.exponentialRampToValueAtTime(0.022, now + dur * 0.3);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    osc.connect(lp).connect(g).connect(bus);
+    osc.start(now);
+    osc.stop(now + dur + 0.05);
+
+    // Faint airy tail trailing the whistle.
+    const tailDur = dur * 0.8;
+    const sr = this.ctx.sampleRate;
+    const buf = this.ctx.createBuffer(1, Math.max(1, Math.floor(sr * tailDur)), sr);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.Q.value = 1.2;
+    bp.frequency.setValueAtTime(f0 * 0.8, now);
+    bp.frequency.exponentialRampToValueAtTime(f1 * 0.8, now + tailDur);
+    const ng = this.ctx.createGain();
+    ng.gain.setValueAtTime(0.0001, now);
+    ng.gain.exponentialRampToValueAtTime(0.012, now + tailDur * 0.4);
+    ng.gain.exponentialRampToValueAtTime(0.0001, now + tailDur);
+    src.connect(bp).connect(ng).connect(bus);
+    src.start(now);
+    src.stop(now + tailDur + 0.05);
+  }
+
+  /**
+   * A soft repeating ping that echoes away into silence — a distant pulsar /
+   * sonar heartbeat. The repeats are slow (~0.5s) and each is quieter and
+   * darker than the last, so it recedes rather than insists.
+   */
+  private etherealPulsarEchoes(): void {
+    if (!this.ctx || !this.musicGain) return;
+    const now = this.ctx.currentTime;
+    const bus = this.bedGain ?? this.musicGain;
+    // Pentatonic-safe pitches so echoes stay consonant under any chord.
+    const roots = [440.0, 523.25, 587.33, 659.25]; // A4 C5 D5 E5
+    const f = roots[Math.floor(Math.random() * roots.length)];
+    const echoes = 4 + Math.floor(Math.random() * 3);
+    const gap = 0.45 + Math.random() * 0.2;
+    const lp = this.ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = 2200;
+    lp.connect(bus);
+    for (let i = 0; i < echoes; i++) {
+      const start = now + i * gap;
+      const peak = 0.035 * Math.pow(0.62, i);
+      const osc = this.ctx.createOscillator();
+      osc.type = 'sine';
+      // Each echo lands a hair flatter — the ping "sinking" into the distance.
+      osc.frequency.value = f * (1 - i * 0.004);
+      const g = this.ctx.createGain();
+      g.gain.setValueAtTime(0.0001, start);
+      g.gain.exponentialRampToValueAtTime(peak, start + 0.03);
+      g.gain.exponentialRampToValueAtTime(0.0001, start + 0.8);
+      osc.connect(g).connect(lp);
+      osc.start(start);
+      osc.stop(start + 0.85);
+    }
+  }
+
+  /**
+   * Two barely-detuned mid sines that swell together over ~8-12s — their
+   * beat frequency shimmers like an aurora curtain, then the pair recedes.
+   */
+  private etherealAuroraSwell(): void {
+    if (!this.ctx || !this.musicGain) return;
+    const now = this.ctx.currentTime;
+    const bus = this.bedGain ?? this.musicGain;
+    const dur = 8 + Math.random() * 4;
+    // Chord-family pitches an octave-ish above the pad.
+    const roots = [220.0, 261.63, 329.63, 392.0];
+    const f = roots[Math.floor(Math.random() * roots.length)];
+    const detune = 1.004 + Math.random() * 0.004; // ~1.5-3.5 Hz beating
+    for (const freq of [f, f * detune]) {
+      const osc = this.ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      const g = this.ctx.createGain();
+      g.gain.setValueAtTime(0.0001, now);
+      g.gain.exponentialRampToValueAtTime(0.02, now + dur * 0.45);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+      osc.connect(g).connect(bus);
+      osc.start(now);
+      osc.stop(now + dur + 0.05);
+    }
+  }
+
+  /**
+   * A deep, dark inhale-exhale of lowpassed noise — the void itself
+   * breathing once. Sits almost entirely under 300 Hz; felt more than heard.
+   */
+  private etherealVoidBreath(): void {
+    if (!this.ctx || !this.musicGain) return;
+    const now = this.ctx.currentTime;
+    const bus = this.bedGain ?? this.musicGain;
+    const dur = 5 + Math.random() * 3;
+    const sr = this.ctx.sampleRate;
+    const buf = this.ctx.createBuffer(1, Math.max(1, Math.floor(sr * dur)), sr);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    const lp = this.ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.Q.value = 0.7;
+    // The filter opens on the inhale and closes on the exhale.
+    lp.frequency.setValueAtTime(120, now);
+    lp.frequency.linearRampToValueAtTime(300, now + dur * 0.5);
+    lp.frequency.linearRampToValueAtTime(90, now + dur);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.0001, now);
+    g.gain.exponentialRampToValueAtTime(0.05, now + dur * 0.5);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    src.connect(lp).connect(g).connect(bus);
+    src.start(now);
+    src.stop(now + dur + 0.05);
   }
 
   shipLaunch(): void {

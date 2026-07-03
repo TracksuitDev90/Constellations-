@@ -72,6 +72,19 @@ export class Audio {
     if (!this.musicStarted && !this.muted) this.startAmbient();
   }
 
+  /**
+   * Suspend the context while the page is hidden — stops all DSP work
+   * (battery on mobile) and silences the ambient bed over other apps.
+   */
+  suspend(): void {
+    if (this.ctx && this.ctx.state === 'running') void this.ctx.suspend();
+  }
+
+  /** Resume after returning to the foreground (or an iOS audio interruption). */
+  resume(): void {
+    if (this.ctx && this.ctx.state === 'suspended') void this.ctx.resume();
+  }
+
   setMuted(muted: boolean): void {
     this.muted = muted;
     if (this.musicGain) this.musicGain.gain.value = muted ? 0 : this.musicVolume;
@@ -238,6 +251,9 @@ export class Audio {
 
   private playGhostVoice(): void {
     if (!this.ctx || !this.musicGain) return;
+    // Suspended context (page hidden): skip — scheduling against a frozen
+    // clock would stack every missed one-shot onto the moment of resume.
+    if (this.ctx.state !== 'running') return;
     const now = this.ctx.currentTime;
     // Intervals above A2 (110) that stay consonant with the A-minor pentatonic
     // pad — fifth, fourth, minor third, octave, major second up a tenth.
@@ -282,6 +298,9 @@ export class Audio {
 
   private playNoiseBed(): void {
     if (!this.ctx || !this.musicGain) return;
+    // Suspended context (page hidden): skip — scheduling against a frozen
+    // clock would stack every missed one-shot onto the moment of resume.
+    if (this.ctx.state !== 'running') return;
     const now = this.ctx.currentTime;
     const dur = 20 + Math.random() * 22;
     const sr = this.ctx.sampleRate;
@@ -328,6 +347,9 @@ export class Audio {
    */
   private playEthereal(): void {
     if (!this.ctx || !this.musicGain) return;
+    // Suspended context (page hidden): skip — scheduling against a frozen
+    // clock would stack every missed one-shot onto the moment of resume.
+    if (this.ctx.state !== 'running') return;
     const pick = Math.floor(Math.random() * 4);
     if (pick === 0) this.etherealWindSwell();
     else if (pick === 1) this.etherealDistantChime();

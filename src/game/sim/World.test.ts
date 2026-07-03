@@ -441,3 +441,84 @@ describe('moving planet capture', () => {
     expect(w.planets[1].owner).toBe(0);
   });
 });
+
+describe('totalGarrison', () => {
+  it('counts hovering units so parked fleets stay on the HUD bar', () => {
+    const map: MapSpec = {
+      width: 400,
+      height: 200,
+      planets: [
+        { pos: { x: 50, y: 100 }, radius: 16, owner: 0, garrison: 0 },
+        { pos: { x: 350, y: 100 }, radius: 16, owner: 1, garrison: 5 },
+      ],
+      edges: [[0, 1]],
+    };
+    const w = new World(map, [
+      { id: 0, isAI: false, name: 'P' },
+      { id: 1, isAI: true, name: 'A' },
+    ]);
+    w.planets[0].productionRate = 4;
+    for (let i = 0; i < 80; i++) w.step(0.05);
+    w.planets[0].productionRate = 0;
+    const before = w.totalGarrison(0);
+    expect(before).toBeGreaterThan(3);
+    // Send everything to a free-space hold point and let it settle to hover.
+    for (const s of w.ships.all) {
+      if (s.active && s.state === 'orbiting' && s.parentPlanet === 0) s.isSelected = true;
+    }
+    const n = w.commandSelectedTo(0, { x: 200, y: 100 });
+    expect(n).toBeGreaterThan(0);
+    for (let i = 0; i < 400; i++) w.step(1 / 30);
+    const hovering = w.ships.all.filter((s) => s.active && s.state === 'hovering').length;
+    expect(hovering).toBeGreaterThan(0);
+    // The parked fleet must still count toward the player's total strength.
+    expect(w.totalGarrison(0)).toBe(before);
+  });
+});
+
+describe('ship combat at negative coordinates', () => {
+  it('mutually destroys opposing hover fleets even off the map origin', () => {
+    // Two enemy units hovering around adjacent negative-coordinate points —
+    // the old spatial-hash key packing corrupted negative cells, so pairs
+    // straddling a cell boundary there never collided.
+    const map: MapSpec = {
+      width: 400,
+      height: 200,
+      planets: [
+        { pos: { x: 50, y: 100 }, radius: 16, owner: 0, garrison: 5 },
+        { pos: { x: 350, y: 100 }, radius: 16, owner: 1, garrison: 5 },
+      ],
+      edges: [[0, 1]],
+    };
+    const w = new World(map, [
+      { id: 0, isAI: false, name: 'P' },
+      { id: 1, isAI: true, name: 'A' },
+    ]);
+    w.planets[0].productionRate = 0;
+    w.planets[1].productionRate = 0;
+    // Place one hovering combatant of each owner within collide range but on
+    // opposite sides of a negative grid-cell boundary (cell size 38 puts one
+    // at x = -38), exercising the cross-cell neighbor lookup that the
+    // corrupted key decode used to miss.
+    const spots: Array<[number, number, number]> = [
+      [0, -40, -40],
+      [1, -36.5, -40],
+    ];
+    for (const [owner, sx, sy] of spots) {
+      const idx = w.ships.spawn(owner, { x: sx, y: sy }, -1, 48, {
+        vx: 0,
+        vy: 0,
+        turnRate: 2,
+        wobbleAmp: 0,
+        wobblePhase: 0,
+        state: 'hovering',
+      });
+      const s = w.ships.get(idx);
+      s.targetX = sx;
+      s.targetY = sy;
+    }
+    for (let i = 0; i < 150; i++) w.step(1 / 30);
+    const survivors = w.ships.all.filter((s) => s.active).length;
+    expect(survivors).toBe(0);
+  });
+});

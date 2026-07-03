@@ -1,4 +1,4 @@
-import { Application, AlphaFilter } from 'pixi.js';
+import { Application } from 'pixi.js';
 import { BasicAI } from './ai/BasicAI.js';
 import { Audio } from './audio/Audio.js';
 import { Input } from './input/Input.js';
@@ -6,6 +6,7 @@ import { Selection } from './input/Selection.js';
 import { generateOrionMap } from './maps/orion.js';
 import { ringCapacity, type Planet } from './sim/Planet.js';
 import { loadPlanetAssets } from './render/planetAssets.js';
+import { assignPlanetArchetypes } from './render/textures.js';
 import { Renderer } from './render/Renderer.js';
 import { World } from './sim/World.js';
 import { Hud } from '../ui/Hud.js';
@@ -20,11 +21,14 @@ export class Game {
   private renderer!: Renderer;
   private selection!: Selection;
   private ai!: BasicAI;
-  private hud!: Hud;
+  private hud: Hud | null = null;
+  private input: Input | null = null;
   private audio = new Audio();
   private accumulator = 0;
   private paused = false;
   private activeOverlay: HTMLDivElement | null = null;
+  /** True while a match's loop/listeners are live (guards double-teardown). */
+  private matchRunning = false;
   /**
    * Rolling 1.0s window of ship-death timestamps. Each frame the size of
    * this window normalizes into a 0..1 combat-tension score that drives
@@ -38,13 +42,31 @@ export class Game {
   }
 
   start(): void {
-    // Kick off texture loading immediately so it's likely done by the time
-    // the player clicks "Begin". Failures fall back to procedural textures.
-    loadPlanetAssets().catch((err) => {
-      console.warn('planet texture load failed, falling back to procedural', err);
-    });
+    // Auto-pause + audio suspend when the tab/app goes to background; saves
+    // battery on mobile and stops the ambient drone from playing over other
+    // apps. Registered once for the Game's lifetime.
+    document.addEventListener('visibilitychange', this.onVisibility);
+    // iOS can leave the AudioContext in 'suspended'/'interrupted' after a
+    // phone call, Siri, or an audio-route change; any fresh touch re-arms it.
+    window.addEventListener('pointerdown', this.onPointerResume, { passive: true });
     this.showMainMenu();
   }
+
+  private onPointerResume = (): void => {
+    if (!document.hidden) this.audio.resume();
+  };
+
+  private onVisibility = (): void => {
+    if (document.hidden) {
+      if (this.matchRunning && !this.paused) {
+        this.paused = true;
+        this.hud?.setPausedUI(true);
+      }
+      this.audio.suspend();
+    } else {
+      this.audio.resume();
+    }
+  };
 
   private showMainMenu(): void {
     this.activeOverlay = showOverlay(
@@ -61,22 +83,13 @@ export class Game {
       [
         {
           label: 'Begin',
-          onClick: async () => {
+          onClick: () => {
             this.audio.unlock();
-            try {
-              // Make sure textures have finished loading so planets render
-              // photographically on the very first frame.
-              await loadPlanetAssets();
-            } catch {
-              // Already logged above; procedural fallback will be used.
-            }
             this.dismissOverlay();
-            try {
-              this.startMatch();
-            } catch (err) {
+            this.startMatch().catch((err) => {
               console.error('startMatch failed', err);
               this.showError(err);
-            }
+            });
           },
         },
       ],
@@ -88,13 +101,33 @@ export class Game {
     this.activeOverlay = null;
   }
 
-  private startMatch(): void {
-    // Reset stage.
-    this.app.stage.removeChildren();
-    this.app.stage.filters = [];
+  private async startMatch(): Promise<void> {
+    // Tear down any previous match first — Input/HUD/ticker/listeners must
+    // never stack across restarts (every retained Input duplicated taps and
+    // hit-tested against a stale World).
+    this.teardownMatch();
+
+    // Generate the map and assign each planet its texture archetype before
+    // loading, so we fetch + alpha-scan only the ≤9 stickers this match
+    // actually draws instead of the whole 39-image pool.
+    const map = generateOrionMap();
+    const archetypes = assignPlanetArchetypes(
+      map.planets.map((_, i) => i),
+      // Wall-clock seed so replays shuffle the pool.
+      Date.now() & 0x7fffffff,
+    );
+    // Never throws — individual failures fall back to procedural bodies.
+    await loadPlanetAssets(archetypes);
+
+    // Reset stage. Destroy children so old Graphics/Sprites release their
+    // GPU buffers (removeChildren alone leaked them across restarts); shared
+    // cached textures survive because texture destruction stays off.
+    for (const child of this.app.stage.removeChildren()) {
+      child.destroy({ children: true, texture: false });
+    }
 
     this.world = new World(
-      generateOrionMap(),
+      map,
       [
         { id: 0, isAI: false, name: 'You' },
         { id: 1, isAI: true, name: 'Rival' },
@@ -151,14 +184,10 @@ export class Game {
 
     this.renderer = new Renderer(this.app, this.world);
 
-    // Soft bloom via alpha-blended duplicate would require a filter dep we skipped.
-    // Use AlphaFilter as a lightweight overall sheen instead.
-    this.app.stage.filters = [new AlphaFilter({ alpha: 1 })];
-
     this.selection = new Selection(this.world, 0);
     this.ai = new BasicAI(this.world, 1);
 
-    new Input(this.app.canvas as unknown as HTMLCanvasElement, this.renderer, this.world, {
+    this.input = new Input(this.app.canvas as unknown as HTMLCanvasElement, this.renderer, this.world, {
       tapPlanet: (id) => {
         const p = this.world.planets[id];
         const selectedIds = this.selection.ids;
@@ -231,9 +260,24 @@ export class Game {
 
     this.accumulator = 0;
     this.paused = false;
+    this.deathTimestamps.length = 0;
     this.app.ticker.add(this.loop);
 
     window.addEventListener('resize', this.onResize);
+    this.matchRunning = true;
+  }
+
+  /** Undo everything `startMatch` set up. Safe to call when nothing is live. */
+  private teardownMatch(): void {
+    if (!this.matchRunning) return;
+    this.matchRunning = false;
+    this.app.ticker.remove(this.loop);
+    window.removeEventListener('keydown', this.onKey);
+    window.removeEventListener('resize', this.onResize);
+    this.input?.destroy();
+    this.input = null;
+    this.hud?.destroy();
+    this.hud = null;
   }
 
   private onResize = (): void => {
@@ -274,9 +318,15 @@ export class Game {
       this.selection.sync();
       this.accumulator -= FIXED_DT;
     }
+    // Drop unpayable sim debt. If a slow device exhausts the step guard, the
+    // leftover accumulator would otherwise grow without bound and pin every
+    // subsequent frame at max catch-up work — the classic fixed-timestep
+    // death spiral. Trading dropped time for a stable frame rate is the
+    // right call on mobile.
+    if (this.accumulator > FIXED_DT * 4) this.accumulator = FIXED_DT * 4;
     this.renderer.planetLayer.setSelection(this.selection.ids);
     this.renderer.update(frameMs / 1000);
-    this.hud.update(this.world);
+    this.hud?.update(this.world);
 
     // Combat tension: count ship deaths in the trailing 1s window and pass
     // the normalized intensity to the audio rumble. ~8 deaths/s saturates.
@@ -300,19 +350,14 @@ export class Game {
           label: 'Play again',
           onClick: () => {
             this.dismissOverlay();
-            this.cleanup();
-            this.startMatch();
+            this.startMatch().catch((err) => {
+              console.error('restart failed', err);
+              this.showError(err);
+            });
           },
         },
       ],
     );
-  }
-
-  private cleanup(): void {
-    this.app.ticker.remove(this.loop);
-    window.removeEventListener('keydown', this.onKey);
-    window.removeEventListener('resize', this.onResize);
-    this.hud?.destroy();
   }
 
   private showError(err: unknown): void {
@@ -326,12 +371,10 @@ export class Game {
           label: 'Retry',
           onClick: () => {
             this.dismissOverlay();
-            try {
-              this.startMatch();
-            } catch (e) {
+            this.startMatch().catch((e) => {
               console.error('retry failed', e);
               this.showError(e);
-            }
+            });
           },
         },
       ],

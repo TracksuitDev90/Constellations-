@@ -1,5 +1,5 @@
 import { Application, Container, Sprite, Texture } from 'pixi.js';
-import { paletteFor } from '../../util/color.js';
+import { paletteFor, toward } from '../../util/color.js';
 import type { World } from '../sim/World.js';
 import { makeShipGlowTexture, makeShipTexture } from './textures.js';
 
@@ -77,7 +77,11 @@ export class ShipLayer extends Container {
         entry.sprite.visible = !hidden;
         entry.sprite.x = s.x;
         entry.sprite.y = s.y;
-        const tint = paletteFor(s.owner).ship;
+        // Selected in-flight units read brighter (tint pushed toward white,
+        // larger glow) so a lasso grab has visible feedback — previously
+        // `isSelected` was never rendered anywhere.
+        const baseTint = paletteFor(s.owner).ship;
+        const tint = s.isSelected ? toward(baseTint, 0xffffff, 0.65) : baseTint;
         entry.sprite.tint = tint;
         if (s.state === 'transit') {
           const speed = Math.hypot(s.vx, s.vy);
@@ -95,8 +99,8 @@ export class ShipLayer extends Container {
         entry.glow.y = s.y;
         entry.glow.tint = tint;
         const flicker = 0.75 + 0.25 * Math.sin(this.time * 4.5 + entry.flickerPhase);
-        entry.glow.alpha = 0.55 * flicker;
-        entry.glow.scale.set(entry.glowScale);
+        entry.glow.alpha = (s.isSelected ? 0.8 : 0.55) * flicker;
+        entry.glow.scale.set(entry.glowScale * (s.isSelected ? 1.35 : 1));
         entry.active = true;
       } else if (entry.active) {
         entry.sprite.visible = false;

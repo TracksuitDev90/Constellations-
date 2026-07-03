@@ -10,6 +10,13 @@ export interface PointerState {
   startTime: number;
   moved: boolean;
   sourcePlanet: number | null;
+  /**
+   * True once this pointer has ever been part of a ≥2-pointer gesture.
+   * Such pointers must never resolve to a tap on release — otherwise a quick
+   * pinch registers as one or two phantom taps (clearing the selection or
+   * issuing an accidental attack order).
+   */
+  wasMultiTouch: boolean;
 }
 
 export interface InputCallbacks {
@@ -63,8 +70,26 @@ export class Input {
     el.addEventListener('pointerup', this.onUp);
     el.addEventListener('pointercancel', this.onUp);
     el.addEventListener('wheel', this.onWheel, { passive: false });
-    el.addEventListener('contextmenu', (e) => e.preventDefault());
+    el.addEventListener('contextmenu', this.onContextMenu);
   }
+
+  /**
+   * Detach every listener. Must be called when a match ends — the canvas
+   * outlives the match, so an undestroyed Input keeps firing callbacks that
+   * hit-test against a stale World/Renderer (and stacks with the next
+   * match's Input, duplicating every tap).
+   */
+  destroy(): void {
+    this.el.removeEventListener('pointerdown', this.onDown);
+    this.el.removeEventListener('pointermove', this.onMove);
+    this.el.removeEventListener('pointerup', this.onUp);
+    this.el.removeEventListener('pointercancel', this.onUp);
+    this.el.removeEventListener('wheel', this.onWheel);
+    this.el.removeEventListener('contextmenu', this.onContextMenu);
+    this.pointers.clear();
+  }
+
+  private onContextMenu = (e: Event): void => e.preventDefault();
 
   private screenFromEvent(e: PointerEvent): { x: number; y: number } {
     const rect = this.el.getBoundingClientRect();
@@ -91,8 +116,11 @@ export class Input {
       startTime: performance.now(),
       moved: false,
       sourcePlanet: owned,
+      wasMultiTouch: this.pointers.size > 0,
     });
-    if (this.pointers.size === 2) {
+    if (this.pointers.size >= 2) {
+      // Every concurrent pointer is now part of a multi-touch gesture.
+      for (const p of this.pointers.values()) p.wasMultiTouch = true;
       this.lastPinchDist = this.currentPinchDistance();
       this.lastPanMid = this.currentPinchMidpoint();
     }
@@ -130,6 +158,10 @@ export class Input {
       return;
     }
 
+    // A pointer left over from a pinch must not start a drag or lasso —
+    // its start position belongs to the gesture, not to a fresh intent.
+    if (p.wasMultiTouch) return;
+
     if (p.sourcePlanet !== null && p.moved) {
       const hover = this.planetAtScreen(x, y);
       this.cb.dragPreview(p.sourcePlanet, hover);
@@ -159,7 +191,7 @@ export class Input {
     }
 
     const dt = performance.now() - p.startTime;
-    if (!p.moved && dt < TAP_TIME_THRESHOLD) {
+    if (!p.moved && !p.wasMultiTouch && dt < TAP_TIME_THRESHOLD) {
       const hit = this.planetAtScreen(p.x, p.y);
       if (hit !== null) {
         this.cb.tapPlanet(hit);
@@ -167,6 +199,13 @@ export class Input {
         const w = this.renderer.screenToWorld(p.x, p.y);
         this.cb.tapEmpty(w.x, w.y);
       }
+      return;
+    }
+
+    if (p.wasMultiTouch) {
+      // A finger lifting out of a pinch/pan gesture must not commit a drag
+      // order — the movement was camera navigation, not intent.
+      this.cb.dragPreview(null, null);
       return;
     }
 

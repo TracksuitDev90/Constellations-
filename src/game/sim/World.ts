@@ -152,6 +152,21 @@ const COHESION_RADIUS = 38;
 const COHESION_WEIGHT = 4;
 const SEEK_WEIGHT = 60;
 
+/**
+ * Cell size of the shared per-tick spatial grid. Sized to the largest
+ * neighbor-query radius (cohesion) so a 3×3 cell sweep always covers it;
+ * separation and combat use the same grid with tighter distance checks.
+ */
+const GRID_CELL = COHESION_RADIUS;
+/**
+ * Collision-free packing of a (cellX, cellY) pair into one integer key.
+ * The +0x8000 bias keeps the packing valid for negative cells — ships can
+ * drift slightly past the map bounds (boids push, free-space hover points),
+ * and the previous `cx * 100000 + cy` scheme silently corrupted keys there.
+ */
+const gridKey = (cx: number, cy: number): number =>
+  (cx + 0x8000) * 0x10000 + (cy + 0x8000);
+
 export class World {
   players: Player[];
   planets: Planet[];
@@ -173,6 +188,18 @@ export class World {
   winner: number | null = null;
   private events: WorldEvents;
   private playersSeen = new Set<number>();
+  /**
+   * Per-tick spatial hash of all active ships, rebuilt once at the top of
+   * `step()` and shared by every neighbor query (boids separation/cohesion,
+   * orbit separation, hover separation, mid-flight combat). Bucket arrays are
+   * pooled across frames so the rebuild allocates nothing in steady state.
+   */
+  private grid = new Map<number, number[]>();
+  private gridBucketPool: number[][] = [];
+  /** Reusable scratch buffer returned by `gatherNeighbors`. */
+  private neighborScratch: number[] = [];
+  /** Reusable output vector for `orbitSeparation` (avoids per-ship allocs). */
+  private sepScratch = { x: 0, y: 0 };
   /**
    * Anchor points for any spawned neutral swarms. Neutrals patrol around
    * these anchors and respawn slowly if killed below the swarm's nominal
@@ -600,7 +627,12 @@ export class World {
       return src.owner === null || src.owner === s.owner;
     });
 
-    // Ship simulation. Each state runs its own steering pass.
+    // Ship simulation. Each state runs its own steering pass. Neighbor
+    // lookups (separation / cohesion / combat) all go through one spatial
+    // grid built here from start-of-tick positions — O(n) instead of the
+    // old O(n²) all-pairs scans, which is what kept big battles playable
+    // on phones.
+    this.rebuildGrid();
     const ships = this.ships.all;
     for (let i = 0; i < ships.length; i++) {
       const ship = ships[i];
@@ -733,57 +765,79 @@ export class World {
   }
 
   /**
-   * Check every pair of in-flight ships of different owners for proximity; any
-   * pair inside `SHIP_COLLIDE_RADIUS` mutually destroys. Grid bucketing keeps
-   * this cheap even with hundreds of ships in the air.
+   * Rebuild the shared spatial grid from every active ship's current
+   * position. Bucket arrays are recycled through `gridBucketPool` so a
+   * steady-state battle rebuilds the grid with zero allocations.
    */
-  private stepShipCombat(): void {
+  private rebuildGrid(): void {
+    for (const arr of this.grid.values()) {
+      arr.length = 0;
+      this.gridBucketPool.push(arr);
+    }
+    this.grid.clear();
     const ships = this.ships.all;
-    const cell = Math.max(SHIP_COLLIDE_RADIUS * 2, 10);
-    const buckets = new Map<number, number[]>();
-    const keyOf = (cx: number, cy: number): number => cx * 100000 + cy;
-    const combatant = (s: Ship): boolean =>
-      s.active && (s.state === 'transit' || s.state === 'hovering');
     for (let i = 0; i < ships.length; i++) {
       const s = ships[i];
-      if (!combatant(s)) continue;
-      const cx = Math.floor(s.x / cell);
-      const cy = Math.floor(s.y / cell);
-      const key = keyOf(cx, cy);
-      let arr = buckets.get(key);
+      if (!s.active) continue;
+      const key = gridKey(Math.floor(s.x / GRID_CELL), Math.floor(s.y / GRID_CELL));
+      let arr = this.grid.get(key);
       if (!arr) {
-        arr = [];
-        buckets.set(key, arr);
+        arr = this.gridBucketPool.pop() ?? [];
+        this.grid.set(key, arr);
       }
       arr.push(i);
     }
+  }
 
+  /**
+   * Collect ship indices from the 3×3 grid cells around (x, y) into the
+   * reusable scratch buffer. Returns the number of valid entries. Cell size
+   * equals the largest query radius (COHESION_RADIUS), so any check within
+   * that radius only needs this one sweep. Callers must filter by state /
+   * owner / distance themselves and must not hold onto the buffer.
+   */
+  private gatherNeighbors(x: number, y: number): number {
+    const cx = Math.floor(x / GRID_CELL);
+    const cy = Math.floor(y / GRID_CELL);
+    const out = this.neighborScratch;
+    let n = 0;
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        const arr = this.grid.get(gridKey(cx + dx, cy + dy));
+        if (!arr) continue;
+        for (let k = 0; k < arr.length; k++) out[n++] = arr[k];
+      }
+    }
+    return n;
+  }
+
+  /**
+   * Check in-flight ships of different owners for proximity; any pair inside
+   * `SHIP_COLLIDE_RADIUS` mutually destroys. Uses the shared spatial grid —
+   * the `j > i` guard dedupes pairs, and because the grid cell (38) is far
+   * larger than the collide radius (5), the 3×3 sweep always covers it.
+   */
+  private stepShipCombat(): void {
+    const ships = this.ships.all;
     const r2 = SHIP_COLLIDE_RADIUS * SHIP_COLLIDE_RADIUS;
     const dead = new Set<number>();
-    for (const [key, arr] of buckets) {
-      const cx = Math.floor(key / 100000);
-      const cy = key - cx * 100000;
-      for (let dx = -1; dx <= 1; dx++) {
-        for (let dy = -1; dy <= 1; dy++) {
-          const other = buckets.get(keyOf(cx + dx, cy + dy));
-          if (!other) continue;
-          for (const i of arr) {
-            if (dead.has(i)) continue;
-            const si = ships[i];
-            for (const j of other) {
-              if (j <= i) continue; // dedupe (only compare each pair once)
-              if (dead.has(j)) continue;
-              const sj = ships[j];
-              if (si.owner === sj.owner) continue;
-              const ddx = si.x - sj.x;
-              const ddy = si.y - sj.y;
-              if (ddx * ddx + ddy * ddy > r2) continue;
-              dead.add(i);
-              dead.add(j);
-              break;
-            }
-          }
-        }
+    for (let i = 0; i < ships.length; i++) {
+      const si = ships[i];
+      if (dead.has(i)) continue;
+      if (!si.active || (si.state !== 'transit' && si.state !== 'hovering')) continue;
+      const count = this.gatherNeighbors(si.x, si.y);
+      for (let k = 0; k < count; k++) {
+        const j = this.neighborScratch[k];
+        if (j <= i || dead.has(j)) continue; // each pair examined once; 1:1 trades only
+        const sj = ships[j];
+        if (!sj.active || (sj.state !== 'transit' && sj.state !== 'hovering')) continue;
+        if (si.owner === sj.owner) continue;
+        const ddx = si.x - sj.x;
+        const ddy = si.y - sj.y;
+        if (ddx * ddx + ddy * ddy > r2) continue;
+        dead.add(i);
+        dead.add(j);
+        break;
       }
     }
 
@@ -961,10 +1015,11 @@ export class World {
     const rx = dx / d;
     const ry = dy / d;
     // Separation from nearby orbiters of the same planet — prevents stacking.
-    const sep = this.orbitSeparation(ship);
+    this.orbitSeparation(ship, this.sepScratch);
+    const sep = this.sepScratch;
 
-    let targetVx = tx * tangentSpeed + rx * radialForce + rx * wander + sep.x;
-    let targetVy = ty * tangentSpeed + ry * radialForce + ry * wander + sep.y;
+    const targetVx = tx * tangentSpeed + rx * radialForce + rx * wander + sep.x;
+    const targetVy = ty * tangentSpeed + ry * radialForce + ry * wander + sep.y;
 
     // Smooth velocity toward target (lightweight steering).
     const blend = Math.min(1, dt * 6);
@@ -989,11 +1044,13 @@ export class World {
     }
   }
 
-  private orbitSeparation(self: Ship): { x: number; y: number } {
+  private orbitSeparation(self: Ship, outForce: { x: number; y: number }): void {
     const ships = this.ships.all;
-    let fx = 0;
-    let fy = 0;
-    for (const other of ships) {
+    outForce.x = 0;
+    outForce.y = 0;
+    const count = this.gatherNeighbors(self.x, self.y);
+    for (let k = 0; k < count; k++) {
+      const other = ships[this.neighborScratch[k]];
       if (other === self || !other.active) continue;
       if (other.state !== 'orbiting' || other.parentPlanet !== self.parentPlanet) continue;
       const dx = self.x - other.x;
@@ -1002,10 +1059,9 @@ export class World {
       if (d2 === 0 || d2 > SEPARATION_RADIUS * SEPARATION_RADIUS) continue;
       const d = Math.sqrt(d2);
       const push = (SEPARATION_RADIUS - d) / SEPARATION_RADIUS;
-      fx += (dx / d) * push * SEPARATION_WEIGHT;
-      fy += (dy / d) * push * SEPARATION_WEIGHT;
+      outForce.x += (dx / d) * push * SEPARATION_WEIGHT;
+      outForce.y += (dy / d) * push * SEPARATION_WEIGHT;
     }
-    return { x: fx, y: fy };
   }
 
   private stepAbsorbing(idx: number, ship: Ship, dt: number): void {
@@ -1152,12 +1208,16 @@ export class World {
     let fy = dy * invD * SEEK_WEIGHT * seekStrength;
 
     // Boids: separation (hard) + weak cohesion with nearby friendly transits.
+    // Neighbors come from the shared spatial grid (cell == COHESION_RADIUS,
+    // so the 3×3 sweep covers both radii) instead of an all-ships scan.
     let sepX = 0;
     let sepY = 0;
     let cohX = 0;
     let cohY = 0;
     let cohN = 0;
-    for (const other of allShips) {
+    const neighborCount = this.gatherNeighbors(ship.x, ship.y);
+    for (let k = 0; k < neighborCount; k++) {
+      const other = allShips[this.neighborScratch[k]];
       if (other === ship || !other.active) continue;
       if (other.state !== 'transit' || other.owner !== ship.owner) continue;
       const ox = ship.x - other.x;
@@ -1284,7 +1344,9 @@ export class World {
     // Simple separation pass so hovering units don't collide.
     let sepX = 0;
     let sepY = 0;
-    for (const other of allShips) {
+    const neighborCount = this.gatherNeighbors(ship.x, ship.y);
+    for (let k = 0; k < neighborCount; k++) {
+      const other = allShips[this.neighborScratch[k]];
       if (other === ship || !other.active) continue;
       if (other.state !== 'hovering' && other.state !== 'orbiting') continue;
       if (other.owner !== ship.owner) continue;
@@ -1442,8 +1504,13 @@ export class World {
   totalGarrison(owner: number): number {
     let t = 0;
     for (const p of this.planets) if (p.owner === owner) t += p.garrison;
+    // Count every free-flying unit: transit waves and standing hover armies.
+    // Orbiting and absorbing units are already reflected in planet garrison —
+    // counting only 'transit' here made the HUD strength bar visibly dip
+    // whenever the player parked a fleet at a hover point.
     for (const s of this.ships.all) {
-      if (s.active && s.owner === owner && s.state === 'transit') t += 1;
+      if (!s.active || s.owner !== owner) continue;
+      if (s.state === 'transit' || s.state === 'hovering') t += 1;
     }
     return t;
   }

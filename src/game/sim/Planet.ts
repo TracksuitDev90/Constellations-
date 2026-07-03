@@ -11,15 +11,17 @@ export type PlanetType = 0 | 1 | 2 | 3; // Small, Large, Extra Large, XXL
 export type RingCount = 0 | 1 | 2;
 
 /**
- * World-space radius for each size. Every tier is sized 1.5× the original
- * baseline so planets read big on screen. XXL is only ever reached through
- * evolution — map authors should not pick it as a starting type.
+ * World-space radius for each size. The spread is deliberately wide
+ * (small → XXL is ~3.5×, up from the old ~2.4×) so the four tiers are
+ * unmistakable at a glance — a Large visibly dwarfs a Small, and an XXL
+ * dominates its neighborhood. XXL is only ever reached through evolution —
+ * map authors should not pick it as a starting type.
  */
 export const SIZE_RADIUS: Record<PlanetType, number> = {
-  0: 27,
-  1: 39,
-  2: 51,
-  3: 66,
+  0: 22,
+  1: 38,
+  2: 55,
+  3: 76,
 };
 
 /**

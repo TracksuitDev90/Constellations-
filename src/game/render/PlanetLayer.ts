@@ -159,18 +159,26 @@ interface PlanetView {
   ringsFront: Graphics;
   atomPaths: Graphics; // faint orbit ellipses that the electrons follow
   shockwave: Graphics;
-  /** Subtle strength bar beneath the planet — visual stand-in for garrison. */
-  strengthBar: Graphics;
-  /** Eased bar fill (0..1+) so the indicator glides with population changes. */
-  easedStrength: number;
+  /**
+   * Hull-integrity bar beneath the planet. Shows `health / maxHealth` as
+   * discrete HP pips — the pool attackers chip through once the garrison is
+   * gone, i.e. the actual "how close is this world to falling" number.
+   */
+  healthBar: Graphics;
+  /** Eased health fill (0..1) so the pips drain smoothly, not in snaps. */
+  easedHealth: number;
+  /** Last observed hull HP — a drop triggers the damage flash. */
+  lastHealth: number;
+  /** 1→0 red flash after a hull hit; makes incoming damage unmissable. */
+  damageFlash: number;
   orbitRoot: Container;
   orbiters: Orbiter[];
   /** Hidden, reusable orbiter sprites — avoids destroy/create churn in combat. */
   orbiterPool: Orbiter[];
   /** Accumulator gating the ~12 Hz heavy Graphics rebuild cadence. */
   fxRedrawAcc: number;
-  /** Last strength-bar fill actually drawn — lets static bars skip redraw. */
-  lastDrawnStrength: number;
+  /** Last health fill actually drawn — lets static bars skip redraw. */
+  lastDrawnHealth: number;
   lastDrawnBarOwner: number | null;
   /**
    * Victory-cascade state: `celebrateDelay` counts down to this planet's
@@ -273,7 +281,7 @@ export class PlanetLayer extends Container {
       const ringsFront = new Graphics();
       const atomPaths = new Graphics();
       const shockwave = new Graphics();
-      const strengthBar = new Graphics();
+      const healthBar = new Graphics();
       const productionFx = new Graphics();
 
       const orbitRoot = new Container();
@@ -291,7 +299,7 @@ export class PlanetLayer extends Container {
         atomPaths,
         orbitRoot,
         shockwave,
-        strengthBar,
+        healthBar,
       );
       this.addChild(container);
 
@@ -316,15 +324,17 @@ export class PlanetLayer extends Container {
         ringsFront,
         atomPaths,
         shockwave,
-        strengthBar,
-        easedStrength: 0,
+        healthBar,
+        easedHealth: 1,
+        lastHealth: planet.health,
+        damageFlash: 0,
         orbitRoot,
         orbiters: [],
         orbiterPool: [],
         // Random phase offset so all planets don't rebuild Graphics on the
         // same frame — spreads the 12 Hz cost across the cadence window.
         fxRedrawAcc: Math.random() * FX_REDRAW_INTERVAL,
-        lastDrawnStrength: -1,
+        lastDrawnHealth: -1,
         lastDrawnBarOwner: null,
         celebrateDelay: 0,
         celebratePulse: 0,
@@ -478,10 +488,11 @@ export class PlanetLayer extends Container {
       const redrawHeavy = animating || v.fxRedrawAcc >= FX_REDRAW_INTERVAL;
       if (v.fxRedrawAcc >= FX_REDRAW_INTERVAL) v.fxRedrawAcc %= FX_REDRAW_INTERVAL;
 
-      // Strength bar under the planet — a visual stand-in for the old numeric
-      // garrison readout. Length scales with garrison / maxUnitCapacity (past
-      // 1.0 it overflows into a pulsing "saturated" glow).
-      this.drawStrengthBar(v, p.garrison, p.maxUnitCapacity, effRadius, pal, p.owner, dt, animating);
+      // Hull-integrity bar under the planet — one pip per HP. Garrison is
+      // already legible from the orbiting swarm, so the bar tracks the thing
+      // nothing else shows: how much hull an attacker still has to chew
+      // through before the world goes neutral.
+      this.drawHealthBar(v, p.health, p.maxHealth, effRadius, pal, p.owner, dt, animating);
 
       // Capacity rings: drawn procedurally as 3D-tilted brushstroke arcs,
       // split across `ringsBack` (rear half, behind the body) and
@@ -669,7 +680,7 @@ export class PlanetLayer extends Container {
       v.lastCostText = text;
     }
     v.costLabel.visible = true;
-    // Sits just below the strength bar (bar bottom ≈ effRadius + height + 6).
+    // Sits just below the health bar (bar bottom ≈ effRadius + height + 6).
     v.costLabel.x = 0;
     v.costLabel.y = effRadius + Math.max(3, effRadius * 0.1) + 12;
   }
@@ -706,6 +717,10 @@ export class PlanetLayer extends Container {
       const sweep = Math.PI * 0.55;
       const start = pulse.angle - sweep / 2;
       const end = pulse.angle + sweep / 2;
+      // Explicit moveTo before the arc — without it Pixi connects the arc to
+      // the previous path point (e.g. an earlier pulse's spark circle),
+      // drawing a stray chord line across the planet.
+      g.moveTo(Math.cos(start) * r, Math.sin(start) * r);
       g.arc(0, 0, r, start, end).stroke({
         width: Math.max(1.2, effRadius * 0.06) * (1 - t),
         color: pal.glow,
@@ -722,86 +737,107 @@ export class PlanetLayer extends Container {
   }
 
   /**
-   * Render the subtle strength indicator beneath the planet. Replaces the old
-   * numeric garrison readout with a visual bar whose filled length tracks
-   * `garrison / maxUnitCapacity`. Once the garrison saturates, an outer pulse
-   * glow communicates overflow rather than breaking the scale.
+   * Render the hull-integrity bar beneath the planet: one pip per HP,
+   * draining right-to-left as attackers chip the hull. Near-invisible while
+   * the hull is intact (no noise on a peaceful board), it brightens and
+   * shifts amber → red as damage lands, with a flash on each hit — so "this
+   * planet is being broken" is readable at a glance from across the map.
    */
-  private drawStrengthBar(
+  private drawHealthBar(
     v: PlanetView,
-    garrison: number,
-    capacity: number,
+    health: number,
+    maxHealth: number,
     effRadius: number,
     pal: import('../../util/color.js').PlayerPalette,
     owner: number | null,
     dt: number,
     forceRedraw: boolean,
   ): void {
-    const g = v.strengthBar;
-    if (owner === null || garrison <= 0) {
-      v.easedStrength = 0;
-      if (v.lastDrawnStrength !== 0) {
+    const g = v.healthBar;
+    if (owner === null || maxHealth <= 0) {
+      v.easedHealth = 1;
+      v.lastHealth = health;
+      v.damageFlash = 0;
+      if (v.lastDrawnHealth !== 0) {
         g.clear();
-        v.lastDrawnStrength = 0;
+        v.lastDrawnHealth = 0;
         v.lastDrawnBarOwner = owner;
       }
       return;
     }
-    const targetFill = capacity > 0 ? garrison / capacity : 0;
-    const ease = 1 - Math.exp(-dt * 5);
-    v.easedStrength += (targetFill - v.easedStrength) * ease;
-    const fill = Math.max(0, v.easedStrength);
 
-    // Once the eased fill has settled and there's no animated overflow pulse,
-    // the bar is static — skip the per-frame Graphics rebuild entirely.
+    // A hull hit landed since last frame — kick the red flash.
+    if (health < v.lastHealth) v.damageFlash = 1;
+    v.lastHealth = health;
+    v.damageFlash = Math.max(0, v.damageFlash - dt * 2.2);
+
+    const targetFill = Math.max(0, Math.min(1, health / maxHealth));
+    const ease = 1 - Math.exp(-dt * 6);
+    v.easedHealth += (targetFill - v.easedHealth) * ease;
+    const fill = v.easedHealth;
+
+    // Fully healed and no active flash → the bar is static; skip the rebuild.
     const settled =
       !forceRedraw &&
       owner === v.lastDrawnBarOwner &&
-      fill <= 1.001 &&
-      Math.abs(fill - v.lastDrawnStrength) < 0.004;
+      v.damageFlash <= 0.001 &&
+      Math.abs(fill - v.lastDrawnHealth) < 0.003;
     if (settled) return;
-    v.lastDrawnStrength = fill;
+    v.lastDrawnHealth = fill;
     v.lastDrawnBarOwner = owner;
     g.clear();
 
-    const width = Math.max(24, effRadius * 1.6);
+    const width = Math.max(26, effRadius * 1.5);
     const height = Math.max(3, effRadius * 0.1);
     const y = effRadius + height + 6;
     const left = -width / 2;
+    const gap = Math.max(1, height * 0.45);
+    const segW = (width - gap * (maxHealth - 1)) / maxHealth;
+    const segR = Math.min(height / 2, segW / 2);
 
-    const radius = height / 2;
+    // Intact hull whispers; damaged hull shouts.
+    const damaged = fill < 0.999;
+    const baseAlpha = damaged ? 0.95 : 0.3;
 
-    // Backdrop — a dim pill so the bar reads against both starfield and halo.
-    g.roundRect(left - 1, y - height / 2 - 1, width + 2, height + 2, radius + 1)
-      .fill({ color: 0x000000, alpha: 0.32 });
-    g.roundRect(left, y - height / 2, width, height, radius)
-      .fill({ color: pal.glow, alpha: 0.22 });
+    // Color runs owner-tint → amber → red as the hull fails.
+    const barColor =
+      fill > 0.6
+        ? pal.ring
+        : fill > 0.3
+          ? toward(0xffaa33, pal.ring, (fill - 0.3) / 0.3)
+          : toward(0xff4040, 0xffaa33, fill / 0.3);
 
-    // Filled portion — clamps at 1, the remainder communicates overflow via
-    // the outer pulse below.
-    const clipped = Math.min(1, fill);
-    const fillW = Math.max(0, width * clipped);
-    if (fillW > 0.5) {
-      g.roundRect(left, y - height / 2, fillW, height, Math.min(radius, fillW / 2))
-        .fill({ color: pal.ring, alpha: 0.95 });
-      // Highlight strip along the top of the filled segment for depth.
-      g.roundRect(
-        left + 1,
-        y - height / 2 + 0.5,
-        Math.max(0, fillW - 2),
-        Math.max(0.8, height * 0.35),
-        Math.min(radius, fillW / 2),
-      ).fill({ color: 0xffffff, alpha: 0.35 });
+    // Backdrop pill so the pips read against both starfield and halo.
+    g.roundRect(left - 1.5, y - height / 2 - 1.5, width + 3, height + 3, segR + 1.5)
+      .fill({ color: 0x000000, alpha: damaged ? 0.45 : 0.25 });
+
+    const filledSegs = fill * maxHealth;
+    for (let s = 0; s < maxHealth; s++) {
+      const sx = left + s * (segW + gap);
+      // Empty socket — a faint outline of the missing HP.
+      g.roundRect(sx, y - height / 2, segW, height, segR)
+        .fill({ color: pal.glow, alpha: damaged ? 0.16 : 0.1 });
+      const segFill = Math.max(0, Math.min(1, filledSegs - s));
+      if (segFill <= 0.02) continue;
+      // The draining pip shrinks within its socket for a smooth bleed-out.
+      g.roundRect(sx, y - height / 2, segW * segFill, height, Math.min(segR, (segW * segFill) / 2))
+        .fill({ color: barColor, alpha: baseAlpha });
+      if (damaged) {
+        g.roundRect(
+          sx + 0.5,
+          y - height / 2 + 0.5,
+          Math.max(0, segW * segFill - 1),
+          Math.max(0.8, height * 0.35),
+          segR,
+        ).fill({ color: 0xffffff, alpha: 0.3 });
+      }
     }
 
-    // Saturation glow: beyond full, pulse a soft ring of light around the bar
-    // so massive fleets read as "overflowing" instead of silently capping.
-    const overflow = Math.max(0, fill - 1);
-    if (overflow > 0.01) {
-      const pulse = 0.55 + 0.45 * Math.sin(this.time * 3.8);
-      const a = Math.min(0.75, 0.35 + overflow * 0.6) * pulse;
-      g.roundRect(left - 2, y - height / 2 - 2, width + 4, height + 4, radius + 2)
-        .stroke({ width: 1.4, color: pal.ring, alpha: a });
+    // Damage flash: a red-hot stroke that blooms on the hit and fades out.
+    if (v.damageFlash > 0.01) {
+      const f = v.damageFlash;
+      g.roundRect(left - 2.5, y - height / 2 - 2.5, width + 5, height + 5, segR + 2.5)
+        .stroke({ width: 1.5 + f * 1.5, color: 0xff5544, alpha: 0.85 * f });
     }
   }
 
@@ -1190,37 +1226,73 @@ const drawProceduralRing = (
     if (target) target.stroke({ width, color, alpha });
   };
 
+  // Empty-track passes are deliberately dim: the unfilled ring should read
+  // as a hollow "socket" waiting for investment, so the coloured fill arc
+  // below carries all the visual weight of absorb progress.
   // Pass 1: dark underline behind the body stroke — gives the ring weight.
-  drawPass(ringWidth * 1.1, underColor, 0.18, false);
+  drawPass(ringWidth * 1.1, underColor, 0.14, false);
   // Pass 2: main body stroke at base color, the brushy silhouette.
-  drawPass(ringWidth, baseColor, 0.55, false);
+  drawPass(ringWidth, baseColor, 0.28, false);
   // Pass 3: lit highlight, only on the near half — gives the ring the
   // "sun-lit upper rim" look that sells the 3D tilt without any shader.
-  drawPass(ringWidth * 0.4, hiColor, 0.7, true);
+  drawPass(ringWidth * 0.35, hiColor, 0.3, true);
 
-  // Pass 4: filled-arc progress paint along the leading edge.
+  // Pass 4: the fill — paint the absorbed fraction of the ring at FULL ring
+  // width in the owner's glow colour, so the ring literally "fills in" as
+  // units are fed to the planet. A brighter core stroke and a white-hot bead
+  // at the leading edge make the growth front unmistakable.
   if (progress > 0.01) {
     const sweep = Math.PI * 2 * progress;
     const fillSegs = Math.max(6, Math.floor(RING_SEGMENTS * progress));
+    const coreColor = toward(fillColor, 0xffffff, 0.4);
+    const strokeFill = (layer: import('pixi.js').Graphics): void => {
+      layer.stroke({ width: ringWidth * 1.05, color: fillColor, alpha: 0.9 });
+    };
     let target: import('pixi.js').Graphics | null = null;
+    // Track the runs so the bright core pass can retrace the same geometry.
+    const runs: Array<{ layer: import('pixi.js').Graphics; pts: Array<{ x: number; y: number }> }> = [];
     for (let i = 0; i <= fillSegs; i++) {
       const t = i / fillSegs;
       const theta = FILL_START + sweep * t + spin;
       const p = projectRing(theta, rMid, sinT, cosT, cosY, sinY);
       const layer = p.depth >= 0 ? front : back;
       if (layer !== target) {
-        if (target) target.stroke({ width: ringWidth * 0.55, color: fillColor, alpha: 0.85 });
+        if (target) strokeFill(target);
         target = layer;
         target.moveTo(p.x, p.y);
+        runs.push({ layer, pts: [{ x: p.x, y: p.y }] });
       } else {
         target.lineTo(p.x, p.y);
+        runs[runs.length - 1].pts.push({ x: p.x, y: p.y });
       }
     }
-    if (target) target.stroke({ width: ringWidth * 0.55, color: fillColor, alpha: 0.85 });
+    if (target) strokeFill(target);
 
-    // Bead sparkle along the filled arc — same idea as the previous design,
-    // kept inline so all ring drawing flows through one helper.
-    const beadCount = Math.max(8, Math.floor(34 * progress));
+    // Bright core retrace — a hot centre line inside the painted fill that
+    // pulses softly, keeping the filled arc luminous rather than flat.
+    const corePulse = 0.55 + 0.2 * Math.sin(time * 1.8 + seed * 0.9);
+    for (const run of runs) {
+      if (run.pts.length < 2) continue;
+      run.layer.moveTo(run.pts[0].x, run.pts[0].y);
+      for (let i = 1; i < run.pts.length; i++) run.layer.lineTo(run.pts[i].x, run.pts[i].y);
+      run.layer.stroke({ width: ringWidth * 0.4, color: coreColor, alpha: corePulse });
+    }
+
+    // Leading-edge tip: a white-hot bead with a glow halo marking exactly
+    // where the fill front sits — the "write head" of the progress arc.
+    const tipTheta = FILL_START + sweep + spin;
+    const tip = projectRing(tipTheta, rMid, sinT, cosT, cosY, sinY);
+    const tipLayer = tip.depth >= 0 ? front : back;
+    const tipPulse = 0.7 + 0.3 * Math.sin(time * 3.4 + seed);
+    tipLayer
+      .circle(tip.x, tip.y, Math.max(3, ringWidth * 0.5) * tipPulse)
+      .fill({ color: fillColor, alpha: 0.45 });
+    tipLayer
+      .circle(tip.x, tip.y, Math.max(1.6, ringWidth * 0.22))
+      .fill({ color: 0xffffff, alpha: 0.9 });
+
+    // Sparse bead sparkle along the filled arc for texture.
+    const beadCount = Math.max(5, Math.floor(20 * progress));
     const rimPulse = 0.65 + 0.25 * Math.sin(time * 2.2 + seed * 0.7);
     for (let i = 0; i <= beadCount; i++) {
       const t = i / beadCount;
@@ -1229,10 +1301,7 @@ const drawProceduralRing = (
       const layer = p.depth >= 0 ? front : back;
       layer
         .circle(p.x, p.y, Math.max(1.2, ringWidth * 0.09))
-        .fill({ color: 0xffffff, alpha: 0.55 * rimPulse * progress });
-      layer
-        .circle(p.x, p.y, Math.max(2.4, ringWidth * 0.18))
-        .fill({ color: fillColor, alpha: 0.22 * progress });
+        .fill({ color: 0xffffff, alpha: 0.45 * rimPulse });
     }
   }
 };

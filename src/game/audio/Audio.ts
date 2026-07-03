@@ -26,6 +26,29 @@ const ABSORB_LADDER = [
   196.0,  // G3
 ];
 
+/**
+ * Slow ambient chord progression for the pad bed. All chords live in the
+ * A-minor / C-major diatonic family so every SFX ladder (pentatonic chimes,
+ * absorb plucks) stays consonant no matter which chord is up. Voice-led:
+ * adjacent chords share tones or move by small steps, so the 8–11s glides
+ * between them read as the drone slowly "turning over" rather than a key
+ * change. Index 0 is the boot chord (matches the original static pad).
+ */
+const AMBIENT_CHORDS: ReadonlyArray<readonly [number, number, number]> = [
+  [110.0, 164.81, 246.94], // Am add9  (A2  E3 B3)
+  [87.31, 130.81, 196.0],  // F quartal (F2  C3 G3)
+  [130.81, 196.0, 293.66], // C add9   (C3  G3 D4)
+  [98.0, 146.83, 220.0],   // Gsus2    (G2  D3 A3)
+  [82.41, 123.47, 196.0],  // Em7      (E2  B2 G3)
+];
+
+/**
+ * Note pool for the sparse generative motif — A-minor pentatonic across two
+ * octaves. Diatonic to every chord in AMBIENT_CHORDS, so a phrase can start
+ * under one chord and finish under the next without ever clashing.
+ */
+const MOTIF_POOL = [220.0, 261.63, 293.66, 329.63, 392.0, 440.0, 523.25];
+
 export class Audio {
   private ctx: AudioContext | null = null;
   private musicGain: GainNode | null = null;
@@ -45,6 +68,13 @@ export class Audio {
   /** Last clock time the rumble target intensity was non-zero. */
   private combatLastActiveAt = 0;
   private etherealTimer: number | null = null;
+  /** Live pad oscillator pairs (main + detuned twin) for chord glides. */
+  private padOscPairs: Array<{ a: OscillatorNode; b: OscillatorNode }> = [];
+  private subOscNode: OscillatorNode | null = null;
+  private shimmerOscA: OscillatorNode | null = null;
+  private shimmerOscB: OscillatorNode | null = null;
+  /** Index into AMBIENT_CHORDS the pad currently sits on (or glides toward). */
+  private chordIdx = 0;
   muted = false;
   musicVolume = 0.35;
   sfxVolume = 0.45;
@@ -132,13 +162,17 @@ export class Audio {
     // ── Core pad voices ───────────────────────────────────────────────────
     // Each voice has its own tremolo at a different slow rate + an independent
     // detune drift, so pairs of voices drift in and out of phase with each
-    // other instead of breathing in unison.
+    // other instead of breathing in unison. Voices boot on AMBIENT_CHORDS[0]
+    // and are re-pitched by the chord-drift scheduler over the match.
+    const bootChord = AMBIENT_CHORDS[0];
     const padVoices = [
-      { freq: 110.0, tremRate: 0.041, tremDepth: 0.045, driftRate: 0.019 },   // A2
-      { freq: 164.81, tremRate: 0.063, tremDepth: 0.055, driftRate: 0.027 },  // E3
-      { freq: 246.94, tremRate: 0.029, tremDepth: 0.040, driftRate: 0.017 },  // B3
+      { freq: bootChord[0], tremRate: 0.041, tremDepth: 0.045, driftRate: 0.019 },
+      { freq: bootChord[1], tremRate: 0.063, tremDepth: 0.055, driftRate: 0.027 },
+      { freq: bootChord[2], tremRate: 0.029, tremDepth: 0.040, driftRate: 0.017 },
     ];
-    for (const v of padVoices) this.addPadVoice(v, filter, 0.11);
+    this.padOscPairs = padVoices.map((v) => this.addPadVoice(v, filter, 0.11)).filter(
+      (p): p is { a: OscillatorNode; b: OscillatorNode } => p !== null,
+    );
 
     // ── Sub-bass "breathing" voice ───────────────────────────────────────
     // A very low sine that swells in and out over ~90s. Adds a felt-not-heard
@@ -146,7 +180,8 @@ export class Audio {
     // the mid register is settled.
     const subOsc = this.ctx.createOscillator();
     subOsc.type = 'sine';
-    subOsc.frequency.value = 55; // A1
+    subOsc.frequency.value = bootChord[0] / 2; // an octave under the chord root
+    this.subOscNode = subOsc;
     const subGain = this.ctx.createGain();
     subGain.gain.value = 0.045;
     subOsc.connect(subGain).connect(this.musicGain);
@@ -163,10 +198,12 @@ export class Audio {
     // the pad feels more grounded.
     const shimmerA = this.ctx.createOscillator();
     shimmerA.type = 'sine';
-    shimmerA.frequency.value = 659.25; // E5
+    shimmerA.frequency.value = bootChord[1] * 4; // E5 at boot
     const shimmerB = this.ctx.createOscillator();
     shimmerB.type = 'sine';
-    shimmerB.frequency.value = 987.77; // B5 (perfect fifth)
+    shimmerB.frequency.value = bootChord[2] * 4; // B5 at boot
+    this.shimmerOscA = shimmerA;
+    this.shimmerOscB = shimmerB;
     const shimmerGain = this.ctx.createGain();
     shimmerGain.gain.value = 0.014;
     shimmerA.connect(shimmerGain);
@@ -194,6 +231,18 @@ export class Audio {
     // airy windy swells, distant chimes, subtle sweeps. Scheduled in JS-time
     // so they don't all stack in the audio graph up front.
     this.scheduleEthereal();
+
+    // ── Slow harmonic motion ─────────────────────────────────────────────
+    // Every 20-40s the whole pad (voices + sub + shimmer) glides to a new
+    // chord over ~8-11s. This is the main anti-drone measure: the bed now
+    // has a harmonic story instead of sitting on one Am cluster forever.
+    this.scheduleChordDrift();
+
+    // ── Sparse generative motif ──────────────────────────────────────────
+    // Occasional soft pentatonic phrases (3-6 notes) floating above the pad
+    // — enough melodic identity to break the drone without ever becoming a
+    // hook that could wear out over a long session.
+    this.scheduleMotif();
   }
 
   /**
@@ -205,8 +254,8 @@ export class Audio {
     spec: { freq: number; tremRate: number; tremDepth: number; driftRate: number },
     dest: AudioNode,
     baseGain: number,
-  ): void {
-    if (!this.ctx) return;
+  ): { a: OscillatorNode; b: OscillatorNode } | null {
+    if (!this.ctx) return null;
     const osc1 = this.ctx.createOscillator();
     osc1.type = 'sine';
     osc1.frequency.value = spec.freq;
@@ -228,6 +277,109 @@ export class Audio {
     this.attachSlowLfo(osc2.detune, spec.driftRate, 14);
     // Tiny breath on osc1 too so the pair doesn't stay at a fixed offset.
     this.attachSlowLfo(osc1.detune, spec.driftRate * 0.63, 6);
+    return { a: osc1, b: osc2 };
+  }
+
+  /**
+   * Every 20-40s, glide the entire harmonic bed (pad voices, sub-bass,
+   * shimmer pair) to a new chord from AMBIENT_CHORDS over ~8-11 seconds.
+   * The glide is slow enough to read as the drone "leaning" rather than a
+   * chord change, but over a couple of minutes the harmony visits the whole
+   * progression — the single biggest cure for the static-drone feel.
+   */
+  private scheduleChordDrift(): void {
+    const delay = 20000 + Math.random() * 20000;
+    window.setTimeout(() => {
+      this.driftToNextChord();
+      this.scheduleChordDrift();
+    }, delay);
+  }
+
+  private driftToNextChord(): void {
+    if (!this.ctx || this.ctx.state !== 'running') return;
+    // Muted just means the master gain is 0 — keep drifting silently so the
+    // harmony is somewhere new when the player unmutes.
+    let next = Math.floor(Math.random() * AMBIENT_CHORDS.length);
+    if (next === this.chordIdx) next = (next + 1) % AMBIENT_CHORDS.length;
+    this.chordIdx = next;
+    const chord = AMBIENT_CHORDS[next];
+    const now = this.ctx.currentTime;
+    const glide = 8 + Math.random() * 3;
+
+    const rampTo = (param: AudioParam, target: number): void => {
+      // Pin the automation to the param's current value first so the ramp
+      // starts from wherever a previous (possibly unfinished) glide left it.
+      const from = Math.max(1e-3, param.value);
+      param.cancelScheduledValues(now);
+      param.setValueAtTime(from, now);
+      param.exponentialRampToValueAtTime(Math.max(1e-3, target), now + glide);
+    };
+
+    for (let i = 0; i < this.padOscPairs.length; i++) {
+      const f = chord[i] ?? chord[chord.length - 1];
+      rampTo(this.padOscPairs[i].a.frequency, f);
+      rampTo(this.padOscPairs[i].b.frequency, f * 1.003);
+    }
+    if (this.subOscNode) rampTo(this.subOscNode.frequency, chord[0] / 2);
+    if (this.shimmerOscA) rampTo(this.shimmerOscA.frequency, chord[1] * 4);
+    if (this.shimmerOscB) rampTo(this.shimmerOscB.frequency, chord[2] * 4);
+  }
+
+  /**
+   * Queue the next generative motif phrase — a long, irregular gap (35-70s)
+   * so phrases feel like rare transmissions, not background muzak.
+   */
+  private scheduleMotif(): void {
+    const delay = 35000 + Math.random() * 35000;
+    window.setTimeout(() => {
+      if (!this.muted) this.playMotif();
+      this.scheduleMotif();
+    }, delay);
+  }
+
+  /**
+   * Play a short random-walk phrase over the pentatonic MOTIF_POOL: 3-6 soft
+   * bell tones with slow attacks, each with a quiet octave partial. Note
+   * spacing is loose and human (0.7-1.4s) and the whole phrase decrescendos,
+   * so it reads as a distant melody drifting past rather than a jingle.
+   */
+  private playMotif(): void {
+    if (!this.ctx || !this.musicGain) return;
+    if (this.ctx.state !== 'running') return;
+    const now = this.ctx.currentTime;
+    const noteCount = 3 + Math.floor(Math.random() * 4);
+    let idx = Math.floor(Math.random() * MOTIF_POOL.length);
+    let t = now + 0.05;
+    // Soften the phrase through a gentle lowpass so it sits behind the SFX.
+    const lp = this.ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = 1600;
+    lp.Q.value = 0.5;
+    lp.connect(this.musicGain);
+    for (let n = 0; n < noteCount; n++) {
+      const f = MOTIF_POOL[idx];
+      const fade = 1 - (n / noteCount) * 0.45; // phrase decrescendo
+      const peak = (0.035 + Math.random() * 0.012) * fade;
+      const dur = 2.2 + Math.random() * 0.8;
+      const partials = [f, f * 2.002];
+      const gains = [peak, peak * 0.35];
+      for (let i = 0; i < partials.length; i++) {
+        const osc = this.ctx.createOscillator();
+        osc.type = 'sine';
+        osc.frequency.value = partials[i];
+        const g = this.ctx.createGain();
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(gains[i], t + 0.25);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+        osc.connect(g).connect(lp);
+        osc.start(t);
+        osc.stop(t + dur + 0.05);
+      }
+      // Random walk: mostly steps, occasional leap, clamped to the pool.
+      const step = Math.random() < 0.7 ? (Math.random() < 0.5 ? -1 : 1) : (Math.random() < 0.5 ? -2 : 2);
+      idx = Math.max(0, Math.min(MOTIF_POOL.length - 1, idx + step));
+      t += 0.7 + Math.random() * 0.7;
+    }
   }
 
   /**

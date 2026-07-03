@@ -103,7 +103,12 @@ export class Input {
   }
 
   private onDown = (e: PointerEvent): void => {
-    (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
+    try {
+      (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
+    } catch {
+      // NotFoundError when the pointer is already gone by the time we run
+      // (fast tap release, or synthetic events) — capture is best-effort.
+    }
     const { x, y } = this.screenFromEvent(e);
     const src = this.planetAtScreen(x, y);
     const owned = src !== null && this.world.planets[src].owner === 0 ? src : null;

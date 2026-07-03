@@ -85,6 +85,18 @@ export class Audio {
     if (this.ctx && this.ctx.state === 'suspended') void this.ctx.resume();
   }
 
+  /**
+   * Slow shared "breath" phase (0..1) derived from the audio clock, one
+   * cycle every 4 seconds — the same order of magnitude as the ambient
+   * pad's tremolo LFOs, so visuals pulsing on it read as moving with the
+   * music. Renderers shape it into whatever curve they need.
+   */
+  beatPhase01(): number {
+    if (!this.ctx) return 0;
+    const BEAT_HZ = 0.25;
+    return (this.ctx.currentTime * BEAT_HZ) % 1;
+  }
+
   setMuted(muted: boolean): void {
     this.muted = muted;
     if (this.musicGain) this.musicGain.gain.value = muted ? 0 : this.musicVolume;

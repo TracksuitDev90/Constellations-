@@ -6,7 +6,7 @@ import {
   Texture,
 } from 'pixi.js';
 import { paletteFor, toward } from '../../util/color.js';
-import { bakePlanetSphere, planetAssetsReady } from './planetAssets.js';
+import { bakePlanetSphere, hasBakedSource } from './planetAssets.js';
 import type { PlanetType } from '../sim/Planet.js';
 
 const cache = new Map<string, Texture>();
@@ -153,12 +153,18 @@ const shuffledArchetypes = (seed: number): PlanetArchetype[] => {
 export const assignPlanetArchetypes = (
   planetIds: readonly number[],
   seed: number,
-): void => {
+): PlanetArchetype[] => {
   archetypeAssignments.clear();
   const shuffled = shuffledArchetypes(seed);
+  const assigned = new Set<PlanetArchetype>();
   for (let i = 0; i < planetIds.length; i++) {
-    archetypeAssignments.set(planetIds[i], shuffled[i % shuffled.length]);
+    const arch = shuffled[i % shuffled.length];
+    archetypeAssignments.set(planetIds[i], arch);
+    assigned.add(arch);
   }
+  // Return the distinct archetype set so the caller can preload exactly the
+  // textures this match will draw (see loadPlanetAssets).
+  return [...assigned];
 };
 
 export const archetypeForSeed = (
@@ -186,7 +192,7 @@ export const makePlanetBodyTexture = (
 ): Texture => {
   const archetype = archetypeForSeed(seed, planetType);
 
-  if (planetAssetsReady() && !PROCEDURAL_ONLY.has(archetype)) {
+  if (hasBakedSource(archetype)) {
     // Bake larger than the sim radius for crisper pixels under zoom. The
     // PlanetLayer scales the sprite down via `bodyBaseScale` so the visible
     // sphere radius still matches `radius`.

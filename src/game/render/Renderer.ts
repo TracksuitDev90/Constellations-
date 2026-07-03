@@ -3,6 +3,7 @@ import { PLAYER_PALETTES } from '../../util/color.js';
 import type { World } from '../sim/World.js';
 import { BackgroundLayer } from './BackgroundLayer.js';
 import { HazardLayer } from './HazardLayer.js';
+import { LinkLayer } from './LinkLayer.js';
 import { PlanetLayer } from './PlanetLayer.js';
 import { ShipLayer } from './ShipLayer.js';
 
@@ -11,6 +12,7 @@ export class Renderer {
   world: World;
   bg: BackgroundLayer;
   worldLayer: Container;
+  linkLayer: LinkLayer;
   planetLayer: PlanetLayer;
   shipLayer: ShipLayer;
   hazardLayer: HazardLayer;
@@ -20,6 +22,11 @@ export class Renderer {
   viewX = 0;
   viewY = 0;
   viewScale = 1;
+  /**
+   * Recomputed per screen size in `updateScaleBounds` — a phone in portrait
+   * needs to zoom out well past the old fixed 0.4 floor to see the whole
+   * 1600×1000 map.
+   */
   minScale = 0.4;
   maxScale = 2.5;
 
@@ -32,17 +39,20 @@ export class Renderer {
     this.worldLayer = new Container();
     app.stage.addChild(this.worldLayer);
 
+    this.linkLayer = new LinkLayer(world);
     this.shipLayer = new ShipLayer(app, world);
     this.hazardLayer = new HazardLayer(app, world);
     this.planetLayer = new PlanetLayer(app, world);
     this.lasso = new Graphics();
 
-    // Z-order: ship streams beneath asteroid debris, then planets and their
-    // halos on top, then hazard neutrals over everything so their dots stay
-    // legible against busy traffic. The HazardLayer internally splits its
-    // asteroid vs. neutral subroots, so we add it twice — once before
-    // planets (asteroids will be in their first child) and the neutral
-    // overlay sits inside the same container above planets via z-index.
+    // Z-order: constellation edge lines at the very bottom, ship streams
+    // beneath asteroid debris, then planets and their halos on top, then
+    // hazard neutrals over everything so their dots stay legible against
+    // busy traffic. The HazardLayer internally splits its asteroid vs.
+    // neutral subroots, so we add it twice — once before planets (asteroids
+    // will be in their first child) and the neutral overlay sits inside the
+    // same container above planets via z-index.
+    this.worldLayer.addChild(this.linkLayer);
     this.worldLayer.addChild(this.shipLayer);
     this.worldLayer.addChild(this.hazardLayer);
     this.worldLayer.addChild(this.planetLayer);
@@ -84,11 +94,22 @@ export class Renderer {
     this.lasso.clear();
   }
 
-  fitToScreen(): void {
+  /** Scale at which the whole map fits the current screen (with padding). */
+  private fitScale(): number {
     const pad = 40;
     const sx = (this.app.screen.width - pad * 2) / this.world.width;
     const sy = (this.app.screen.height - pad * 2) / this.world.height;
-    const s = Math.min(sx, sy);
+    return Math.min(sx, sy);
+  }
+
+  /** Let small screens zoom out far enough to see the whole constellation. */
+  private updateScaleBounds(): void {
+    this.minScale = Math.min(0.4, this.fitScale() * 0.9);
+  }
+
+  fitToScreen(): void {
+    this.updateScaleBounds();
+    const s = this.fitScale();
     this.viewScale = Math.max(this.minScale, Math.min(this.maxScale, s));
     this.viewX = this.app.screen.width / 2 - (this.world.width * this.viewScale) / 2;
     this.viewY = this.app.screen.height / 2 - (this.world.height * this.viewScale) / 2;
@@ -126,20 +147,47 @@ export class Renderer {
   }
 
   private applyCamera(): void {
+    this.clampCamera();
     this.worldLayer.x = this.viewX;
     this.worldLayer.y = this.viewY;
     this.worldLayer.scale.set(this.viewScale);
   }
 
+  /**
+   * Keep the map on screen: the visible window may never be panned more
+   * than ~25% of the screen past the world bounds, so the player can't
+   * fling the constellation away and get lost in empty space.
+   */
+  private clampCamera(): void {
+    const sw = this.app.screen.width;
+    const sh = this.app.screen.height;
+    const worldW = this.world.width * this.viewScale;
+    const worldH = this.world.height * this.viewScale;
+    const marginX = sw * 0.25;
+    const marginY = sh * 0.25;
+    // Require at least `margin` of overlap between the world's span and the
+    // screen: the world's right edge may not go left of marginX, and its
+    // left edge may not go right of (screen − margin).
+    this.viewX = Math.max(marginX - worldW, Math.min(sw - marginX, this.viewX));
+    this.viewY = Math.max(marginY - worldH, Math.min(sh - marginY, this.viewY));
+  }
+
   onResize(width: number, height: number): void {
     this.bg.resize(width, height);
-    this.fitToScreen();
+    // Preserve the player's zoom/pan — mobile browsers fire resize whenever
+    // the toolbar collapses/expands, and resetting the camera mid-match made
+    // the view snap away under the player's fingers. Just refresh the scale
+    // floor and re-clamp against the new screen size.
+    this.updateScaleBounds();
+    this.viewScale = Math.max(this.minScale, Math.min(this.maxScale, this.viewScale));
+    this.applyCamera();
   }
 
   update(dt: number): void {
     this.bg.update(this.viewX, this.viewY);
+    this.linkLayer.update();
     this.planetLayer.update(dt);
     this.hazardLayer.update(dt);
-    this.shipLayer.update();
+    this.shipLayer.update(dt);
   }
 }

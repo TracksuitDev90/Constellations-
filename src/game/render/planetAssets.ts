@@ -41,27 +41,48 @@ interface SourceMap {
 
 const sources = new Map<PlanetArchetype, SourceMap>();
 const bakedCache = new Map<string, Texture>();
-let loadPromise: Promise<void> | null = null;
+/** In-flight per-archetype loads, deduped across calls. */
+const pending = new Map<PlanetArchetype, Promise<void>>();
+/** Archetypes whose source failed to load — these stay procedural. */
+const failed = new Set<PlanetArchetype>();
 
-export const loadPlanetAssets = (): Promise<void> => {
-  if (loadPromise) return loadPromise;
-  loadPromise = (async () => {
-    const entries = Object.entries(TEXTURE_PATHS) as Array<[PlanetArchetype, string]>;
-    const baked = entries.length;
-    await Promise.all(
-      entries.map(async ([arch, path]) => {
-        const img = await loadImage(resolveAsset(path));
-        const bounds = computePlanetBounds(img);
-        sources.set(arch, { img, ...bounds });
-      }),
-    );
-
-    bakedSourceCount = baked;
-  })();
-  return loadPromise;
+/**
+ * Load the source bitmaps for the given archetypes (defaults to the full
+ * pool). A match only ever uses the ≤9 archetypes assigned to its planets,
+ * so callers should pass that subset — loading and alpha-scanning all 39
+ * stickers (~5 MB) up front was a multi-second stall on mobile connections.
+ *
+ * Never rejects: an individual texture that fails to load (flaky network,
+ * missing file) is recorded in `failed` and its planet falls back to the
+ * procedural body, instead of one 404 disabling the entire photographic
+ * pipeline as `Promise.all` used to.
+ */
+export const loadPlanetAssets = (
+  archetypes: readonly PlanetArchetype[] = PHOTOGRAPHIC_ARCHETYPES,
+): Promise<void> => {
+  const jobs: Array<Promise<void>> = [];
+  for (const arch of archetypes) {
+    if (sources.has(arch) || failed.has(arch)) continue;
+    let job = pending.get(arch);
+    if (!job) {
+      job = (async () => {
+        try {
+          const img = await loadImage(resolveAsset(TEXTURE_PATHS[arch]));
+          const bounds = computePlanetBounds(img);
+          sources.set(arch, { img, ...bounds });
+        } catch (err) {
+          failed.add(arch);
+          console.warn(`planet texture ${arch} failed to load; using procedural body`, err);
+        } finally {
+          pending.delete(arch);
+        }
+      })();
+      pending.set(arch, job);
+    }
+    jobs.push(job);
+  }
+  return Promise.all(jobs).then(() => undefined);
 };
-
-let bakedSourceCount = 0;
 
 const loadImage = (src: string): Promise<HTMLImageElement> =>
   new Promise((resolve, reject) => {
@@ -115,41 +136,52 @@ const computePlanetBounds = (img: HTMLImageElement): { bx: number; by: number; b
   const h = maxY - minY + 1;
   const D = Math.min(w, h);
 
-  // Helper: count opaque pixels inside [x0, x0+D) × [y0, y0+D).
-  const countOpaque = (x0: number, y0: number): number => {
-    let n = 0;
-    const x1 = x0 + D;
-    const y1 = y0 + D;
-    for (let y = y0; y < y1; y++) {
-      const row = y * c.width;
-      for (let x = x0; x < x1; x++) {
-        if (data[(row + x) * 4 + 3] >= ALPHA_THRESHOLD) n++;
-      }
-    }
-    return n;
-  };
-
   let bx = minX;
   let by = minY;
   if (w > h) {
     // Slide a D-wide window across the bbox horizontally, pick the densest.
+    // Precompute per-column opaque counts within the D-tall band, then walk
+    // the window incrementally — O(W·D) instead of recounting the full
+    // window at every offset (O(W·D²), a visible main-thread stall on the
+    // larger stickers).
+    const colCounts = new Int32Array(w);
+    for (let x = minX; x <= maxX; x++) {
+      let n = 0;
+      for (let y = minY; y < minY + D; y++) {
+        if (data[(y * c.width + x) * 4 + 3] >= ALPHA_THRESHOLD) n++;
+      }
+      colCounts[x - minX] = n;
+    }
+    let windowSum = 0;
+    for (let x = 0; x < D; x++) windowSum += colCounts[x];
     let bestX = minX;
-    let bestCount = -1;
-    for (let x = minX; x + D <= maxX + 1; x++) {
-      const n = countOpaque(x, minY);
-      if (n > bestCount) {
-        bestCount = n;
+    let bestCount = windowSum;
+    for (let x = minX + 1; x + D <= maxX + 1; x++) {
+      windowSum += colCounts[x - minX + D - 1] - colCounts[x - minX - 1];
+      if (windowSum > bestCount) {
+        bestCount = windowSum;
         bestX = x;
       }
     }
     bx = bestX;
   } else if (h > w) {
+    const rowCounts = new Int32Array(h);
+    for (let y = minY; y <= maxY; y++) {
+      let n = 0;
+      const row = y * c.width;
+      for (let x = minX; x < minX + D; x++) {
+        if (data[(row + x) * 4 + 3] >= ALPHA_THRESHOLD) n++;
+      }
+      rowCounts[y - minY] = n;
+    }
+    let windowSum = 0;
+    for (let y = 0; y < D; y++) windowSum += rowCounts[y];
     let bestY = minY;
-    let bestCount = -1;
-    for (let y = minY; y + D <= maxY + 1; y++) {
-      const n = countOpaque(minX, y);
-      if (n > bestCount) {
-        bestCount = n;
+    let bestCount = windowSum;
+    for (let y = minY + 1; y + D <= maxY + 1; y++) {
+      windowSum += rowCounts[y - minY + D - 1] - rowCounts[y - minY - 1];
+      if (windowSum > bestCount) {
+        bestCount = windowSum;
         bestY = y;
       }
     }
@@ -163,10 +195,6 @@ const computePlanetBounds = (img: HTMLImageElement): { bx: number; by: number; b
   if (by + bsize > c.height) bsize = c.height - by;
   return { bx, by, bsize };
 };
-
-/** True once every photographic archetype's source bitmap has been sampled. */
-export const planetAssetsReady = (): boolean =>
-  bakedSourceCount > 0 && sources.size === bakedSourceCount;
 
 /** Whether a particular archetype has a baked photographic source. */
 export const hasBakedSource = (archetype: PlanetArchetype): boolean =>

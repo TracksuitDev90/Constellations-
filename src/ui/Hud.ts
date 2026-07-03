@@ -5,13 +5,15 @@ const btnStyle: Partial<CSSStyleDeclaration> = {
   background: 'rgba(255,255,255,0.08)',
   border: '1px solid rgba(255,255,255,0.12)',
   color: '#cfd6e4',
-  width: '36px',
-  height: '28px',
-  borderRadius: '6px',
+  // 44×44 is the minimum comfortable touch target on phones.
+  width: '44px',
+  height: '44px',
+  borderRadius: '8px',
   cursor: 'pointer',
-  fontSize: '16px',
+  fontSize: '18px',
   lineHeight: '1',
   padding: '0',
+  touchAction: 'manipulation',
 };
 
 export class Hud {
@@ -34,9 +36,11 @@ export class Hud {
     this.root = document.createElement('div');
     Object.assign(this.root.style, {
       position: 'absolute',
-      top: '12px',
-      left: '12px',
-      right: '12px',
+      // Respect notches / rounded corners — viewport-fit=cover means content
+      // otherwise slides under the safe-area cutouts on phones.
+      top: 'max(12px, env(safe-area-inset-top))',
+      left: 'max(12px, env(safe-area-inset-left))',
+      right: 'max(12px, env(safe-area-inset-right))',
       display: 'flex',
       gap: '8px',
       alignItems: 'center',

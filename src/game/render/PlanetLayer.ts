@@ -1,17 +1,17 @@
 import { Application, Container, Graphics, Sprite } from 'pixi.js';
 import type { Texture } from 'pixi.js';
-import { adjustColor, hueJitter, paletteFor } from '../../util/color.js';
+import { adjustColor, hueJitter, paletteFor, toward } from '../../util/color.js';
 import { ringCapacity, type PlanetType } from '../sim/Planet.js';
 import type { World } from '../sim/World.js';
 import {
-  assignPlanetArchetypes,
+  archetypeForSeed,
   bakedBodyDiameter,
   makePlanetBodyTexture,
   makePlanetHaloTexture,
   makeShipGlowTexture,
   makeShipTexture,
 } from './textures.js';
-import { planetAssetsReady } from './planetAssets.js';
+import { hasBakedSource } from './planetAssets.js';
 
 /**
  * Upper bound on atom-electron sprites per planet. Bigger planets get more
@@ -69,6 +69,16 @@ const RING_GROWTH_THRESHOLDS = [22, 36];
 const FULL_ATOM_COUNT = 42;
 /** Min/max ease rate so position transitions feel flowy, not mechanical. */
 const ORBIT_POS_EASE_RATE = 1.6;
+/**
+ * Seconds between heavy Graphics rebuilds (capacity rings, atom paths).
+ * Rebuilding Pixi Graphics is the single most expensive per-frame CPU cost
+ * on phones, and the content it draws animates slowly (ring spins are
+ * 0.2–0.5 rad/s) — a ~12 Hz cadence is visually indistinguishable from 60.
+ * Pulses (capture/evolve) force an immediate redraw so fast FX stay smooth.
+ */
+const FX_REDRAW_INTERVAL = 1 / 12;
+/** Max pooled (hidden) orbiter sprites retained per planet. */
+const ORBITER_POOL_MAX = 64;
 /** Ring alpha fade rate — slower than position so rings bleed in gradually. */
 const RING_ALPHA_EASE_RATE = 0.6;
 /** How quickly the eased ring count catches its discrete target. */
@@ -100,8 +110,9 @@ const RING_GROWTH_MAX = 0.7;
 const RING_GROWTH_CURVE = 0.55;
 
 /** Map the baked body's pixel diameter back down to the planet's world radius. */
-const computeBodyBaseScale = (radius: number): number => {
-  if (!planetAssetsReady()) return 1; // procedural body already matches radius.
+const computeBodyBaseScale = (radius: number, planetId: number): number => {
+  // Procedural fallback bodies are already drawn at the world radius.
+  if (!hasBakedSource(archetypeForSeed(planetId))) return 1;
   const diameter = bakedBodyDiameter(radius);
   return (radius * 2) / diameter;
 };
@@ -154,6 +165,13 @@ interface PlanetView {
   easedStrength: number;
   orbitRoot: Container;
   orbiters: Orbiter[];
+  /** Hidden, reusable orbiter sprites — avoids destroy/create churn in combat. */
+  orbiterPool: Orbiter[];
+  /** Accumulator gating the ~12 Hz heavy Graphics rebuild cadence. */
+  fxRedrawAcc: number;
+  /** Last strength-bar fill actually drawn — lets static bars skip redraw. */
+  lastDrawnStrength: number;
+  lastDrawnBarOwner: number | null;
   lastOwner: number | null;
   displayScale: number;
   baseRadius: number;
@@ -215,13 +233,9 @@ export class PlanetLayer extends Container {
     this.shipTex = makeShipTexture(app);
     this.shipGlowTex = makeShipGlowTexture(app);
 
-    // Assign every planet a distinct archetype from the pool before baking
-    // any body textures, so no two worlds in the same match share a surface.
-    assignPlanetArchetypes(
-      world.planets.map((p) => p.id),
-      // Use the wall clock as the per-match seed so replays shuffle the pool.
-      Date.now() & 0x7fffffff,
-    );
+    // Archetype → planet assignment happens in Game.startMatch (before the
+    // per-match texture subset is loaded), so by the time this constructor
+    // bakes body textures every assignment is already in place.
 
     for (const planet of world.planets) {
       const container = new Container();
@@ -289,6 +303,12 @@ export class PlanetLayer extends Container {
         easedStrength: 0,
         orbitRoot,
         orbiters: [],
+        orbiterPool: [],
+        // Random phase offset so all planets don't rebuild Graphics on the
+        // same frame — spreads the 12 Hz cost across the cadence window.
+        fxRedrawAcc: Math.random() * FX_REDRAW_INTERVAL,
+        lastDrawnStrength: -1,
+        lastDrawnBarOwner: null,
         lastOwner: planet.owner,
         displayScale: 1,
         baseRadius: planet.radius,
@@ -304,7 +324,7 @@ export class PlanetLayer extends Container {
         ringAlpha: [0, 0, 0],
         easedRingCount: 0,
         atomFormation: 0,
-        bodyBaseScale: computeBodyBaseScale(planet.radius),
+        bodyBaseScale: computeBodyBaseScale(planet.radius, planet.id),
         lastProductionAcc: 0,
         productionPulses: [],
         productionFx,
@@ -343,7 +363,7 @@ export class PlanetLayer extends Container {
       if (p.type !== v.type || p.radius !== v.baseRadius) {
         v.type = p.type;
         v.baseRadius = p.radius;
-        v.bodyBaseScale = computeBodyBaseScale(p.radius);
+        v.bodyBaseScale = computeBodyBaseScale(p.radius, p.id);
         v.body.texture = makePlanetBodyTexture(this.app, p.owner, p.radius, p.id, p.type);
         v.halo.texture = makePlanetHaloTexture(this.app, p.owner, p.radius);
         v.displayScale = EVOLVE_POP_START;
@@ -352,7 +372,8 @@ export class PlanetLayer extends Container {
       // Owner change → halo re-tints. The body stays as the baked planet map
       // (ownership is communicated by the halo + rings + orbiters).
       if (p.owner !== v.lastOwner) {
-        if (!planetAssetsReady()) {
+        if (!hasBakedSource(archetypeForSeed(p.id))) {
+          // Procedural fallback bodies are owner-tinted, so rebake on flip.
           v.body.texture = makePlanetBodyTexture(this.app, p.owner, p.radius, p.id, p.type);
         }
         v.halo.texture = makePlanetHaloTexture(this.app, p.owner, p.radius);
@@ -399,18 +420,28 @@ export class PlanetLayer extends Container {
 
       const pal = paletteFor(p.owner);
 
+      // Heavy Graphics rebuilds run on a ~12 Hz cadence; active FX (capture
+      // flash, evolve pop, size ease) force per-frame redraws so the fast
+      // animations don't stutter.
+      const animating =
+        p.capturePulse > 0.01 ||
+        p.evolvePulse > 0.01 ||
+        Math.abs(1 - v.displayScale) > 0.01;
+      v.fxRedrawAcc += dt;
+      const redrawHeavy = animating || v.fxRedrawAcc >= FX_REDRAW_INTERVAL;
+      if (v.fxRedrawAcc >= FX_REDRAW_INTERVAL) v.fxRedrawAcc %= FX_REDRAW_INTERVAL;
+
       // Strength bar under the planet — a visual stand-in for the old numeric
       // garrison readout. Length scales with garrison / maxUnitCapacity (past
       // 1.0 it overflows into a pulsing "saturated" glow).
-      this.drawStrengthBar(v, p.garrison, p.maxUnitCapacity, effRadius, pal, p.owner, dt);
+      this.drawStrengthBar(v, p.garrison, p.maxUnitCapacity, effRadius, pal, p.owner, dt, animating);
 
       // Capacity rings: drawn procedurally as 3D-tilted brushstroke arcs,
       // split across `ringsBack` (rear half, behind the body) and
       // `ringsFront` (near half, over the body) so each ring reads as
       // orbiting around the world. Fill progress paints a coloured arc
-      // along the leading edge with sparkle beads on top.
-      v.ringsBack.clear();
-      v.ringsFront.clear();
+      // along the leading edge with sparkle beads on top. Easing/spin state
+      // advances every frame; only the (expensive) stroke rebuild is gated.
       const RING_WIDTH = Math.max(4, v.baseRadius * 0.35);
       const RING_GAP = Math.max(3, v.baseRadius * 0.12);
       const RING_INSET = Math.max(6, v.baseRadius * 0.22);
@@ -423,34 +454,41 @@ export class PlanetLayer extends Container {
           const prog = v.ringProgress[k] ?? 0;
           const eased = 1 - Math.exp(-dt * 4);
           v.ringProgress[k] = prog + (target - prog) * eased;
-          const progress = v.ringProgress[k];
-
-          const rMid =
-            effRadius +
-            RING_INSET +
-            RING_WIDTH / 2 +
-            k * (RING_WIDTH + RING_GAP);
-
           v.capRingSpin[k] += (v.capRingSpinSpeed[k] ?? 0.25) * dt;
-
-          const jitterSeed = p.id * 73 + k * 19;
-          const baseColor = hueJitter(pal.ring, jitterSeed, 0.18);
-
-          drawProceduralRing(
-            v.ringsBack,
-            v.ringsFront,
-            rMid,
-            RING_WIDTH,
-            v.capRingTilt[k] ?? 0.6,
-            v.capRingYaw[k] ?? 0,
-            v.capRingSpin[k] ?? 0,
-            baseColor,
-            pal.glow,
-            progress,
-            this.time,
-            p.id * 13 + k,
-          );
         }
+        if (redrawHeavy) {
+          v.ringsBack.clear();
+          v.ringsFront.clear();
+          for (let k = 0; k < p.ringCount; k++) {
+            const rMid =
+              effRadius +
+              RING_INSET +
+              RING_WIDTH / 2 +
+              k * (RING_WIDTH + RING_GAP);
+
+            const jitterSeed = p.id * 73 + k * 19;
+            const baseColor = hueJitter(pal.ring, jitterSeed, 0.18);
+
+            drawProceduralRing(
+              v.ringsBack,
+              v.ringsFront,
+              rMid,
+              RING_WIDTH,
+              v.capRingTilt[k] ?? 0.6,
+              v.capRingYaw[k] ?? 0,
+              v.capRingSpin[k] ?? 0,
+              baseColor,
+              pal.glow,
+              v.ringProgress[k] ?? 0,
+              this.time,
+              p.id * 13 + k,
+            );
+          }
+        }
+      } else if (redrawHeavy) {
+        // Rings may have just cleared (evolve/capture) — wipe stale strokes.
+        v.ringsBack.clear();
+        v.ringsFront.clear();
       }
 
       // Evolve shockwave: a fading ring that expands outward past the halo
@@ -504,10 +542,12 @@ export class PlanetLayer extends Container {
       v.lastProductionAcc = p.owner === null ? 0 : p.productionAcc;
 
       // Orbiters: represent garrison (up to cap) as atom-symbol electrons.
+      // Electron sprites move every frame (cheap transforms); the ghost
+      // ellipse paths are Graphics and follow the 12 Hz rebuild cadence.
       if (p.owner !== null) {
         this.syncOrbiters(v, Math.min(p.garrison, orbiterCapFor(p.maxUnitCapacity)), p.owner);
         this.tickOrbiters(v, dt);
-        this.drawAtomPaths(v, pal.ring);
+        if (redrawHeavy) this.drawAtomPaths(v, pal.ring);
       } else {
         if (v.orbiters.length > 0) this.clearOrbiters(v);
         v.atomPaths.clear();
@@ -579,17 +619,34 @@ export class PlanetLayer extends Container {
     pal: import('../../util/color.js').PlayerPalette,
     owner: number | null,
     dt: number,
+    forceRedraw: boolean,
   ): void {
     const g = v.strengthBar;
-    g.clear();
     if (owner === null || garrison <= 0) {
       v.easedStrength = 0;
+      if (v.lastDrawnStrength !== 0) {
+        g.clear();
+        v.lastDrawnStrength = 0;
+        v.lastDrawnBarOwner = owner;
+      }
       return;
     }
     const targetFill = capacity > 0 ? garrison / capacity : 0;
     const ease = 1 - Math.exp(-dt * 5);
     v.easedStrength += (targetFill - v.easedStrength) * ease;
     const fill = Math.max(0, v.easedStrength);
+
+    // Once the eased fill has settled and there's no animated overflow pulse,
+    // the bar is static — skip the per-frame Graphics rebuild entirely.
+    const settled =
+      !forceRedraw &&
+      owner === v.lastDrawnBarOwner &&
+      fill <= 1.001 &&
+      Math.abs(fill - v.lastDrawnStrength) < 0.004;
+    if (settled) return;
+    v.lastDrawnStrength = fill;
+    v.lastDrawnBarOwner = owner;
+    g.clear();
 
     const width = Math.max(24, effRadius * 1.6);
     const height = Math.max(3, effRadius * 0.1);
@@ -641,6 +698,30 @@ export class PlanetLayer extends Container {
     }
 
     while (v.orbiters.length < target) {
+      // Reuse a pooled orbiter when available — garrisons oscillate every
+      // few seconds in combat, and destroy/create sprite churn was a
+      // measurable GC + scene-graph cost on phones.
+      const pooled = v.orbiterPool.pop();
+      if (pooled) {
+        pooled.sprite.visible = true;
+        pooled.glow.visible = true;
+        pooled.sprite.tint = shipTint;
+        pooled.glow.tint = shipTint;
+        pooled.sprite.scale.set(0);
+        pooled.sprite.x = 0;
+        pooled.sprite.y = 0;
+        pooled.glow.x = 0;
+        pooled.glow.y = 0;
+        pooled.glow.alpha = 0;
+        pooled.birthAge = 0;
+        pooled.birthAngle = Math.random() * Math.PI * 2;
+        pooled.phase = Math.random() * Math.PI * 2;
+        pooled.wanderPhase = Math.random() * Math.PI * 2;
+        pooled.slotPhase = Math.random() * Math.PI * 2;
+        v.orbiters.push(pooled);
+        continue;
+      }
+
       // Glow is added first so it renders under the bright dot. Additive
       // blending means overlapping glows accumulate into bright hotspots
       // wherever orbiters cluster, without each ring reading as a solid blob.
@@ -681,12 +762,22 @@ export class PlanetLayer extends Container {
     }
 
     while (v.orbiters.length > target) {
-      const o = v.orbiters.pop()!;
-      v.orbitRoot.removeChild(o.sprite);
-      v.orbitRoot.removeChild(o.glow);
-      o.sprite.destroy();
-      o.glow.destroy();
+      this.retireOrbiter(v, v.orbiters.pop()!);
     }
+  }
+
+  /** Hide an orbiter into the per-planet pool, or destroy past the cap. */
+  private retireOrbiter(v: PlanetView, o: Orbiter): void {
+    if (v.orbiterPool.length < ORBITER_POOL_MAX) {
+      o.sprite.visible = false;
+      o.glow.visible = false;
+      v.orbiterPool.push(o);
+      return;
+    }
+    v.orbitRoot.removeChild(o.sprite);
+    v.orbitRoot.removeChild(o.glow);
+    o.sprite.destroy();
+    o.glow.destroy();
   }
 
   private tickOrbiters(v: PlanetView, dt: number): void {
@@ -863,12 +954,7 @@ export class PlanetLayer extends Container {
   }
 
   private clearOrbiters(v: PlanetView): void {
-    for (const o of v.orbiters) {
-      v.orbitRoot.removeChild(o.sprite);
-      v.orbitRoot.removeChild(o.glow);
-      o.sprite.destroy();
-      o.glow.destroy();
-    }
+    for (const o of v.orbiters) this.retireOrbiter(v, o);
     v.orbiters.length = 0;
   }
 
@@ -940,8 +1026,11 @@ const drawProceduralRing = (
   const cosT = Math.cos(tilt);
   const cosY = Math.cos(yaw);
   const sinY = Math.sin(yaw);
-  const underColor = adjustColor(baseColor, -0.4);
-  const hiColor = adjustColor(baseColor, 0.45);
+  // `adjustColor` multiplies channels, so darken with a 0..1 factor and
+  // lighten by blending toward white — the old `-0.4` / `0.45` calls
+  // produced a pure-black underglow and a *darker* "highlight".
+  const underColor = adjustColor(baseColor, 0.6);
+  const hiColor = toward(baseColor, 0xffffff, 0.45);
 
   // Pre-sample each segment's screen position + depth + per-segment radial
   // jitter so all four passes hit the exact same painterly silhouette.

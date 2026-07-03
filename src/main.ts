@@ -32,7 +32,10 @@ const bootstrap = async (): Promise<void> => {
     background: '#050810',
     resizeTo: window,
     antialias: true,
-    resolution: window.devicePixelRatio || 1,
+    // Cap at 2× — DPR-3 phones would otherwise rasterize 2.25× the pixels of
+    // a 2× buffer for no visible gain on a glowing-dots aesthetic, and fill
+    // rate is the tightest budget on mobile GPUs.
+    resolution: Math.min(window.devicePixelRatio || 1, 2),
     autoDensity: true,
   });
 
@@ -43,6 +46,12 @@ const bootstrap = async (): Promise<void> => {
 
   const game = new Game(app, uiEl);
   game.start();
+
+  // Dev-only escape hatch for debugging / driving the game from the console
+  // (and from automated smoke tests). Not exposed in production builds.
+  if (import.meta.env.DEV) {
+    (window as unknown as { __game: Game }).__game = game;
+  }
 };
 
 window.addEventListener('error', (e) => showFatal(String(e.error ?? e.message)));

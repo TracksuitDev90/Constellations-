@@ -190,6 +190,11 @@ export class Game {
           this.audio.shipDeath();
           this.deathTimestamps.push(performance.now());
         },
+        onShipConsumed: () => {
+          this.audio.shipConsumed();
+          // A hole eating a wave should read as combat pressure too.
+          this.deathTimestamps.push(performance.now());
+        },
         onPlanetEvolve: (_planetId, owner, newType) => {
           if (owner !== 0) return;
           this.audio.planetEvolve(newType);
@@ -222,6 +227,10 @@ export class Game {
     );
 
     this.renderer = new Renderer(this.app, this.world);
+
+    // Matches with a black hole get a dedicated dark drone under the ambient
+    // bed; hole-free matches must not carry it over from a previous game.
+    this.audio.setBlackHolePresence(this.world.blackHoles.length > 0);
 
     this.selection = new Selection(this.world, 0);
     this.ais = level.aiConfigs.map((cfg, i) => new BasicAI(this.world, i + 1, cfg));

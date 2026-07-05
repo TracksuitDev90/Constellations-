@@ -357,6 +357,214 @@ describe('neutral swarm hazard', () => {
   });
 });
 
+describe('black hole hazard', () => {
+  // Target is neutral so a successful capture can't trigger game-over (a
+  // frozen post-victory sim would mask the assertions we care about here).
+  const holeMap = (holeY: number): MapSpec => ({
+    width: 1000,
+    height: 800,
+    planets: [
+      { pos: { x: 50, y: 400 }, radius: 16, owner: 0, garrison: 30 },
+      { pos: { x: 950, y: 400 }, radius: 16, owner: null, garrison: 5 },
+    ],
+    edges: [[0, 1]],
+    hazards: [
+      {
+        type: 'blackHole',
+        pos: { x: 500, y: holeY },
+        horizonRadius: 18,
+        gravityRadius: 160,
+        seed: 7,
+      },
+    ],
+  });
+  const players = [
+    { id: 0, isAI: false, name: 'P' },
+    { id: 1, isAI: true, name: 'A' },
+  ];
+
+  it('consumes a wave sent straight through the well', () => {
+    let consumed = 0;
+    // Hole dead-center on the flight line between the two planets.
+    const w = new World(holeMap(400), players, {
+      onShipConsumed: () => consumed++,
+    });
+    for (const p of w.planets) p.productionRate = 0;
+    w.openStream(0, 0, 1, 12);
+    for (let i = 0; i < 800; i++) w.step(0.05);
+    // The lazy straight-line send dies in the hole; the target holds.
+    expect(consumed).toBeGreaterThanOrEqual(8);
+    expect(w.planets[1].owner).toBe(null);
+  });
+
+  it('spares a route that stays outside the gravity radius', () => {
+    let consumed = 0;
+    // Same well, moved 300px off the flight line — a planned route around.
+    const w = new World(holeMap(100), players, {
+      onShipConsumed: () => consumed++,
+    });
+    for (const p of w.planets) p.productionRate = 0;
+    w.openStream(0, 0, 1, 12);
+    for (let i = 0; i < 800; i++) w.step(0.05);
+    expect(consumed).toBe(0);
+    expect(w.planets[1].owner).toBe(0);
+  });
+
+  it('capture is terminal but the infall spiral is visibly slow', () => {
+    let consumedAt = -1;
+    const w = new World(holeMap(400), players, {
+      onShipConsumed: () => {
+        if (consumedAt < 0) consumedAt = w.time;
+      },
+    });
+    for (const p of w.planets) p.productionRate = 0;
+    // Park a hover ship just inside the capture threshold (18 * 2.6 ≈ 47).
+    const idx = w.ships.spawn(0, { x: 500 + 42, y: 400 }, -1, 48, {
+      vx: 0,
+      vy: 0,
+      turnRate: 2,
+      wobbleAmp: 0,
+      wobblePhase: 0,
+      state: 'hovering',
+    });
+    const s = w.ships.get(idx);
+    s.targetX = 500 + 42;
+    s.targetY = 400;
+    for (let i = 0; i < 300 && consumedAt < 0; i++) w.step(1 / 30);
+    // It died — no immortal spirals — but took a readable moment to fall.
+    expect(consumedAt).toBeGreaterThan(0.8);
+    expect(consumedAt).toBeLessThan(6);
+  });
+
+  it('swallows neutral swarm ships that stray inside', () => {
+    let neutralDeaths = 0;
+    const map: MapSpec = {
+      ...holeMap(400),
+      hazards: [
+        ...(holeMap(400).hazards ?? []),
+        // Swarm anchored right on the hole — every spawn is inside capture.
+        { type: 'neutralSwarm', pos: { x: 500, y: 400 }, count: 3, patrolRadius: 30, seed: 3 },
+      ],
+    };
+    const w = new World(map, players, {
+      onNeutralDeath: () => neutralDeaths++,
+    });
+    for (const p of w.planets) p.productionRate = 0;
+    for (let i = 0; i < 200; i++) w.step(1 / 30);
+    // No player ships anywhere near — the hole itself did the killing.
+    expect(neutralDeaths).toBeGreaterThan(0);
+  });
+
+  it('excludes doomed ships from totalGarrison', () => {
+    const w = new World(holeMap(400), players);
+    for (const p of w.planets) p.productionRate = 0;
+    const base = w.totalGarrison(0);
+    const idx = w.ships.spawn(0, { x: 500 + 40, y: 400 }, -1, 48, {
+      vx: 0,
+      vy: 0,
+      turnRate: 2,
+      wobbleAmp: 0,
+      wobblePhase: 0,
+      state: 'hovering',
+    });
+    const s = w.ships.get(idx);
+    s.targetX = 500 + 40;
+    s.targetY = 400;
+    expect(w.totalGarrison(0)).toBe(base + 1);
+    w.step(1 / 30);
+    // One tick inside the capture zone flips it to 'doomed' — the HUD
+    // strength bar must drop it immediately even though it's still visible.
+    expect(s.state).toBe('doomed');
+    expect(s.active).toBe(true);
+    expect(w.totalGarrison(0)).toBe(base);
+  });
+});
+
+describe('neutral swarm behavior', () => {
+  it('hunts down ships loitering well outside the old point-blank radius', () => {
+    let shipDeaths = 0;
+    const map: MapSpec = {
+      width: 600,
+      height: 300,
+      planets: [
+        { pos: { x: 50, y: 250 }, radius: 16, owner: 0, garrison: 5 },
+        { pos: { x: 550, y: 250 }, radius: 16, owner: 1, garrison: 5 },
+      ],
+      edges: [[0, 1]],
+      hazards: [
+        { type: 'neutralSwarm', pos: { x: 300, y: 100 }, count: 4, patrolRadius: 10, seed: 5 },
+      ],
+    };
+    const w = new World(
+      map,
+      [
+        { id: 0, isAI: false, name: 'P' },
+        { id: 1, isAI: true, name: 'A' },
+      ],
+      { onShipDeath: () => shipDeaths++ },
+    );
+    for (const p of w.planets) p.productionRate = 0;
+    // A fleet parked 80px from the anchor — 70px clear of the patrol band.
+    // The old 22px point-blank snipe could never touch it; the pursue state
+    // must detect it (90px ring), close in, and trade kills.
+    for (let k = 0; k < 3; k++) {
+      const idx = w.ships.spawn(0, { x: 380, y: 100 + k * 6 }, -1, 48, {
+        vx: 0,
+        vy: 0,
+        turnRate: 2,
+        wobbleAmp: 0,
+        wobblePhase: 0,
+        state: 'hovering',
+      });
+      const s = w.ships.get(idx);
+      s.targetX = 380;
+      s.targetY = 100 + k * 6;
+    }
+    for (let i = 0; i < 900; i++) w.step(1 / 30);
+    expect(shipDeaths).toBeGreaterThan(0);
+  });
+
+  it('leashes back to its anchor instead of chasing across the map', () => {
+    const anchor = { x: 300, y: 100 };
+    const patrolRadius = 40;
+    const map: MapSpec = {
+      width: 600,
+      height: 200,
+      planets: [
+        { pos: { x: 50, y: 100 }, radius: 16, owner: 0, garrison: 5 },
+        { pos: { x: 550, y: 100 }, radius: 16, owner: 1, garrison: 5 },
+      ],
+      edges: [[0, 1]],
+      hazards: [{ type: 'neutralSwarm', pos: anchor, count: 4, patrolRadius, seed: 9 }],
+    };
+    const w = new World(map, [
+      { id: 0, isAI: false, name: 'P' },
+      { id: 1, isAI: true, name: 'A' },
+    ]);
+    for (const p of w.planets) p.productionRate = 0;
+    // Dangle bait at the detection edge, then let the swarm chase, kill, and
+    // (crucially) come home.
+    const idx = w.ships.spawn(0, { x: 380, y: 100 }, -1, 48, {
+      vx: 0,
+      vy: 0,
+      turnRate: 2,
+      wobbleAmp: 0,
+      wobblePhase: 0,
+      state: 'hovering',
+    });
+    const bait = w.ships.get(idx);
+    bait.targetX = 380;
+    bait.targetY = 100;
+    for (let i = 0; i < 900; i++) w.step(1 / 30);
+    const leash = patrolRadius + 90 * 1.2; // patrol band + chase margin
+    for (const n of w.neutrals.all) {
+      if (!n.active) continue;
+      const d = Math.hypot(n.x - anchor.x, n.y - anchor.y);
+      expect(d).toBeLessThanOrEqual(leash + 20);
+    }
+  });
+});
+
 describe('World game over', () => {
   it('declares winner when only one owner remains', () => {
     let winner: number | null = -1;

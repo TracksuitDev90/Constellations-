@@ -40,14 +40,34 @@ const AMBIENT_CHORDS: ReadonlyArray<readonly [number, number, number]> = [
   [130.81, 196.0, 293.66], // C add9   (C3  G3 D4)
   [98.0, 146.83, 220.0],   // Gsus2    (G2  D3 A3)
   [82.41, 123.47, 196.0],  // Em7      (E2  B2 G3)
+  [110.0, 146.83, 196.0],  // A quartal (A2  D3 G3)
+  [73.42, 110.0, 164.81],  // Dsus low  (D2  A2 E3)
 ];
 
 /**
- * Note pool for the sparse generative motif — A-minor pentatonic across two
- * octaves. Diatonic to every chord in AMBIENT_CHORDS, so a phrase can start
- * under one chord and finish under the next without ever clashing.
+ * Note pool for the sparse generative motif — A-minor pentatonic across
+ * nearly four octaves. Diatonic to every chord in AMBIENT_CHORDS, so a
+ * phrase can start under one chord and finish under the next without ever
+ * clashing. The wide range lets the random walk sketch longer arcs: low
+ * openings that climb, high phrases that sink back down.
  */
-const MOTIF_POOL = [220.0, 261.63, 293.66, 329.63, 392.0, 440.0, 523.25];
+const MOTIF_POOL = [
+  164.81, // E3
+  196.0,  // G3
+  220.0,  // A3
+  261.63, // C4
+  293.66, // D4
+  329.63, // E4
+  392.0,  // G4
+  440.0,  // A4
+  523.25, // C5
+  587.33, // D5
+  659.25, // E5
+  783.99, // G5
+];
+
+/** Low pool for the slow bass counter-voice under the motif register. */
+const BASS_MOTIF_POOL = [110.0, 130.81, 146.83, 164.81]; // A2 C3 D3 E3
 
 export class Audio {
   private ctx: AudioContext | null = null;
@@ -82,6 +102,9 @@ export class Audio {
   private shimmerOscB: OscillatorNode | null = null;
   /** Index into AMBIENT_CHORDS the pad currently sits on (or glides toward). */
   private chordIdx = 0;
+  /** Live nodes of the black-hole drone layer; null when no hole is present. */
+  private blackHoleNodes: Array<OscillatorNode | AudioBufferSourceNode | GainNode> = [];
+  private lastConsumeAt = 0;
   muted = false;
   musicVolume = 0.35;
   sfxVolume = 0.45;
@@ -262,6 +285,11 @@ export class Audio {
     // — enough melodic identity to break the drone without ever becoming a
     // hook that could wear out over a long session.
     this.scheduleMotif();
+
+    // ── Bass counter-voice ───────────────────────────────────────────────
+    // Rare 2-3 note phrases from the low pool with very slow attacks — a
+    // second melodic register answering the motif from far below.
+    this.scheduleBassMotif();
   }
 
   /**
@@ -369,6 +397,7 @@ export class Audio {
     const noteCount = 3 + Math.floor(Math.random() * 4);
     let idx = Math.floor(Math.random() * MOTIF_POOL.length);
     let t = now + 0.05;
+    const phrase: number[] = [];
     // Soften the phrase through a gentle lowpass so it sits behind the SFX.
     const lp = this.ctx.createBiquadFilter();
     lp.type = 'lowpass';
@@ -377,6 +406,7 @@ export class Audio {
     lp.connect(this.bedGain ?? this.musicGain);
     for (let n = 0; n < noteCount; n++) {
       const f = MOTIF_POOL[idx];
+      phrase.push(f);
       const fade = 1 - (n / noteCount) * 0.45; // phrase decrescendo
       const peak = (0.035 + Math.random() * 0.012) * fade;
       const dur = 2.2 + Math.random() * 0.8;
@@ -398,6 +428,77 @@ export class Audio {
       const step = Math.random() < 0.7 ? (Math.random() < 0.5 ? -1 : 1) : (Math.random() < 0.5 ? -2 : 2);
       idx = Math.max(0, Math.min(MOTIF_POOL.length - 1, idx + step));
       t += 0.7 + Math.random() * 0.7;
+    }
+    // Sometimes a distant answer: the phrase's opening notes return several
+    // seconds later, an octave down and darker — call-and-response structure
+    // without ever becoming a hook.
+    if (Math.random() < 0.35) {
+      const echoDelay = 5 + Math.random() * 3;
+      window.setTimeout(() => {
+        if (!this.muted) this.playMotifEcho(phrase.slice(0, 2 + Math.floor(Math.random() * 2)));
+      }, echoDelay * 1000);
+    }
+  }
+
+  /** Replay `notes` an octave down on a muffled triangle — the "response". */
+  private playMotifEcho(notes: number[]): void {
+    if (!this.ctx || !this.musicGain) return;
+    if (this.ctx.state !== 'running') return;
+    let t = this.ctx.currentTime + 0.05;
+    const lp = this.ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = 1000;
+    lp.Q.value = 0.5;
+    lp.connect(this.bedGain ?? this.musicGain);
+    for (const f of notes) {
+      const osc = this.ctx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.value = f / 2;
+      const g = this.ctx.createGain();
+      const dur = 2.6 + Math.random() * 0.6;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.028, t + 0.35);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      osc.connect(g).connect(lp);
+      osc.start(t);
+      osc.stop(t + dur + 0.05);
+      t += 0.9 + Math.random() * 0.5;
+    }
+  }
+
+  /** Queue the next bass counter-phrase — even rarer than the motif. */
+  private scheduleBassMotif(): void {
+    const delay = 70000 + Math.random() * 50000;
+    window.setTimeout(() => {
+      if (!this.muted) this.playBassMotif();
+      this.scheduleBassMotif();
+    }, delay);
+  }
+
+  /**
+   * 2-3 notes from the low pool with very slow (~0.8s) attacks — felt as the
+   * floor of the music briefly finding a melody of its own.
+   */
+  private playBassMotif(): void {
+    if (!this.ctx || !this.musicGain) return;
+    if (this.ctx.state !== 'running') return;
+    let t = this.ctx.currentTime + 0.05;
+    const noteCount = 2 + (Math.random() < 0.5 ? 1 : 0);
+    let idx = Math.floor(Math.random() * BASS_MOTIF_POOL.length);
+    for (let n = 0; n < noteCount; n++) {
+      const osc = this.ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = BASS_MOTIF_POOL[idx];
+      const g = this.ctx.createGain();
+      const dur = 4 + Math.random() * 1.5;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.045, t + 0.8);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      osc.connect(g).connect(this.bedGain ?? this.musicGain);
+      osc.start(t);
+      osc.stop(t + dur + 0.05);
+      idx = Math.max(0, Math.min(BASS_MOTIF_POOL.length - 1, idx + (Math.random() < 0.5 ? -1 : 1)));
+      t += 2 + Math.random() * 1.2;
     }
   }
 
@@ -533,7 +634,7 @@ export class Audio {
     // Suspended context (page hidden): skip — scheduling against a frozen
     // clock would stack every missed one-shot onto the moment of resume.
     if (this.ctx.state !== 'running') return;
-    const pick = Math.floor(Math.random() * 8);
+    const pick = Math.floor(Math.random() * 10);
     if (pick === 0) this.etherealWindSwell();
     else if (pick === 1) this.etherealDistantChime();
     else if (pick === 2) this.etherealDeepSweep();
@@ -541,7 +642,70 @@ export class Audio {
     else if (pick === 4) this.etherealCometWhistle();
     else if (pick === 5) this.etherealPulsarEchoes();
     else if (pick === 6) this.etherealAuroraSwell();
+    else if (pick === 7) this.etherealHarmonicRain();
+    else if (pick === 8) this.etherealGravityHum();
     else this.etherealVoidBreath();
+  }
+
+  /**
+   * A short cascade of descending pentatonic plucks, closely staggered —
+   * like sparks raining down a scale. Quiet and lowpassed so it stays
+   * texture, not melody.
+   */
+  private etherealHarmonicRain(): void {
+    if (!this.ctx || !this.musicGain) return;
+    const now = this.ctx.currentTime;
+    const bus = this.bedGain ?? this.musicGain;
+    const lp = this.ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = 2400;
+    lp.Q.value = 0.5;
+    lp.connect(bus);
+    // Walk down the high half of the pentatonic pool from a random start.
+    const highPool = [1046.5, 880.0, 783.99, 659.25, 587.33, 523.25, 440.0, 392.0];
+    const start = Math.floor(Math.random() * 3);
+    const drops = 5 + Math.floor(Math.random() * 4);
+    for (let i = 0; i < drops; i++) {
+      const f = highPool[Math.min(highPool.length - 1, start + i)];
+      const t = now + i * 0.09 + Math.random() * 0.03;
+      const osc = this.ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = f;
+      const g = this.ctx.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.02 * (1 - i / drops * 0.4), t + 0.015);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.7);
+      osc.connect(g).connect(lp);
+      osc.start(t);
+      osc.stop(t + 0.75);
+    }
+  }
+
+  /**
+   * Two deep sines a perfect fifth apart with a slow beating detune — a long
+   * gravitational drone-swell. Doubles as generic space dread, and pairs
+   * naturally with the black-hole matches.
+   */
+  private etherealGravityHum(): void {
+    if (!this.ctx || !this.musicGain) return;
+    const now = this.ctx.currentTime;
+    const bus = this.bedGain ?? this.musicGain;
+    const dur = 10 + Math.random() * 4;
+    const pair = [82.41, 123.47]; // E2 + B2 — a fifth, chord-family safe
+    for (const f of pair) {
+      for (const detune of [0, 1.5 + Math.random()]) {
+        const osc = this.ctx.createOscillator();
+        osc.type = 'sine';
+        osc.frequency.value = f + detune;
+        const g = this.ctx.createGain();
+        g.gain.setValueAtTime(0.0001, now);
+        g.gain.exponentialRampToValueAtTime(0.02, now + dur * 0.45);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+        osc.connect(g).connect(bus);
+        osc.start(now);
+        osc.stop(now + dur + 0.05);
+      }
+    }
   }
 
   /** Long, breathy filtered-noise swell — reads as solar wind / space air. */
@@ -781,6 +945,104 @@ export class Audio {
     src.connect(lp).connect(g).connect(bus);
     src.start(now);
     src.stop(now + dur + 0.05);
+  }
+
+  /**
+   * Toggle the black-hole presence layer: a barely-audible D1 drone with a
+   * slow LFO plus a low bandpassed noise swirl, routed into the ambient bed.
+   * Called at every match start (true when the rolled map has a hole, false
+   * otherwise) so the dread never leaks into a hole-free sky.
+   */
+  setBlackHolePresence(active: boolean): void {
+    // Tear down whatever the previous match left running.
+    for (const node of this.blackHoleNodes) {
+      try {
+        if ('stop' in node) node.stop();
+      } catch {
+        // already stopped
+      }
+      node.disconnect();
+    }
+    this.blackHoleNodes = [];
+    if (!active || !this.ctx) return;
+    const bus = this.bedGain ?? this.musicGain;
+    if (!bus) return;
+
+    const drone = this.ctx.createOscillator();
+    drone.type = 'sine';
+    drone.frequency.value = 36.71; // D1 — under the chord bed, felt not heard
+    const droneGain = this.ctx.createGain();
+    droneGain.gain.value = 0.035;
+    this.attachSlowLfo(droneGain.gain, 0.017, 0.02);
+    drone.connect(droneGain).connect(bus);
+    drone.start();
+
+    const sr = this.ctx.sampleRate;
+    const buf = this.ctx.createBuffer(1, Math.max(1, Math.floor(sr * 3)), sr);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+    const swirl = this.ctx.createBufferSource();
+    swirl.buffer = buf;
+    swirl.loop = true;
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 90;
+    bp.Q.value = 2;
+    this.attachSlowLfo(bp.frequency, 0.03, 28);
+    const swirlGain = this.ctx.createGain();
+    swirlGain.gain.value = 0.02;
+    this.attachSlowLfo(swirlGain.gain, 0.023, 0.011);
+    swirl.connect(bp).connect(swirlGain).connect(bus);
+    swirl.start();
+
+    this.blackHoleNodes = [drone, droneGain, swirl, swirlGain];
+  }
+
+  /**
+   * A ship crossing the event horizon: a long falling sine into the sub
+   * register plus a rising-envelope noise "slurp" cut off hard — swallowed,
+   * not exploded. Throttled like shipDeath so a consumed wave reads as one
+   * gulp, not a crackle.
+   */
+  shipConsumed(): void {
+    if (!this.ctx || !this.sfxGain || this.muted) return;
+    const now = this.ctx.currentTime;
+    if (now - this.lastConsumeAt < 0.08) return;
+    this.lastConsumeAt = now;
+
+    const fall = this.ctx.createOscillator();
+    fall.type = 'sine';
+    fall.frequency.setValueAtTime(320, now);
+    fall.frequency.exponentialRampToValueAtTime(55, now + 0.45);
+    const fallGain = this.ctx.createGain();
+    fallGain.gain.setValueAtTime(0.0001, now);
+    fallGain.gain.exponentialRampToValueAtTime(0.09, now + 0.03);
+    fallGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.5);
+    fall.connect(fallGain).connect(this.sfxGain);
+    fall.start(now);
+    fall.stop(now + 0.52);
+
+    // Reverse-envelope noise: swells toward the cutoff instead of decaying.
+    const dur = 0.32;
+    const sampleCount = Math.max(1, Math.floor(this.ctx.sampleRate * dur));
+    const buf = this.ctx.createBuffer(1, sampleCount, this.ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < sampleCount; i++) {
+      const t = i / sampleCount;
+      data[i] = (Math.random() * 2 - 1) * Math.pow(t, 2.2);
+    }
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.Q.value = 1.2;
+    bp.frequency.setValueAtTime(1200, now);
+    bp.frequency.exponentialRampToValueAtTime(200, now + dur);
+    const g = this.ctx.createGain();
+    g.gain.value = 0.07;
+    src.connect(bp).connect(g).connect(this.sfxGain);
+    src.start(now);
+    src.stop(now + dur + 0.01);
   }
 
   shipLaunch(): void {

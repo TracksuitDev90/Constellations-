@@ -31,7 +31,13 @@ export class Renderer {
   constructor(app: Application, world: World) {
     this.app = app;
     this.world = world;
-    this.bg = new BackgroundLayer(app, app.screen.width, app.screen.height);
+    // Wall-clock seed: each match rolls its own (possible) nebulae.
+    this.bg = new BackgroundLayer(
+      app,
+      app.screen.width,
+      app.screen.height,
+      Date.now() & 0x7fffffff,
+    );
     app.stage.addChild(this.bg);
 
     this.worldLayer = new Container();
@@ -181,7 +187,7 @@ export class Renderer {
   }
 
   update(dt: number): void {
-    this.bg.update(this.viewX, this.viewY);
+    this.bg.update(this.viewX, this.viewY, dt);
     this.planetLayer.update(dt);
     this.hazardLayer.update(dt);
     this.shipLayer.update(dt);

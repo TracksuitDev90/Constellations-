@@ -25,7 +25,7 @@ const MAP_HEIGHT = 1000;
 /** Per-match rejection-sampling range for minimum planet center distance. */
 const MIN_SEPARATION_RANGE: [number, number] = [200, 280];
 
-export type HazardKind = 'driftingPlanet' | 'asteroidField' | 'neutralSwarm';
+export type HazardKind = 'driftingPlanet' | 'asteroidField' | 'neutralSwarm' | 'blackHole';
 
 export interface MapGenConfig {
   playerCount: 2 | 3 | 4;
@@ -268,6 +268,41 @@ const rollHazardOfKind = (
       slowdown: 0.32,
       seed: Math.floor(Math.random() * 1e9),
     };
+  }
+
+  if (variant === 'blackHole') {
+    // The hardest hazard: a gravity well in the contested middle. Placement
+    // must leave every planet's orbit band untouched (center far enough that
+    // orbiters never feel pull) and stay well clear of the start worlds. If
+    // the map is too dense, shrink the well before giving up — a null roll
+    // just means this match stays hole-free.
+    const horizonRadius = irange(16, 20);
+    let gravityRadius = frange(130, 170);
+    while (gravityRadius >= 110) {
+      for (let attempt = 0; attempt < 25; attempt++) {
+        const candidate = {
+          x: frange(MAP_WIDTH * 0.28, MAP_WIDTH * 0.72),
+          y: frange(MAP_HEIGHT * 0.3, MAP_HEIGHT * 0.7),
+        };
+        const clearOfPlanets = positions.every(
+          (p) => Math.hypot(candidate.x - p.x, candidate.y - p.y) > gravityRadius + 110,
+        );
+        const clearOfStarts = starts.every(
+          (s) => Math.hypot(candidate.x - s.x, candidate.y - s.y) > 340,
+        );
+        if (clearOfPlanets && clearOfStarts) {
+          return {
+            type: 'blackHole',
+            pos: candidate,
+            horizonRadius,
+            gravityRadius,
+            seed: Math.floor(Math.random() * 1e9),
+          };
+        }
+      }
+      gravityRadius -= 15;
+    }
+    return null;
   }
 
   // neutralSwarm — anchor it well clear of every start world.

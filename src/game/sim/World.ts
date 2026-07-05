@@ -60,16 +60,35 @@ export interface MapSpec {
  *     ANY owner, but never capture planets. Their own units die when killed
  *     in a 1:1 exchange; they respawn slowly so the swarm thins under
  *     sustained attack.
+ *   - blackHole: a gravity well at `pos`. Free-flying ships inside
+ *     `gravityRadius` are pulled toward the center; anything that crosses the
+ *     capture threshold is locked into a slow terminal spiral and consumed at
+ *     the event horizon. The hardest hazard — routes must be planned around it.
  */
 export type HazardSpec =
   | { type: 'driftingPlanet'; planetId: number; vx: number; vy: number }
   | { type: 'asteroidField'; pos: Vec2; radius: number; slowdown: number; seed: number }
-  | { type: 'neutralSwarm'; pos: Vec2; count: number; patrolRadius: number; seed: number };
+  | { type: 'neutralSwarm'; pos: Vec2; count: number; patrolRadius: number; seed: number }
+  | { type: 'blackHole'; pos: Vec2; horizonRadius: number; gravityRadius: number; seed: number };
 
 export interface AsteroidField {
   pos: Vec2;
   radius: number;
   slowdown: number;
+  seed: number;
+}
+
+export interface BlackHole {
+  pos: Vec2;
+  /** Radius of the event horizon — ships are consumed here. */
+  horizonRadius: number;
+  /** Outer reach of the gravity pull. Beyond this, ships fly unaffected. */
+  gravityRadius: number;
+  /**
+   * Point of no return: crossing this switches a ship into the 'doomed'
+   * scripted spiral. Derived from horizonRadius at world construction.
+   */
+  captureRadius: number;
   seed: number;
 }
 
@@ -88,6 +107,8 @@ export interface WorldEvents {
   onShipAbsorbed?: (planetId: number, owner: number) => void;
   /** Fired when a neutral hostile is destroyed. Carries world-space death point. */
   onNeutralDeath?: (x: number, y: number) => void;
+  /** Fired when a ship finishes its doomed spiral and crosses a black hole's horizon. */
+  onShipConsumed?: (owner: number, x: number, y: number) => void;
   /**
    * Fired every time an absorbed unit ticks up a ring's fill counter. Distinct
    * from `onRingFilled` which only fires on the final unit that completes the ring.
@@ -142,6 +163,23 @@ const ABSORB_FLUSH_RATE = 14;
  */
 const REINFORCEMENT_ORBIT_CAP = 300;
 
+/**
+ * Black hole tuning. The capture threshold sits well outside the horizon so a
+ * ship is visibly committed (~1s of flight) before it starts the spiral, and
+ * peak gravity is strong enough that a straight line through the inner half
+ * of the well is fatal while a pass along the rim only bends the flight path.
+ */
+const BLACK_HOLE_CAPTURE_MULT = 2.6;
+/** Peak gravitational acceleration (px/s²) at the capture threshold. */
+const BLACK_HOLE_G_PEAK = 110;
+/** Radial infall speed (px/s) at the capture rim... */
+const DOOM_INFALL_BASE = 8;
+/** ...climbing by this much as the spiral closes on the horizon. */
+const DOOM_INFALL_ACCEL = 30;
+/** Angular speed (rad/s) of the doomed spiral at the rim / added near center. */
+const DOOM_SPIN_BASE = 1.4;
+const DOOM_SPIN_ACCEL = 3.4;
+
 /** True when the planet still has something absorb can usefully fill. */
 const canAbsorb = (p: Planet): boolean =>
   p.ringCount > 0 || p.health < p.maxHealth;
@@ -180,6 +218,8 @@ export class World {
    * `stepTransit` consults this list to apply a per-zone speed multiplier.
    */
   asteroidFields: AsteroidField[] = [];
+  /** Gravity wells from the `blackHole` hazard; consulted by every flight pass. */
+  blackHoles: BlackHole[] = [];
   /** Pool of green hostile units spawned by the `neutralSwarm` hazard. */
   neutrals: NeutralPool = new NeutralPool();
   time = 0;
@@ -201,6 +241,8 @@ export class World {
   private neighborScratch: number[] = [];
   /** Reusable output vector for `orbitSeparation` (avoids per-ship allocs). */
   private sepScratch = { x: 0, y: 0 };
+  /** Per-tick pursuit claims (ship idx → pursuer count) for pack-splitting. */
+  private pursuerCounts = new Map<number, number>();
   /**
    * Anchor points for any spawned neutral swarms. Neutrals patrol around
    * these anchors and respawn slowly if killed below the swarm's nominal
@@ -292,6 +334,14 @@ export class World {
         for (let i = 0; i < h.count; i++) {
           this.spawnNeutralAt(anchorIdx);
         }
+      } else if (h.type === 'blackHole') {
+        this.blackHoles.push({
+          pos: { ...h.pos },
+          horizonRadius: h.horizonRadius,
+          gravityRadius: h.gravityRadius,
+          captureRadius: h.horizonRadius * BLACK_HOLE_CAPTURE_MULT,
+          seed: h.seed,
+        });
       }
     }
   }
@@ -590,6 +640,7 @@ export class World {
       if (ship.state === 'orbiting') this.stepOrbiting(i, ship, dt);
       else if (ship.state === 'absorbing') this.stepAbsorbing(i, ship, dt);
       else if (ship.state === 'hovering') this.stepHovering(ship, dt, ships);
+      else if (ship.state === 'doomed') this.stepDoomed(i, ship, dt);
       else this.stepTransit(i, ship, dt, ships);
     }
 
@@ -622,21 +673,50 @@ export class World {
   }
 
   /**
-   * Per-tick neutral hostiles update. Every active neutral wanders inside its
-   * anchor's patrol radius, scans for the nearest in-range ship of ANY owner,
-   * and destroys it 1:1 (the neutral dies in the exchange). Slow respawn
-   * behind the scenes keeps the swarm a persistent threat without flooding
-   * the map.
+   * Per-tick neutral hostiles update. The swarm runs a small state machine:
+   *
+   *   patrol — wander the anchor's patrol band (the original drifting cloud).
+   *   pursue — chase a detected intruder with lead-predicted intercept, up to
+   *            a leash distance from home. Pursuit is slower than SHIP_SPEED,
+   *            so committed waves outrun the pack — the swarm punishes ships
+   *            that graze its territory, it doesn't erase armies.
+   *   return — leash snapped or target lost: fly home, then resume patrol.
+   *   doomed — captured by a black hole; rides the same terminal spiral as
+   *            player ships. A pursuing neutral follows prey straight into
+   *            the well — kiting the swarm into a hole is fair play.
+   *
+   * Kills stay 1:1 mutual (the neutral dies in the exchange) and the slow
+   * respawn keeps the swarm a persistent threat without flooding the map.
    */
   private stepNeutrals(dt: number): void {
     if (this.neutralAnchors.length === 0 && this.neutrals.activeCount() === 0) return;
-    const NEUTRAL_SPEED = 22;
-    const ATTACK_RADIUS = 22;
-    const ATTACK_R2 = ATTACK_RADIUS * ATTACK_RADIUS;
+    const PATROL_SPEED = 22;
+    const PURSUE_SPEED = 36;
+    const RETURN_SPEED = PATROL_SPEED * 1.3;
+    const DETECT_RADIUS = 90;
+    const DETECT_R2 = DETECT_RADIUS * DETECT_RADIUS;
+    // Give up when the target pulls beyond 1.6× detection range.
+    const DROP_R2 = DETECT_R2 * (1.6 * 1.6);
+    const KILL_RADIUS = 14;
+    const KILL_R2 = KILL_RADIUS * KILL_RADIUS;
+    // Leash: patrol band plus a comfortable chase margin past the detection
+    // ring, so anything a neutral can see it can also run down before the
+    // leash snaps — but never a map-crossing chase.
+    const LEASH_MARGIN = DETECT_RADIUS * 1.2;
+    const MAX_PURSUERS_PER_TARGET = 3;
+    const SEP_RADIUS = 12;
     const RESPAWN_INTERVAL = 6.5;
 
     const all = this.neutrals.all;
     const ships = this.ships.all;
+
+    // Standing pursuit claims — lets late acquirers skip already-swarmed
+    // targets so a pack naturally splits across a crossing wave.
+    this.pursuerCounts.clear();
+    for (const n of all) {
+      if (!n.active || n.state !== 'pursue' || n.targetIdx < 0) continue;
+      this.pursuerCounts.set(n.targetIdx, (this.pursuerCounts.get(n.targetIdx) ?? 0) + 1);
+    }
 
     for (let i = 0; i < all.length; i++) {
       const n = all[i];
@@ -647,52 +727,199 @@ export class World {
         continue;
       }
 
-      // Pull gently toward the anchor when wandering past the patrol band so
-      // the swarm holds territory rather than dispersing across the map.
+      // Terminal black hole spiral — same math as doomed ships.
+      if (n.state === 'doomed') {
+        const bh = this.blackHoles[n.doomHoleIdx];
+        if (!bh) {
+          this.neutrals.kill(i);
+          continue;
+        }
+        const depth = 1 - n.doomRadius / bh.captureRadius;
+        const infall = DOOM_INFALL_BASE + DOOM_INFALL_ACCEL * depth;
+        const angVel = n.doomDir * (DOOM_SPIN_BASE + DOOM_SPIN_ACCEL * depth);
+        n.doomRadius -= infall * dt;
+        n.doomAngle += angVel * dt;
+        const r = Math.max(n.doomRadius, 0);
+        n.x = bh.pos.x + Math.cos(n.doomAngle) * r;
+        n.y = bh.pos.y + Math.sin(n.doomAngle) * r;
+        n.heading = n.doomAngle + (n.doomDir > 0 ? Math.PI / 2 : -Math.PI / 2);
+        if (n.doomRadius <= bh.horizonRadius) {
+          this.events.onNeutralDeath?.(n.x, n.y);
+          this.neutrals.kill(i);
+        }
+        continue;
+      }
+
+      // Black hole capture check (any live state).
+      let captured = false;
+      for (let h = 0; h < this.blackHoles.length; h++) {
+        const bh = this.blackHoles[h];
+        const bdx = n.x - bh.pos.x;
+        const bdy = n.y - bh.pos.y;
+        const bd = Math.hypot(bdx, bdy);
+        if (bd <= bh.captureRadius) {
+          n.state = 'doomed';
+          n.doomHoleIdx = h;
+          n.doomAngle = Math.atan2(bdy, bdx);
+          n.doomRadius = Math.max(bd, bh.horizonRadius + 1);
+          const cross = bdx * n.vy - bdy * n.vx;
+          n.doomDir = cross >= 0 ? 1 : -1;
+          n.targetIdx = -1;
+          captured = true;
+          break;
+        }
+      }
+      if (captured) continue;
+
       const adx = anchor.pos.x - n.x;
       const ady = anchor.pos.y - n.y;
       const ad = Math.hypot(adx, ady);
-      const outside = ad - anchor.patrolRadius;
-      const pullDir = ad > 0 ? { x: adx / ad, y: ady / ad } : { x: 0, y: 0 };
-      // Slow heading drift — a sine wander around the current heading.
-      n.heading += Math.sin(this.time * 0.7 + n.phase) * dt * 0.6;
-      let vx = Math.cos(n.heading) * NEUTRAL_SPEED;
-      let vy = Math.sin(n.heading) * NEUTRAL_SPEED;
-      if (outside > 0) {
-        // Bias toward the anchor proportional to how far out we drifted.
-        const k = Math.min(1, outside / anchor.patrolRadius);
-        vx = vx * (1 - k) + pullDir.x * NEUTRAL_SPEED * k;
-        vy = vy * (1 - k) + pullDir.y * NEUTRAL_SPEED * k;
-        // Lock the heading back onto the new direction so it stays coherent.
-        n.heading = Math.atan2(vy, vx);
-      }
-      n.x += vx * dt;
-      n.y += vy * dt;
+      const leash = anchor.patrolRadius + LEASH_MARGIN;
 
-      // Scan for the nearest live combatant ship inside attack radius. Treat
-      // every owner as hostile — the green swarm is everyone's problem.
-      let bestIdx = -1;
-      let bestD2 = ATTACK_R2;
-      for (let j = 0; j < ships.length; j++) {
-        const s = ships[j];
-        if (!s.active) continue;
-        if (s.state === 'absorbing') continue; // can't intercept a ship inside its own planet.
-        const dx = s.x - n.x;
-        const dy = s.y - n.y;
-        const d2 = dx * dx + dy * dy;
-        if (d2 < bestD2) {
-          bestD2 = d2;
-          bestIdx = j;
+      // Validate / drop the pursuit target before steering on it.
+      if (n.state === 'pursue') {
+        const t = n.targetIdx >= 0 ? ships[n.targetIdx] : undefined;
+        const alive = t && t.active && t.state !== 'absorbing' && t.state !== 'doomed';
+        if (!alive) {
+          n.state = 'return';
+          n.targetIdx = -1;
+        } else {
+          const dx = t.x - n.x;
+          const dy = t.y - n.y;
+          if (dx * dx + dy * dy > DROP_R2 || ad > leash) {
+            n.state = 'return';
+            n.targetIdx = -1;
+          }
         }
       }
-      if (bestIdx >= 0) {
-        const victim = ships[bestIdx];
-        this.events.onShipDeath?.(victim.owner, victim.x, victim.y);
-        this.ships.kill(bestIdx);
-        // Mutual kill keeps the swarm beatable and rewards sustained pushes.
-        this.events.onNeutralDeath?.(n.x, n.y);
-        this.neutrals.kill(i);
+
+      // Acquire: nearest eligible intruder in detection range that isn't
+      // already mobbed by the pack. Neutral counts are tiny, so the straight
+      // scan over the ship pool stays cheap.
+      if (n.state !== 'pursue' && ad < leash) {
+        let bestIdx = -1;
+        let bestD2 = DETECT_R2;
+        for (let j = 0; j < ships.length; j++) {
+          const s = ships[j];
+          if (!s.active) continue;
+          if (s.state === 'absorbing' || s.state === 'doomed') continue;
+          if ((this.pursuerCounts.get(j) ?? 0) >= MAX_PURSUERS_PER_TARGET) continue;
+          const dx = s.x - n.x;
+          const dy = s.y - n.y;
+          const d2 = dx * dx + dy * dy;
+          if (d2 < bestD2) {
+            bestD2 = d2;
+            bestIdx = j;
+          }
+        }
+        if (bestIdx >= 0) {
+          n.state = 'pursue';
+          n.targetIdx = bestIdx;
+          this.pursuerCounts.set(bestIdx, (this.pursuerCounts.get(bestIdx) ?? 0) + 1);
+        }
       }
+
+      // Desired velocity by state.
+      let desiredX: number;
+      let desiredY: number;
+      if (n.state === 'pursue') {
+        const t = ships[n.targetIdx];
+        const dx = t.x - n.x;
+        const dy = t.y - n.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 <= KILL_R2) {
+          // Contact — mutual kill keeps the swarm beatable and rewards
+          // sustained pushes.
+          this.events.onShipDeath?.(t.owner, t.x, t.y);
+          this.ships.kill(n.targetIdx);
+          this.events.onNeutralDeath?.(n.x, n.y);
+          this.neutrals.kill(i);
+          continue;
+        }
+        // Lead pursuit: aim where the target will be, not where it is. The
+        // lead is deliberately shorter than the true time-to-intercept —
+        // full lead makes a flanking pursuer run parallel to a faster
+        // target instead of cutting in toward its path.
+        const d = Math.sqrt(d2);
+        const lead = Math.min(0.9, (d / PURSUE_SPEED) * 0.7);
+        const aimX = t.x + t.vx * lead - n.x;
+        const aimY = t.y + t.vy * lead - n.y;
+        const am = Math.hypot(aimX, aimY) || 1;
+        desiredX = (aimX / am) * PURSUE_SPEED;
+        desiredY = (aimY / am) * PURSUE_SPEED;
+      } else if (n.state === 'return') {
+        if (ad <= anchor.patrolRadius * 0.9) {
+          n.state = 'patrol';
+        }
+        const am = ad || 1;
+        desiredX = (adx / am) * RETURN_SPEED;
+        desiredY = (ady / am) * RETURN_SPEED;
+      } else {
+        // Patrol: the original sine wander with a proportional anchor pull
+        // past the patrol band, so the swarm holds territory.
+        n.heading += Math.sin(this.time * 0.7 + n.phase) * dt * 0.6;
+        desiredX = Math.cos(n.heading) * PATROL_SPEED;
+        desiredY = Math.sin(n.heading) * PATROL_SPEED;
+        const outside = ad - anchor.patrolRadius;
+        if (outside > 0 && ad > 0) {
+          const k = Math.min(1, outside / anchor.patrolRadius);
+          desiredX = desiredX * (1 - k) + (adx / ad) * PATROL_SPEED * k;
+          desiredY = desiredY * (1 - k) + (ady / ad) * PATROL_SPEED * k;
+        }
+      }
+
+      // Idle states shy away from gravity wells; a committed pursuer doesn't.
+      if (n.state !== 'pursue') {
+        for (const bh of this.blackHoles) {
+          const bdx = n.x - bh.pos.x;
+          const bdy = n.y - bh.pos.y;
+          const bd = Math.hypot(bdx, bdy);
+          const avoidR = bh.gravityRadius * 1.15;
+          if (bd > 0 && bd < avoidR) {
+            const k = 1 - bd / avoidR;
+            desiredX += (bdx / bd) * PATROL_SPEED * 2 * k;
+            desiredY += (bdy / bd) * PATROL_SPEED * 2 * k;
+          }
+        }
+      }
+
+      // Wing dynamics within the anchor's pack: hard separation up close, and
+      // mild velocity alignment when packmates converge on the same target so
+      // the group sweeps in as a formation instead of a knot.
+      let alignX = 0;
+      let alignY = 0;
+      let alignN = 0;
+      for (let j = 0; j < all.length; j++) {
+        if (j === i) continue;
+        const m = all[j];
+        if (!m.active || m.anchorIdx !== n.anchorIdx || m.state === 'doomed') continue;
+        const sx = n.x - m.x;
+        const sy = n.y - m.y;
+        const sd2 = sx * sx + sy * sy;
+        if (sd2 > 0 && sd2 < SEP_RADIUS * SEP_RADIUS) {
+          const sd = Math.sqrt(sd2);
+          const push = (SEP_RADIUS - sd) / SEP_RADIUS;
+          desiredX += (sx / sd) * PATROL_SPEED * push;
+          desiredY += (sy / sd) * PATROL_SPEED * push;
+        }
+        if (n.state === 'pursue' && m.state === 'pursue' && m.targetIdx === n.targetIdx) {
+          alignX += m.vx;
+          alignY += m.vy;
+          alignN++;
+        }
+      }
+      if (alignN > 0) {
+        desiredX += (alignX / alignN - n.vx) * 0.3;
+        desiredY += (alignY / alignN - n.vy) * 0.3;
+      }
+
+      // Smooth toward the desired velocity — reads as banking, not snapping.
+      const blend = Math.min(1, dt * (n.state === 'pursue' ? 6 : 2.5));
+      n.vx += (desiredX - n.vx) * blend;
+      n.vy += (desiredY - n.vy) * blend;
+      n.x += n.vx * dt;
+      n.y += n.vy * dt;
+      if (n.vx !== 0 || n.vy !== 0) n.heading = Math.atan2(n.vy, n.vx);
     }
 
     // Slow respawn — top each anchor's swarm back up to its target count over
@@ -1275,6 +1502,77 @@ export class World {
     } else {
       ship.x += ship.vx * dt;
       ship.y += ship.vy * dt;
+      // Gravity last, after the speed cap and integration — a ship at full
+      // steering authority still accumulates inward drift it cannot cancel,
+      // which is what makes flying near the well genuinely costly.
+      this.applyBlackHoleGravity(ship, dt);
+    }
+  }
+
+  /**
+   * Pull `ship` toward any black hole whose gravity radius it is inside.
+   * Crossing the capture threshold flips the ship into the 'doomed' scripted
+   * spiral. Returns true when the ship was captured this tick.
+   */
+  private applyBlackHoleGravity(ship: Ship, dt: number): boolean {
+    for (let h = 0; h < this.blackHoles.length; h++) {
+      const bh = this.blackHoles[h];
+      const dx = bh.pos.x - ship.x;
+      const dy = bh.pos.y - ship.y;
+      const d = Math.hypot(dx, dy);
+      if (d >= bh.gravityRadius) continue;
+      if (d <= bh.captureRadius) {
+        ship.state = 'doomed';
+        ship.doomHoleIdx = h;
+        ship.doomAngle = Math.atan2(-dy, -dx);
+        ship.doomRadius = Math.max(d, bh.horizonRadius + 1);
+        // Keep the handedness the ship approached with: sign of the cross
+        // product of the radial vector (hole → ship) and its velocity.
+        const cross = -dx * ship.vy + dy * ship.vx;
+        ship.doomDir = cross >= 0 ? 1 : -1;
+        ship.isSelected = false;
+        ship.targetPlanet = -1;
+        ship.parentPlanet = -1;
+        return true;
+      }
+      // Quadratic ramp — negligible at the outer rim, fierce near capture.
+      const t = 1 - (d - bh.captureRadius) / (bh.gravityRadius - bh.captureRadius);
+      const a = BLACK_HOLE_G_PEAK * t * t;
+      const inv = 1 / d;
+      ship.vx += dx * inv * a * dt;
+      ship.vy += dy * inv * a * dt;
+    }
+    return false;
+  }
+
+  /**
+   * Terminal spiral: radius decays (slow at the rim, plunging near the core)
+   * while angular speed climbs — a Kepler-flavored infall that stays readable
+   * for the ~2 seconds it takes. Velocity is kept tangential so the ship
+   * renderer's motion streak follows the spiral for free.
+   */
+  private stepDoomed(idx: number, ship: Ship, dt: number): void {
+    const bh = this.blackHoles[ship.doomHoleIdx];
+    if (!bh) {
+      this.ships.kill(idx);
+      return;
+    }
+    const depth = 1 - ship.doomRadius / bh.captureRadius; // 0 at rim → ~0.6 at horizon
+    const infall = DOOM_INFALL_BASE + DOOM_INFALL_ACCEL * depth;
+    const angVel = ship.doomDir * (DOOM_SPIN_BASE + DOOM_SPIN_ACCEL * depth);
+    ship.doomRadius -= infall * dt;
+    ship.doomAngle += angVel * dt;
+    const r = Math.max(ship.doomRadius, 0);
+    const cos = Math.cos(ship.doomAngle);
+    const sin = Math.sin(ship.doomAngle);
+    ship.x = bh.pos.x + cos * r;
+    ship.y = bh.pos.y + sin * r;
+    const tangential = angVel * Math.max(r, 6);
+    ship.vx = -sin * tangential - cos * infall;
+    ship.vy = cos * tangential - sin * infall;
+    if (ship.doomRadius <= bh.horizonRadius) {
+      this.events.onShipConsumed?.(ship.owner, ship.x, ship.y);
+      this.ships.kill(idx);
     }
   }
 
@@ -1350,6 +1648,9 @@ export class World {
     }
     ship.x += ship.vx * dt;
     ship.y += ship.vy * dt;
+    // Hover points parked inside a gravity well slowly bleed into it — holding
+    // position next to a black hole is a choice the well gets a vote on.
+    this.applyBlackHoleGravity(ship, dt);
   }
 
   private arrive(shipIdx: number, planet: Planet): void {
@@ -1522,9 +1823,10 @@ const edgeKey = (a: number, b: number): string => (a < b ? `${a}-${b}` : `${b}-$
 /**
  * Closest distance from point (px, py) to the line segment (ax, ay)–(bx, by).
  * Used for swept-arrival so a ship that flies past a moving planet within
- * one frame still registers as landed.
+ * one frame still registers as landed, and by the AI to score whether a
+ * planned wave's flight line clips a black hole's gravity well.
  */
-const pointToSegmentDist = (
+export const pointToSegmentDist = (
   px: number,
   py: number,
   ax: number,

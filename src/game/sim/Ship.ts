@@ -10,8 +10,11 @@ import type { Vec2 } from '../../util/math.js';
  *                 to hold at (no parent planet).
  *   'absorbing' — unit is being pulled into its parent planet's center to be
  *                 consumed for heal / upgrade energy.
+ *   'doomed'    — unit crossed a black hole's capture threshold and rides a
+ *                 scripted decaying spiral into the event horizon. No steering,
+ *                 no combat, no selection — it is already lost.
  */
-export type ShipState = 'orbiting' | 'transit' | 'hovering' | 'absorbing';
+export type ShipState = 'orbiting' | 'transit' | 'hovering' | 'absorbing' | 'doomed';
 
 export interface Ship {
   active: boolean;
@@ -60,6 +63,12 @@ export interface Ship {
    * worlds so the player visibly feeds rings with a single tap.
    */
   absorbOnArrive: boolean;
+  /** Black hole spiral bookkeeping — only meaningful while state === 'doomed'. */
+  doomHoleIdx: number;
+  doomAngle: number;
+  doomRadius: number;
+  /** Spiral direction (+1 CCW / -1 CW), chosen from approach tangent. */
+  doomDir: number;
 }
 
 export interface SpawnOptions {
@@ -125,6 +134,10 @@ export class ShipPool {
       s.wanderPhase = wanderPhase;
       s.isSelected = false;
       s.absorbOnArrive = absorbOnArrive;
+      s.doomHoleIdx = -1;
+      s.doomAngle = 0;
+      s.doomRadius = 0;
+      s.doomDir = 1;
       return idx;
     }
     const ship: Ship = {
@@ -150,6 +163,10 @@ export class ShipPool {
       wanderPhase,
       isSelected: false,
       absorbOnArrive,
+      doomHoleIdx: -1,
+      doomAngle: 0,
+      doomRadius: 0,
+      doomDir: 1,
     };
     this.ships.push(ship);
     return this.ships.length - 1;
@@ -164,6 +181,7 @@ export class ShipPool {
     s.parentPlanet = -1;
     s.sourcePlanet = -1;
     s.absorbOnArrive = false;
+    s.doomHoleIdx = -1;
     this.freeList.push(idx);
   }
 

@@ -87,9 +87,15 @@ export class ShipLayer extends Container {
         // larger glow) so a lasso grab has visible feedback — previously
         // `isSelected` was never rendered anywhere.
         const baseTint = paletteFor(s.owner).ship;
-        const tint = s.isSelected ? toward(baseTint, 0xffffff, 0.65) : baseTint;
+        // Doomed ships blue-shift toward white as they spiral in — the light
+        // of a unit already lost to the hole.
+        const tint = s.isSelected
+          ? toward(baseTint, 0xffffff, 0.65)
+          : s.state === 'doomed'
+            ? toward(baseTint, 0xffffff, 0.5)
+            : baseTint;
         entry.sprite.tint = tint;
-        if (s.state === 'transit') {
+        if (s.state === 'transit' || s.state === 'doomed') {
           const speed = Math.hypot(s.vx, s.vy);
           if (speed > 0.01) entry.sprite.rotation = Math.atan2(s.vy, s.vx);
           entry.sprite.scale.set(BASE_SCALE * TRANSIT_STRETCH, BASE_SCALE * TRANSIT_NARROW);

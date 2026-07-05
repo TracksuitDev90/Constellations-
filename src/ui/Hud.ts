@@ -16,9 +16,14 @@ const btnStyle: Partial<CSSStyleDeclaration> = {
   touchAction: 'manipulation',
 };
 
+const hex = (c: number): string => `#${c.toString(16).padStart(6, '0')}`;
+
 export class Hud {
   private root: HTMLElement;
   private bars: HTMLDivElement[] = [];
+  /** One planet-pip row per player; diffed against `lastCounts` each frame. */
+  private pipRows: HTMLDivElement[] = [];
+  private lastCounts: number[] = [];
   private muteBtn: HTMLButtonElement;
   private pauseBtn: HTMLButtonElement;
   private speedBtn: HTMLButtonElement;
@@ -53,28 +58,58 @@ export class Hud {
       color: '#cfd6e4',
     });
 
-    // One strength bar per player, in player order (human first).
+    // One control cluster per player, in player order (human first). Each
+    // cluster is purely visual — no text: a row of glowing pips counts the
+    // player's captured planets, and the bar below it shows their share of
+    // total fleet strength. The human's cluster is slightly taller with a
+    // faint white under-glow so "which one is me" needs no label either.
     for (const player of world.players) {
       const pal = paletteFor(player.id);
+      const isHuman = player.id === 0;
+      const cluster = document.createElement('div');
+      Object.assign(cluster.style, {
+        flex: '1',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '3px',
+        minWidth: '0',
+      });
+
+      const pips = document.createElement('div');
+      Object.assign(pips.style, {
+        display: 'flex',
+        gap: '4px',
+        height: '7px',
+        alignItems: 'center',
+      });
+      cluster.appendChild(pips);
+      this.pipRows.push(pips);
+      this.lastCounts.push(-1); // force the first update() to populate
+
       const bar = document.createElement('div');
       Object.assign(bar.style, {
-        flex: '1',
-        height: '10px',
+        height: isHuman ? '12px' : '10px',
         background: 'rgba(255,255,255,0.06)',
+        border: `1px solid ${hex(pal.ring)}59`,
         borderRadius: '6px',
         overflow: 'hidden',
-        boxShadow: `0 0 12px #${pal.glow.toString(16).padStart(6, '0')}66`,
+        boxShadow: isHuman
+          ? `0 0 12px ${hex(pal.glow)}66, 0 2px 6px rgba(255,255,255,0.28)`
+          : `0 0 12px ${hex(pal.glow)}66`,
       });
       const fill = document.createElement('div');
       Object.assign(fill.style, {
         height: '100%',
         width: '50%',
-        background: `#${pal.core.toString(16).padStart(6, '0')}`,
+        background: `linear-gradient(90deg, ${hex(pal.glow)}, ${hex(pal.core)})`,
+        borderRight: `2px solid ${hex(pal.ship)}`,
+        boxSizing: 'border-box',
         transition: 'width 0.25s ease-out',
       });
       bar.appendChild(fill);
       this.bars.push(fill);
-      this.root.appendChild(bar);
+      cluster.appendChild(bar);
+      this.root.appendChild(cluster);
     }
 
     // Sim-speed cycle (1× → 2× → 4×), an Auralux staple for the slow
@@ -148,6 +183,47 @@ export class Hud {
     const total = Math.max(1, strengths.reduce((a, b) => a + b, 0));
     for (let i = 0; i < this.bars.length; i++) {
       this.bars[i].style.width = `${((strengths[i] ?? 0) / total) * 100}%`;
+    }
+    for (let i = 0; i < world.players.length; i++) {
+      const id = world.players[i].id;
+      let count = 0;
+      for (const p of world.planets) if (p.owner === id) count++;
+      this.syncPips(i, count, paletteFor(id));
+    }
+  }
+
+  /**
+   * Diff the pip row to `count` discs — update() runs every render frame, so
+   * rebuilding the row would thrash the DOM. New pips pop in with a scale
+   * transition; crowded rows (9+ planets) drop to smaller pips so a runaway
+   * empire still fits a phone-width strip.
+   */
+  private syncPips(i: number, count: number, pal: ReturnType<typeof paletteFor>): void {
+    if (count === this.lastCounts[i]) return;
+    this.lastCounts[i] = count;
+    const row = this.pipRows[i];
+    const size = count > 8 ? '5px' : '7px';
+    while (row.children.length > count) row.lastElementChild!.remove();
+    while (row.children.length < count) {
+      const pip = document.createElement('div');
+      Object.assign(pip.style, {
+        width: size,
+        height: size,
+        borderRadius: '50%',
+        background: hex(pal.core),
+        boxShadow: `0 0 6px ${hex(pal.glow)}`,
+        flex: 'none',
+        transform: 'scale(0)',
+        transition: 'transform 0.25s ease-out',
+      });
+      row.appendChild(pip);
+      requestAnimationFrame(() => {
+        pip.style.transform = 'scale(1)';
+      });
+    }
+    for (const el of row.children) {
+      (el as HTMLDivElement).style.width = size;
+      (el as HTMLDivElement).style.height = size;
     }
   }
 

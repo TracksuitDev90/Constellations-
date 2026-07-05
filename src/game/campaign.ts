@@ -102,11 +102,11 @@ export const LEVELS: LevelDef[] = [
   {
     id: 'draco',
     name: 'Draco',
-    blurb: 'The dragon coils: three armies and a hostile sky.',
+    blurb: 'The dragon coils: three armies, a hostile sky — and a dark star.',
     map: {
       playerCount: 3,
       totalPlanets: [8, 10],
-      hazardPool: ['driftingPlanet', 'asteroidField', 'neutralSwarm'],
+      hazardPool: ['driftingPlanet', 'asteroidField', 'neutralSwarm', 'blackHole'],
       calmChance: 0.2,
       playerGarrison: 20,
       enemyGarrison: 18,
@@ -121,7 +121,7 @@ export const LEVELS: LevelDef[] = [
     map: {
       playerCount: 4,
       totalPlanets: [9, 10],
-      hazardPool: ['driftingPlanet', 'asteroidField', 'neutralSwarm'],
+      hazardPool: ['driftingPlanet', 'asteroidField', 'neutralSwarm', 'blackHole'],
       calmChance: 0.2,
       playerGarrison: 20,
       enemyGarrison: 18,
@@ -136,7 +136,7 @@ export const LEVELS: LevelDef[] = [
     map: {
       playerCount: 4,
       totalPlanets: [10, 11],
-      hazardPool: ['driftingPlanet', 'asteroidField', 'neutralSwarm'],
+      hazardPool: ['driftingPlanet', 'asteroidField', 'neutralSwarm', 'blackHole'],
       calmChance: 0.1,
       playerGarrison: 20,
       enemyGarrison: 20,

@@ -1,5 +1,5 @@
 import { dist } from '../../util/math.js';
-import type { World } from '../sim/World.js';
+import { pointToSegmentDist, type World } from '../sim/World.js';
 
 export interface AIConfig {
   /** Seconds between decision ticks. Lower = faster reactions. */
@@ -114,6 +114,23 @@ export class BasicAI {
     return n;
   }
 
+  /**
+   * Penalty multiplier for a wave flying `from` → `to` past black holes.
+   * A line through the capture zone means most of the wave dies (heavily
+   * discouraged); merely clipping the gravity well costs some fringe ships,
+   * so it's discounted rather than banned — the AI takes the same measured
+   * risks a player does.
+   */
+  private routeHazardPenalty(from: { x: number; y: number }, to: { x: number; y: number }): number {
+    let penalty = 1;
+    for (const bh of this.world.blackHoles) {
+      const d = pointToSegmentDist(bh.pos.x, bh.pos.y, from.x, from.y, to.x, to.y);
+      if (d < bh.captureRadius + 30) penalty *= 0.25;
+      else if (d < bh.gravityRadius) penalty *= 0.7;
+    }
+    return penalty;
+  }
+
   private think(): void {
     const me = this.playerId;
     const myPlanets = this.world.planets.filter((p) => p.owner === me);
@@ -187,7 +204,8 @@ export class BasicAI {
         const neutralBonus = tgt.owner === null ? 1.2 : 0.85;
         const score =
           ((tgt.radius * neutralBonus) / (Math.max(1, effective + 1) * d)) *
-          this.cfg.aggression;
+          this.cfg.aggression *
+          this.routeHazardPenalty(p.pos, tgt.pos);
         if (!best || score > best.score) best = { id: tgt.id, score };
       }
       if (best) {

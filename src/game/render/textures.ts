@@ -294,3 +294,161 @@ const mulberry32 = (seed: number) => {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 };
+
+/**
+ * A wispy dust cloud for the background nebulae. Soft blobs are scattered
+ * along a correlated random walk so the mass reads as one flowing cloud
+ * rather than confetti; per-blob color lerps between the two palette
+ * endpoints for gentle internal variation. Seeded so each match's sky can
+ * roll its own shapes.
+ */
+export const makeNebulaTexture = (
+  app: Application,
+  seed: number,
+  colorA: number,
+  colorB: number,
+): Texture => {
+  const size = 512;
+  return makeGlowTexture(app, `nebula:${seed}:${colorA}:${colorB}`, (g) => {
+    // Transparent anchor rect so the baked bounds cover the full tile even
+    // though every blob is soft-edged.
+    g.rect(0, 0, size, size).fill({ color: 0x000000, alpha: 0.001 });
+    const rng = mulberry32(seed);
+    let x = size / 2;
+    let y = size / 2;
+    let dir = rng() * Math.PI * 2;
+    const blobs = 28 + Math.floor(rng() * 12);
+    const margin = 96;
+    for (let i = 0; i < blobs; i++) {
+      dir += (rng() - 0.5) * 1.5;
+      const step = 16 + rng() * 30;
+      x += Math.cos(dir) * step;
+      y += Math.sin(dir) * step;
+      if (x < margin || x > size - margin || y < margin || y > size - margin) {
+        // Turn the walk back toward the middle so the cloud stays framed.
+        dir = Math.atan2(size / 2 - y, size / 2 - x) + (rng() - 0.5) * 0.8;
+        x = Math.min(Math.max(x, margin), size - margin);
+        y = Math.min(Math.max(y, margin), size - margin);
+      }
+      const radius = 30 + rng() * 80;
+      const col = toward(colorA, colorB, rng());
+      const layers = 8 + Math.floor(rng() * 3);
+      for (let k = layers; k > 0; k--) {
+        const t = k / layers;
+        g.circle(x, y, radius * t).fill({
+          color: col,
+          alpha: Math.pow(1 - t, 1.5) * 0.14 + 0.015,
+        });
+      }
+    }
+  });
+};
+
+/**
+ * The neutral swarm's hull: a small swept-wing dart, nose along +x so
+ * `rotation = heading` points it in the flight direction. Pre-colored in the
+ * reserved hostile green so the sprite is used untinted.
+ */
+export const makeHostileShipTexture = (app: Application): Texture => {
+  return makeGlowTexture(app, 'hostile-ship', (g) => {
+    // Wings swept back from the nose, notched tail so the silhouette reads
+    // as a ship even at gameplay zoom.
+    g.poly([
+      { x: 10, y: 0 },
+      { x: -3, y: -2.4 },
+      { x: -8, y: -6.5 },
+      { x: -5, y: 0 },
+      { x: -8, y: 6.5 },
+      { x: -3, y: 2.4 },
+    ]).fill({ color: 0x35502a, alpha: 1 });
+    g.poly([
+      { x: 10, y: 0 },
+      { x: -3, y: -2.4 },
+      { x: -8, y: -6.5 },
+      { x: -5, y: 0 },
+      { x: -8, y: 6.5 },
+      { x: -3, y: 2.4 },
+    ]).stroke({ width: 1, color: 0x9cff7a, alpha: 0.9 });
+    // Canopy glint just behind the nose.
+    g.circle(3.2, 0, 1.7).fill({ color: 0x9cff7a, alpha: 1 });
+    g.circle(3.2, 0, 0.8).fill({ color: 0xe8ffd8, alpha: 1 });
+  });
+};
+
+/** Elongated additive engine flare drawn trailing along -x behind the hull. */
+export const makeEngineFlareTexture = (app: Application): Texture => {
+  return makeGlowTexture(app, 'engine-flare', (g) => {
+    for (let i = 8; i > 0; i--) {
+      const t = i / 8;
+      g.ellipse(-2 * (1 - t), 0, 7 * t, 2.6 * t).fill({
+        color: toward(0x9cff7a, 0xffffff, 1 - t),
+        alpha: 0.14 * (1 - t) + 0.05,
+      });
+    }
+  });
+};
+
+/** Nominal horizon radius the black hole textures are baked against; the
+ * HazardLayer scales its sprites by `horizonRadius / BH_TEXTURE_HORIZON`. */
+export const BH_TEXTURE_HORIZON = 20;
+
+/**
+ * Faked gravitational lensing: concentric additive rings that brighten
+ * toward ~1.5× the horizon and vanish inside it, reading as background
+ * starlight bunched around the shadow. Additive black inside the horizon
+ * adds nothing, so the texture needs no explicit cutout.
+ */
+export const makeLensHaloTexture = (app: Application): Texture => {
+  return makeGlowTexture(app, 'bh-lens-halo', (g) => {
+    const H = BH_TEXTURE_HORIZON;
+    const R = H * 2.4;
+    g.rect(0, 0, R * 2, R * 2).fill({ color: 0x000000, alpha: 0.001 });
+    for (let r = H * 1.02; r <= R; r += 1.2) {
+      // Gaussian brightness bump centered a bit outside the photon ring.
+      const d = (r - H * 1.5) / (H * 0.55);
+      const a = Math.exp(-d * d) * 0.11;
+      if (a < 0.004) continue;
+      g.circle(R, R, r).stroke({ width: 1.6, color: 0xbfd4ff, alpha: a });
+    }
+  });
+};
+
+/**
+ * Seeded accretion disk: streaky warm arcs from white-hot at the inner edge
+ * to deep ember at the rim, with one side brighter (Doppler beaming). Drawn
+ * flat; the HazardLayer squashes it to an ellipse and spins it.
+ */
+export const makeAccretionDiskTexture = (app: Application, seed: number): Texture => {
+  const H = BH_TEXTURE_HORIZON;
+  const inner = H * 1.25;
+  const outer = H * 4;
+  return makeGlowTexture(app, `bh-disk:${seed}`, (g) => {
+    g.rect(0, 0, outer * 2, outer * 2).fill({ color: 0x000000, alpha: 0.001 });
+    const rng = mulberry32(seed || 1);
+    const arcs = 110;
+    for (let i = 0; i < arcs; i++) {
+      const t = Math.pow(rng(), 0.75); // bias streaks toward the hot inner edge
+      const r = inner + t * (outer - inner);
+      const a0 = rng() * Math.PI * 2;
+      const len = 0.35 + rng() * 1.5;
+      const mid = a0 + len / 2;
+      // Doppler beaming: the side sweeping toward the viewer glows brighter.
+      const doppler = 1 + 0.8 * Math.sin(mid);
+      const col = toward(0xfff3d6, 0xb33c10, t);
+      const alpha = Math.min(0.5, (0.2 - t * 0.13) * doppler + 0.02);
+      g.arc(outer, outer, r, a0, a0 + len).stroke({
+        width: 1 + rng() * 1.8,
+        color: col,
+        alpha,
+      });
+    }
+    // A hot continuous inner rim anchors the streaks.
+    for (let k = 0; k < 4; k++) {
+      g.circle(outer, outer, inner + k * 1.1).stroke({
+        width: 1.4,
+        color: toward(0xfff3d6, 0xffb060, k / 4),
+        alpha: 0.16 - k * 0.03,
+      });
+    }
+  });
+};

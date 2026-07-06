@@ -1,20 +1,25 @@
 import type { HazardSpec, MapSpec } from '../sim/World.js';
-import type { PlanetType } from '../sim/Planet.js';
-import { SIZE_RADIUS } from '../sim/Planet.js';
+import type { PlanetType, RingCount } from '../sim/Planet.js';
+import { SIZE_RADIUS, clampRingCount } from '../sim/Planet.js';
 
 /**
  * Procedural constellation generator, parameterized per campaign level.
  * Every match rolls:
+ *   - A layout archetype (scatter / lanes / ringworld / clusters) that shapes
+ *     the map's geography — and with it, the shape of the whole match.
  *   - One start world per player (2–4), placed in per-count corner zones so
  *     free-for-alls begin at fair distances.
- *   - Neutral planets inside a wide central band, with a randomized
- *     minimum-separation so spacing varies between matches without ever
- *     letting two worlds visually overlap.
+ *   - Neutral planets whose worth follows a value gradient: cheap, bare
+ *     worlds near the starts for safe expansion; bigger, ringed, better
+ *     defended worlds in contested space. "Why this planet" should always
+ *     have an answer you can read off the map.
  *   - Edge connectivity by nearest-neighbor with a connectivity backstop.
  *     The edges are invisible (movement is free-flight, and the line layer
  *     is intentionally not rendered) but streams still route along them.
- *   - Up to two hazards of distinct kinds, drawn from the level's allowed
- *     pool: most hazardous matches roll one, some roll a pair.
+ *   - Up to two hazards of distinct kinds — and hazards guard rewards: an
+ *     asteroid belt hides a sweetened treasure world, a green swarm patrols
+ *     a prize, planets near a black hole carry extra rings, and a drifting
+ *     planet is a moving treasure.
  *
  * Planet ids 0..playerCount-1 are the start worlds, in player order.
  */
@@ -26,6 +31,20 @@ const MAP_HEIGHT = 1000;
 const MIN_SEPARATION_RANGE: [number, number] = [200, 280];
 
 export type HazardKind = 'driftingPlanet' | 'asteroidField' | 'neutralSwarm' | 'blackHole';
+
+/**
+ * Map geography archetypes. Each rolls a different set of neutral placement
+ * zones, so the same planet count produces very different strategic shapes:
+ *
+ *   - scatter: the classic open sky — neutrals anywhere in the central band.
+ *   - lanes: two or three horizontal corridors with empty space between.
+ *     Every attack picks a road; flanking through the other lane is real.
+ *   - ringworld: neutrals on a wide ellipse around one rich central prize.
+ *     Taking the middle is tempting and exposed from every direction.
+ *   - clusters: tight planet groups separated by open space — hold a whole
+ *     cluster and its interior is defensible territory.
+ */
+export type LayoutKind = 'scatter' | 'lanes' | 'ringworld' | 'clusters';
 
 export interface MapGenConfig {
   playerCount: 2 | 3 | 4;
@@ -41,6 +60,8 @@ export interface MapGenConfig {
   enemyGarrison: number;
   /** Give the player's start a ring so the evolution path is always there. */
   playerRing: boolean;
+  /** Layout archetypes this level may roll. Defaults to ['scatter']. */
+  layouts?: LayoutKind[];
 }
 
 interface PlacementZone {
@@ -71,7 +92,7 @@ const START_ZONES: Record<2 | 3 | 4, PlacementZone[]> = {
   ],
 };
 
-/** Wide central band where neutral worlds spawn. */
+/** Wide central band where neutral worlds spawn in the scatter layout. */
 const NEUTRAL_ZONE: PlacementZone = { x: [220, 1380], y: [220, 820] };
 
 const rollInZone = (zone: PlacementZone): { x: number; y: number } => ({
@@ -189,56 +210,176 @@ const buildEdges = (
   return [...edges].map((k) => k.split('-').map(Number) as [number, number]);
 };
 
+/** One neutral planet's placement recipe under the rolled layout. */
+interface NeutralSlot {
+  zone: PlacementZone;
+  /** Ringworld's central prize — forced rich regardless of the value roll. */
+  rich?: boolean;
+}
+
+const clampZone = (zone: PlacementZone): PlacementZone => ({
+  x: [Math.max(150, zone.x[0]), Math.min(MAP_WIDTH - 150, zone.x[1])],
+  y: [Math.max(130, zone.y[0]), Math.min(MAP_HEIGHT - 130, zone.y[1])],
+});
+
+const boxAround = (x: number, y: number, half: number): PlacementZone =>
+  clampZone({ x: [x - half, x + half], y: [y - half, y + half] });
+
+/**
+ * Turn the rolled layout into one placement zone per neutral planet. The
+ * zones are the whole difference between layouts — placement itself always
+ * runs through the same rejection sampler.
+ */
+const buildNeutralSlots = (layout: LayoutKind, count: number): NeutralSlot[] => {
+  if (layout === 'lanes') {
+    const laneCount = count >= 6 && Math.random() < 0.5 ? 3 : 2;
+    const centers =
+      laneCount === 3 ? [270, 520, 770] : [330, 690];
+    const slots: NeutralSlot[] = [];
+    for (let i = 0; i < count; i++) {
+      const y = centers[i % laneCount];
+      slots.push({ zone: clampZone({ x: [240, 1360], y: [y - 80, y + 80] }) });
+    }
+    return slots;
+  }
+
+  if (layout === 'ringworld') {
+    const cx = MAP_WIDTH / 2 + frange(-40, 40);
+    const cy = MAP_HEIGHT / 2 + frange(-30, 30);
+    const rx = frange(420, 500);
+    const ry = frange(260, 310);
+    const slots: NeutralSlot[] = [{ zone: boxAround(cx, cy, 50), rich: true }];
+    const spokes = count - 1;
+    const phase = Math.random() * Math.PI * 2;
+    for (let i = 0; i < spokes; i++) {
+      const a = phase + (i / Math.max(1, spokes)) * Math.PI * 2;
+      slots.push({
+        zone: boxAround(cx + Math.cos(a) * rx, cy + Math.sin(a) * ry, 90),
+      });
+    }
+    return slots;
+  }
+
+  if (layout === 'clusters') {
+    const k = irange(3, 4);
+    const centers: Array<{ x: number; y: number }> = [];
+    for (let attempt = 0; attempt < 80 && centers.length < k; attempt++) {
+      const c = { x: frange(340, 1260), y: frange(280, 720) };
+      if (centers.every((q) => Math.hypot(q.x - c.x, q.y - c.y) > 330)) centers.push(c);
+    }
+    while (centers.length < k) centers.push({ x: frange(340, 1260), y: frange(280, 720) });
+    const slots: NeutralSlot[] = [];
+    for (let i = 0; i < count; i++) {
+      const c = centers[i % centers.length];
+      slots.push({ zone: boxAround(c.x, c.y, 130) });
+    }
+    return slots;
+  }
+
+  // scatter
+  return Array.from({ length: count }, () => ({ zone: NEUTRAL_ZONE }));
+};
+
 interface NeutralSeed {
   type: PlanetType;
-  ringCount: 0 | 1 | 2;
+  ringCount: RingCount;
   garrison: number;
 }
 
 /**
- * Independent roll for ring count: 70% no rings, 25% one ring, 5% two rings.
- * Two-ring rolls require an XL planet (size 2); downgrades to 1 otherwise.
- * Most worlds end up bare so a ringed planet feels like a meaningful target.
+ * Roll a neutral planet's profile from its contestedness `value` in [0, 1].
+ * Low value (close to somebody's start): small, bare, lightly held — quick,
+ * safe expansion food. High value (deep contested space): bigger, likelier
+ * to carry rings, and garrisoned to match. The gradient is what makes target
+ * selection a real decision instead of "nearest first, always".
  */
-const rollRingCount = (type: PlanetType): 0 | 1 | 2 => {
-  const r = Math.random();
-  if (r < 0.7) return 0;
-  if (r < 0.95) return 1;
-  return type === 2 ? 2 : 1;
+const rollNeutralFromValue = (value: number, rich = false): NeutralSeed => {
+  if (rich) {
+    // Ringworld center: a two-ring XL worth fighting every neighbor for.
+    return { type: 2, ringCount: 2, garrison: irange(18, 24) };
+  }
+  const type = weightedPick<PlanetType>([
+    [0, 2.2 - 1.6 * value],
+    [1, 2.4],
+    [2, 0.3 + 1.9 * value],
+  ]);
+  let ringCount: RingCount = 0;
+  if (Math.random() < 0.12 + 0.6 * value) {
+    ringCount = type === 2 && value > 0.65 && Math.random() < 0.35 ? 2 : 1;
+  }
+  ringCount = clampRingCount(type, ringCount);
+  const baseGarrison =
+    type === 2 ? irange(12, 18) : type === 1 ? irange(8, 14) : irange(5, 9);
+  const garrison = Math.max(3, Math.round(baseGarrison * (0.75 + 0.7 * value)));
+  return { type, ringCount, garrison };
 };
 
-/** Roll one neutral planet's profile so the pool reads as a varied bunch. */
-const rollNeutralSeed = (): NeutralSeed => {
-  const type = weightedPick<PlanetType>([
-    [0, 1],
-    [1, 3],
-    [2, 1.2],
-  ]);
-  const ringCount = rollRingCount(type);
-  const garrison = type === 2 ? irange(12, 18) : type === 1 ? irange(8, 14) : irange(6, 10);
-  return { type, ringCount, garrison };
+type PlanetDraft = MapSpec['planets'][number];
+
+/** Add one unfilled ring to a drafted planet, respecting its size cap. */
+const addRing = (p: PlanetDraft): boolean => {
+  const type = (p.type ?? 0) as PlanetType;
+  const next = clampRingCount(type, (p.ringCount ?? 0) + 1);
+  if (next === (p.ringCount ?? 0)) return false;
+  p.ringCount = next;
+  return true;
+};
+
+/** Rough worth of a drafted planet — used to pick which world a hazard guards. */
+const draftValue = (p: PlanetDraft): number =>
+  p.garrison + (p.ringCount ?? 0) * 8 + ((p.type ?? 0) as number) * 6;
+
+/**
+ * Pick a neutral planet id biased toward the valuable end: sort by worth and
+ * choose randomly among the top three, so treasure hunts vary between matches
+ * without ever guarding a worthless rock.
+ */
+const pickValuableNeutral = (
+  planets: ReadonlyArray<PlanetDraft>,
+  firstNeutral: number,
+  exclude?: (id: number) => boolean,
+): number | null => {
+  const ids: number[] = [];
+  for (let i = firstNeutral; i < planets.length; i++) {
+    if (exclude?.(i)) continue;
+    ids.push(i);
+  }
+  if (ids.length === 0) return null;
+  ids.sort((a, b) => draftValue(planets[b]) - draftValue(planets[a]));
+  return ids[Math.floor(Math.random() * Math.min(3, ids.length))];
 };
 
 /** Chance a hazardous match rolls a second hazard of a different kind. */
 const SECOND_HAZARD_CHANCE = 0.3;
 
 /**
- * Roll one hazard of the given kind. Placement keeps hazards central so
- * they interfere with contested space, never with a start world.
+ * Roll one hazard of the given kind. Hazards guard rewards: most rolls latch
+ * onto a neutral planet and sweeten it (extra ring, deeper garrison), so the
+ * danger zone on the map is also the treasure map. `planets` is mutated when
+ * a hazard upgrades the world it guards.
  */
 const rollHazardOfKind = (
   variant: HazardKind,
   cfg: MapGenConfig,
+  planets: PlanetDraft[],
   positions: ReadonlyArray<{ x: number; y: number; r: number }>,
 ): HazardSpec | null => {
   const starts = positions.slice(0, cfg.playerCount);
+  const firstNeutral = cfg.playerCount;
 
   if (variant === 'driftingPlanet') {
-    // Only neutral worlds drift — the start worlds stay anchored.
-    const candidates: number[] = [];
-    for (let i = cfg.playerCount; i < positions.length; i++) candidates.push(i);
-    if (candidates.length === 0) return null;
-    const planetId = candidates[Math.floor(Math.random() * candidates.length)];
+    // Only neutral worlds drift — the start worlds stay anchored. Prefer a
+    // ringed drifter (a moving treasure whose capture timing matters); if
+    // none rolled, mint one so the wanderer is always worth chasing.
+    const ringed: number[] = [];
+    const bare: number[] = [];
+    for (let i = firstNeutral; i < planets.length; i++) {
+      ((planets[i].ringCount ?? 0) > 0 ? ringed : bare).push(i);
+    }
+    const pool = ringed.length > 0 ? ringed : bare;
+    if (pool.length === 0) return null;
+    const planetId = pool[Math.floor(Math.random() * pool.length)];
+    if (ringed.length === 0) addRing(planets[planetId]);
     const speed = frange(14, 26);
     const heading = Math.random() * Math.PI * 2;
     return {
@@ -250,11 +391,27 @@ const rollHazardOfKind = (
   }
 
   if (variant === 'asteroidField') {
-    // Drop the field between two neutral planets so it sits in a likely
-    // flight path. Falls back to mid-map if there aren't enough neutrals.
+    // Treasure in the rocks: most fields wrap a neutral planet, and that
+    // planet gets sweeter — an extra ring and a deeper garrison. Slow going
+    // for the attacker, but also for anyone counterattacking the new owner.
+    const guarded = Math.random() < 0.65 ? pickValuableNeutral(planets, firstNeutral) : null;
+    if (guarded !== null) {
+      const p = planets[guarded];
+      addRing(p);
+      p.garrison = Math.round(p.garrison * 1.5);
+      const bodyR = SIZE_RADIUS[(p.type ?? 0) as PlanetType];
+      return {
+        type: 'asteroidField',
+        pos: { x: p.pos.x, y: p.pos.y },
+        radius: Math.max(frange(150, 220), bodyR * 2.8),
+        slowdown: 0.32,
+        seed: Math.floor(Math.random() * 1e9),
+      };
+    }
+    // Fallback: a free-floating belt between two neutral planets, sitting in
+    // a likely flight path. Mid-map when there aren't enough neutrals.
     let cx = MAP_WIDTH / 2;
     let cy = MAP_HEIGHT / 2;
-    const firstNeutral = cfg.playerCount;
     if (positions.length >= firstNeutral + 2) {
       const a = positions[firstNeutral];
       const b = positions[firstNeutral + 1];
@@ -291,6 +448,15 @@ const rollHazardOfKind = (
           (s) => Math.hypot(candidate.x - s.x, candidate.y - s.y) > 340,
         );
         if (clearOfPlanets && clearOfStarts) {
+          // Dangerous riches: neutrals in the well's neighborhood gain a
+          // ring. Attacking or holding them means flying the slingshot line
+          // every time — a skill play with a fatal inner edge.
+          let sweetened = 0;
+          for (let i = firstNeutral; i < planets.length && sweetened < 2; i++) {
+            const p = planets[i];
+            const d = Math.hypot(candidate.x - p.pos.x, candidate.y - p.pos.y);
+            if (d < gravityRadius * 2.2 && addRing(p)) sweetened++;
+          }
           return {
             type: 'blackHole',
             pos: candidate,
@@ -305,7 +471,25 @@ const rollHazardOfKind = (
     return null;
   }
 
-  // neutralSwarm — anchor it well clear of every start world.
+  // neutralSwarm — a guardian pack anchored on a prize worth guarding. The
+  // guarded world gets sweeter (ring + garrison), the swarm patrols right on
+  // top of it, and once the planet is captured the pack stops replenishing.
+  const guarded = pickValuableNeutral(planets, firstNeutral);
+  if (guarded !== null) {
+    const p = planets[guarded];
+    if ((p.ringCount ?? 0) === 0) addRing(p);
+    p.garrison = Math.round(p.garrison * 1.25);
+    const bodyR = SIZE_RADIUS[(p.type ?? 0) as PlanetType];
+    return {
+      type: 'neutralSwarm',
+      pos: { x: p.pos.x, y: p.pos.y },
+      count: irange(4, 6),
+      patrolRadius: Math.max(frange(110, 160), bodyR * 2.4 + 30),
+      seed: Math.floor(Math.random() * 1e9),
+      guardPlanetId: guarded,
+    };
+  }
+  // Fallback (no neutrals at all): free-floating swarm clear of the starts.
   let pos = { x: MAP_WIDTH / 2, y: MAP_HEIGHT / 2 + frange(-80, 120) };
   for (let attempt = 0; attempt < 20; attempt++) {
     const candidate = {
@@ -338,6 +522,7 @@ const rollHazardOfKind = (
  */
 const rollHazards = (
   cfg: MapGenConfig,
+  planets: PlanetDraft[],
   positions: ReadonlyArray<{ x: number; y: number; r: number }>,
 ): HazardSpec[] => {
   if (cfg.hazardPool.length === 0) return [];
@@ -345,13 +530,14 @@ const rollHazards = (
   const pool = [...new Set(cfg.hazardPool)];
   const first = pool[Math.floor(Math.random() * pool.length)];
   const hazards: HazardSpec[] = [];
-  const rolled = rollHazardOfKind(first, cfg, positions);
+  const rolled = rollHazardOfKind(first, cfg, planets, positions);
   if (rolled) hazards.push(rolled);
   const rest = pool.filter((k) => k !== first);
   if (hazards.length > 0 && rest.length > 0 && Math.random() < SECOND_HAZARD_CHANCE) {
     const second = rollHazardOfKind(
       rest[Math.floor(Math.random() * rest.length)],
       cfg,
+      planets,
       positions,
     );
     if (second) hazards.push(second);
@@ -367,6 +553,8 @@ export const generateMap = (cfg: MapGenConfig): MapSpec => {
   );
   const neutralCount = totalPlanets - cfg.playerCount;
   const minSep = frange(MIN_SEPARATION_RANGE[0], MIN_SEPARATION_RANGE[1]);
+  const layouts = cfg.layouts && cfg.layouts.length > 0 ? cfg.layouts : ['scatter' as const];
+  const layout = layouts[Math.floor(Math.random() * layouts.length)];
 
   const placed: Array<{ x: number; y: number; r: number }> = [];
   const planets: MapSpec['planets'] = [];
@@ -386,30 +574,49 @@ export const generateMap = (cfg: MapGenConfig): MapSpec => {
     placed.push({ ...pos, r: SIZE_RADIUS[0] });
   }
 
-  // Neutrals — rejection-sample the central band; relax separation slightly
-  // on failure so we always hit the requested count.
-  for (let i = 0; i < neutralCount; i++) {
-    const seed = rollNeutralSeed();
-    const ownR = SIZE_RADIUS[seed.type];
-    let pos = tryPlace(NEUTRAL_ZONE, placed, ownR, minSep);
+  // Neutrals — place first (layout decides where), value them second (their
+  // position decides what they're worth). Placement uses a mid-size radius
+  // stand-in; the separation floor dwarfs any radius delta.
+  const slots = buildNeutralSlots(layout, neutralCount);
+  const neutralPositions: Array<{ x: number; y: number; rich: boolean }> = [];
+  for (const slot of slots) {
+    let pos = tryPlace(slot.zone, placed, SIZE_RADIUS[1], minSep);
     let relaxed = minSep;
     while (!pos && relaxed > MIN_SEPARATION_RANGE[0] - 50) {
       relaxed -= 20;
-      pos = tryPlace(NEUTRAL_ZONE, placed, ownR, relaxed);
+      pos = tryPlace(slot.zone, placed, SIZE_RADIUS[1], relaxed);
     }
-    if (!pos) pos = rollInZone(NEUTRAL_ZONE);
+    if (!pos) pos = rollInZone(slot.zone);
+    neutralPositions.push({ ...pos, rich: slot.rich ?? false });
+    placed.push({ ...pos, r: SIZE_RADIUS[1] });
+  }
+
+  // Contestedness: distance to the nearest start, min-max normalized across
+  // this map's neutrals. Worlds near somebody's doorstep come out cheap;
+  // deep-space worlds come out rich and defended.
+  const starts = placed.slice(0, cfg.playerCount);
+  const nearestStart = neutralPositions.map((p) =>
+    Math.min(...starts.map((s) => Math.hypot(s.x - p.x, s.y - p.y))),
+  );
+  const dMin = Math.min(...nearestStart);
+  const dMax = Math.max(...nearestStart);
+  const span = Math.max(1, dMax - dMin);
+
+  neutralPositions.forEach((p, i) => {
+    const value = (nearestStart[i] - dMin) / span;
+    const seed = rollNeutralFromValue(value, p.rich);
     planets.push({
-      pos,
+      pos: { x: p.x, y: p.y },
       owner: null,
       garrison: seed.garrison,
       type: seed.type,
       ringCount: seed.ringCount,
     });
-    placed.push({ ...pos, r: ownR });
-  }
+    placed[cfg.playerCount + i].r = SIZE_RADIUS[seed.type];
+  });
 
   const edges = buildEdges(placed);
-  const hazards = rollHazards(cfg, placed);
+  const hazards = rollHazards(cfg, planets, placed);
 
   return {
     width: MAP_WIDTH,

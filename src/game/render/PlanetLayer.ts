@@ -245,6 +245,8 @@ export class PlanetLayer extends Container {
   private world: World;
   private views: PlanetView[] = [];
   private selectedSources = new Set<number>();
+  /** Planets currently under inbound attack (see setThreatened). */
+  private threatened = new Set<number>();
   private shipTex: Texture;
   private shipGlowTex: Texture;
   private time = 0;
@@ -372,6 +374,15 @@ export class PlanetLayer extends Container {
 
   setSelection(ids: Iterable<number>): void {
     this.selectedSources = new Set(ids);
+  }
+
+  /**
+   * Planets with an enemy wave inbound — the Game refreshes this a few times
+   * a second. Each gets a slow amber warning pulse so the player's eye is
+   * drawn to trouble before the first ship lands, without any text or icon.
+   */
+  setThreatened(ids: Iterable<number>): void {
+    this.threatened = new Set(ids);
   }
 
   /**
@@ -606,6 +617,21 @@ export class PlanetLayer extends Container {
             : 8;
         const outer = effRadius + ringsOuter + 8 + Math.sin(this.time * 4) * 1.6;
         v.ring.circle(0, 0, outer).stroke({ width: 2.5, color: pal.ring, alpha: 0.95 });
+      }
+      // Incoming-attack warning: a slow amber pulse drawn OUTSIDE the orbit
+      // band so it reads as a perimeter alert rather than getting lost in
+      // the swarm. Quieter than the selection ring — a nudge toward trouble,
+      // not an alarm. Phase-offset per planet so two threatened worlds don't
+      // blink in eerie unison.
+      if (this.threatened.has(p.id)) {
+        const wob = Math.sin(this.time * 3.1 + p.id * 1.7);
+        const warnR = effRadius * 2.05 + 6 + wob * 3;
+        v.ring
+          .circle(0, 0, warnR)
+          .stroke({ width: 3, color: 0xffb02e, alpha: 0.42 + 0.2 * wob });
+        v.ring
+          .circle(0, 0, warnR * 0.92)
+          .stroke({ width: 1.5, color: 0xff7a3c, alpha: 0.22 + 0.12 * wob });
       }
 
       // Production detection: a sub-unit accumulator wrap means the sim just

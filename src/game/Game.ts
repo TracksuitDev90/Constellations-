@@ -53,6 +53,9 @@ export class Game {
    * the persistent rumble in Audio so a brawl audibly swells and fades.
    */
   private deathTimestamps: number[] = [];
+  /** Player planets currently under inbound attack; refreshed ~4×/second. */
+  private threatened = new Set<number>();
+  private threatScanAcc = 0;
 
   constructor(app: Application, ui: HTMLElement) {
     this.app = app;
@@ -228,12 +231,21 @@ export class Game {
 
     this.renderer = new Renderer(this.app, this.world);
 
+    // Dev-only escape hatch: expose the live world so tooling (and driving
+    // the game headlessly in CI) can script scenarios that are awkward to
+    // reach by tapping. Stripped from production builds.
+    if (import.meta.env.DEV) {
+      (window as unknown as { __world?: World }).__world = this.world;
+    }
+
     // Matches with a black hole get a dedicated dark drone under the ambient
     // bed; hole-free matches must not carry it over from a previous game.
     this.audio.setBlackHolePresence(this.world.blackHoles.length > 0);
 
     this.selection = new Selection(this.world, 0);
-    this.ais = level.aiConfigs.map((cfg, i) => new BasicAI(this.world, i + 1, cfg));
+    this.ais = level.aiConfigs.map(
+      (cfg, i) => new BasicAI(this.world, i + 1, cfg, level.personalities?.[i]),
+    );
 
     this.input = new Input(this.app.canvas as unknown as HTMLCanvasElement, this.renderer, this.world, {
       tapPlanet: (id) => {
@@ -350,6 +362,8 @@ export class Game {
     this.paused = false;
     this.endingT = -1;
     this.deathTimestamps.length = 0;
+    this.threatened = new Set();
+    this.threatScanAcc = 0;
     this.app.ticker.add(this.loop);
 
     window.addEventListener('resize', this.onResize);
@@ -423,6 +437,30 @@ export class Game {
       // fixed-timestep death spiral. Trading dropped time for a stable
       // frame rate is the right call on mobile.
       if (this.accumulator > FIXED_DT * 4) this.accumulator = FIXED_DT * 4;
+
+      // Incoming-attack scan, ~4×/second: which of the player's planets have
+      // an enemy wave flying at them right now? Newly threatened planets get
+      // a soft audio warning (rate-limited inside Audio); the renderer draws
+      // a quiet amber pulse for as long as the threat persists.
+      this.threatScanAcc += dt;
+      if (this.threatScanAcc >= 0.25) {
+        this.threatScanAcc = 0;
+        const next = new Set<number>();
+        for (const p of this.world.planets) {
+          if (p.owner !== 0) continue;
+          if (this.world.incomingAttackers(p.id, 0) > 0) next.add(p.id);
+        }
+        let newlyThreatened = false;
+        for (const id of next) {
+          if (!this.threatened.has(id)) {
+            newlyThreatened = true;
+            break;
+          }
+        }
+        if (newlyThreatened) this.audio.threatWarning();
+        this.threatened = next;
+        this.renderer.planetLayer.setThreatened(next);
+      }
     } else if (this.endingT >= 0) {
       // End-of-match dramatization: let the renderer keep breathing while
       // defeat drains the color out of the sky (victory's shockwave cascade

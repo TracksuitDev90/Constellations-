@@ -59,16 +59,27 @@ export interface MapSpec {
  *     wander a `patrolRadius` and shoot down the nearest in-range ship of
  *     ANY owner, but never capture planets. Their own units die when killed
  *     in a 1:1 exchange; they respawn slowly so the swarm thins under
- *     sustained attack.
+ *     sustained attack. When `guardPlanetId` is set the swarm is a guardian:
+ *     its anchor follows that planet (even if it drifts) and respawning stops
+ *     for good once the planet is captured — clear the prize, break the pack.
  *   - blackHole: a gravity well at `pos`. Free-flying ships inside
  *     `gravityRadius` are pulled toward the center; anything that crosses the
  *     capture threshold is locked into a slow terminal spiral and consumed at
- *     the event horizon. The hardest hazard — routes must be planned around it.
+ *     the event horizon. The outer band doubles as a slingshot lane — ships
+ *     riding it fly meaningfully faster — so the hardest hazard is also the
+ *     boldest shortcut.
  */
 export type HazardSpec =
   | { type: 'driftingPlanet'; planetId: number; vx: number; vy: number }
   | { type: 'asteroidField'; pos: Vec2; radius: number; slowdown: number; seed: number }
-  | { type: 'neutralSwarm'; pos: Vec2; count: number; patrolRadius: number; seed: number }
+  | {
+      type: 'neutralSwarm';
+      pos: Vec2;
+      count: number;
+      patrolRadius: number;
+      seed: number;
+      guardPlanetId?: number;
+    }
   | { type: 'blackHole'; pos: Vec2; horizonRadius: number; gravityRadius: number; seed: number };
 
 export interface AsteroidField {
@@ -172,6 +183,16 @@ const REINFORCEMENT_ORBIT_CAP = 300;
 const BLACK_HOLE_CAPTURE_MULT = 2.6;
 /** Peak gravitational acceleration (px/s²) at the capture threshold. */
 const BLACK_HOLE_G_PEAK = 110;
+/**
+ * Slingshot band: the safe part of a gravity well, from just outside the
+ * capture threshold out to the gravity radius. Ships riding the band get a
+ * speed-cap lift that peaks mid-band — the well bends their path AND speeds
+ * them up, so shaving close to a black hole is a genuine fast lane with a
+ * fatal inner edge. Exported so the AI can price the same tradeoff.
+ */
+export const SLINGSHOT_INNER_MULT = 1.15;
+/** Peak speed multiplier at the middle of the slingshot band. */
+export const SLINGSHOT_PEAK_BOOST = 1.35;
 /** Radial infall speed (px/s) at the capture rim... */
 const DOOM_INFALL_BASE = 8;
 /** ...climbing by this much as the spiral closes on the horizon. */
@@ -253,6 +274,12 @@ export class World {
     patrolRadius: number;
     targetCount: number;
     respawnAcc: number;
+    /**
+     * Planet this swarm guards, or -1 for a free-floating swarm. A guardian
+     * anchor tracks its planet's position every tick and stops respawning
+     * once the planet is captured by anyone.
+     */
+    guardPlanetId: number;
   }> = [];
 
   constructor(map: MapSpec, players: Player[], events: WorldEvents = {}) {
@@ -325,11 +352,15 @@ export class World {
         });
       } else if (h.type === 'neutralSwarm') {
         const anchorIdx = this.neutralAnchors.length;
+        const guardPlanet =
+          h.guardPlanetId !== undefined ? this.planets[h.guardPlanetId] : undefined;
         this.neutralAnchors.push({
-          pos: { ...h.pos },
+          // A guardian swarm centers exactly on its prize.
+          pos: guardPlanet ? { ...guardPlanet.pos } : { ...h.pos },
           patrolRadius: h.patrolRadius,
           targetCount: h.count,
           respawnAcc: 0,
+          guardPlanetId: guardPlanet ? guardPlanet.id : -1,
         });
         for (let i = 0; i < h.count; i++) {
           this.spawnNeutralAt(anchorIdx);
@@ -710,6 +741,17 @@ export class World {
     const all = this.neutrals.all;
     const ships = this.ships.all;
 
+    // Guardian anchors shadow their planet so the pack keeps circling the
+    // prize even when the driftingPlanet hazard carries it across the map.
+    for (const a of this.neutralAnchors) {
+      if (a.guardPlanetId < 0) continue;
+      const guarded = this.planets[a.guardPlanetId];
+      if (guarded) {
+        a.pos.x = guarded.pos.x;
+        a.pos.y = guarded.pos.y;
+      }
+    }
+
     // Standing pursuit claims — lets late acquirers skip already-swarmed
     // targets so a pack naturally splits across a crossing wave.
     this.pursuerCounts.clear();
@@ -927,6 +969,13 @@ export class World {
     // so a heavily-thinned swarm takes meaningfully longer to recover.
     for (let ai = 0; ai < this.neutralAnchors.length; ai++) {
       const a = this.neutralAnchors[ai];
+      // A guardian swarm whose prize has been claimed stops replenishing —
+      // whittling it down is permanent progress, and the captured planet
+      // isn't forever ringed by hostiles.
+      if (a.guardPlanetId >= 0 && this.planets[a.guardPlanetId]?.owner !== null) {
+        a.respawnAcc = 0;
+        continue;
+      }
       const live = this.neutrals.countAtAnchor(ai);
       if (live >= a.targetCount) {
         a.respawnAcc = 0;
@@ -1474,9 +1523,10 @@ export class World {
     // nominal speed scaled by drag so a ship physically crawls through the
     // rocks while still steering normally.
 
-    // Cap speed to the ship's nominal speed (scaled by drag).
+    // Cap speed to the ship's nominal speed (scaled by drag, lifted by any
+    // slingshot band the ship is riding).
     const sp = Math.hypot(ship.vx, ship.vy);
-    const effectiveSpeed = ship.speed * drag;
+    const effectiveSpeed = ship.speed * drag * this.blackHoleSpeedLift(ship.x, ship.y);
     if (sp > effectiveSpeed) {
       ship.vx = (ship.vx / sp) * effectiveSpeed;
       ship.vy = (ship.vy / sp) * effectiveSpeed;
@@ -1591,6 +1641,29 @@ export class World {
       }
     }
     return drag;
+  }
+
+  /**
+   * Slingshot speed multiplier for a ship at (x, y). Inside a gravity well's
+   * safe band — outside `captureRadius * SLINGSHOT_INNER_MULT`, inside
+   * `gravityRadius` — the speed cap lifts on a parabola that peaks mid-band
+   * at SLINGSHOT_PEAK_BOOST and fades to 1 at both edges. Riding the rim is
+   * a fast lane; the price is that the same rim drags the flight path toward
+   * the fatal capture threshold.
+   */
+  blackHoleSpeedLift(x: number, y: number): number {
+    let lift = 1;
+    for (const bh of this.blackHoles) {
+      const inner = bh.captureRadius * SLINGSHOT_INNER_MULT;
+      const outer = bh.gravityRadius;
+      if (outer <= inner) continue;
+      const d = Math.hypot(x - bh.pos.x, y - bh.pos.y);
+      if (d <= inner || d >= outer) continue;
+      const t = (d - inner) / (outer - inner); // 0 at inner edge → 1 at rim
+      const boost = 1 + (SLINGSHOT_PEAK_BOOST - 1) * 4 * t * (1 - t);
+      if (boost > lift) lift = boost;
+    }
+    return lift;
   }
 
   private beginHover(ship: Ship): void {
@@ -1801,6 +1874,36 @@ export class World {
       if (d <= p.radius + slop) return p;
     }
     return null;
+  }
+
+  /**
+   * Read-only view of the swarm patrol zones that still have live hostiles —
+   * the AI prices flight paths through them the way a player eyeballs the
+   * green cloud. Anchors whose pack has been wiped cost nothing.
+   */
+  swarmZones(): Array<{ pos: Vec2; patrolRadius: number }> {
+    const zones: Array<{ pos: Vec2; patrolRadius: number }> = [];
+    for (let ai = 0; ai < this.neutralAnchors.length; ai++) {
+      if (this.neutrals.countAtAnchor(ai) === 0) continue;
+      const a = this.neutralAnchors[ai];
+      zones.push({ pos: a.pos, patrolRadius: a.patrolRadius });
+    }
+    return zones;
+  }
+
+  /**
+   * Number of enemy ships currently flying at `planetId` (transit state with
+   * that planet as target, owner different from `owner`). Drives the HUD's
+   * incoming-attack warning; the AI keeps its own richer variant that also
+   * counts staged hover fleets.
+   */
+  incomingAttackers(planetId: number, owner: number): number {
+    let n = 0;
+    for (const s of this.ships.all) {
+      if (!s.active || s.owner === owner) continue;
+      if (s.state === 'transit' && s.targetPlanet === planetId) n++;
+    }
+    return n;
   }
 
   totalGarrison(owner: number): number {

@@ -1,4 +1,13 @@
-import { CHILL_AI, FIERCE_AI, NORMAL_AI, type AIConfig } from './ai/BasicAI.js';
+import {
+  AGGRESSOR,
+  CHILL_AI,
+  ECONOMIST,
+  FIERCE_AI,
+  NORMAL_AI,
+  OPPORTUNIST,
+  type AIConfig,
+  type Personality,
+} from './ai/BasicAI.js';
 import type { MapGenConfig } from './maps/generator.js';
 
 /**
@@ -9,7 +18,10 @@ import type { MapGenConfig } from './maps/generator.js';
  * pressure at a time: hazards, a sharper AI, then free-for-alls, then
  * fierce free-for-alls with everything turned on. Every level's hazard
  * pool is non-empty so drifting planets and asteroid belts have a chance
- * of appearing anywhere in the campaign; only the odds ramp.
+ * of appearing anywhere in the campaign; only the odds ramp. Map layout
+ * archetypes widen the same way: early skies are open scatter, later ones
+ * roll lanes, ringworlds, and clusters so the geography itself becomes a
+ * strategic variable.
  */
 export interface LevelDef {
   id: string;
@@ -19,6 +31,12 @@ export interface LevelDef {
   map: MapGenConfig;
   /** One config per AI rival; length = map.playerCount - 1. */
   aiConfigs: AIConfig[];
+  /**
+   * Optional temperament per rival, parallel to `aiConfigs`. Free-for-all
+   * levels mix distinct personalities so the rivals read as different minds;
+   * omitted entries play the balanced default.
+   */
+  personalities?: Personality[];
 }
 
 export const LEVELS: LevelDef[] = [
@@ -66,6 +84,7 @@ export const LEVELS: LevelDef[] = [
       playerGarrison: 20,
       enemyGarrison: 14,
       playerRing: true,
+      layouts: ['scatter', 'lanes'],
     },
     aiConfigs: [NORMAL_AI],
   },
@@ -81,6 +100,7 @@ export const LEVELS: LevelDef[] = [
       playerGarrison: 20,
       enemyGarrison: 16,
       playerRing: true,
+      layouts: ['scatter', 'lanes', 'ringworld'],
     },
     aiConfigs: [NORMAL_AI],
   },
@@ -96,8 +116,11 @@ export const LEVELS: LevelDef[] = [
       playerGarrison: 20,
       enemyGarrison: 16,
       playerRing: true,
+      layouts: ['scatter', 'ringworld', 'clusters'],
     },
     aiConfigs: [NORMAL_AI, NORMAL_AI],
+    // A hoarder and a bully — the free-for-all reads as two different minds.
+    personalities: [ECONOMIST, AGGRESSOR],
   },
   {
     id: 'draco',
@@ -111,8 +134,10 @@ export const LEVELS: LevelDef[] = [
       playerGarrison: 20,
       enemyGarrison: 18,
       playerRing: true,
+      layouts: ['scatter', 'lanes', 'ringworld', 'clusters'],
     },
     aiConfigs: [NORMAL_AI, FIERCE_AI],
+    personalities: [OPPORTUNIST, AGGRESSOR],
   },
   {
     id: 'cygnus',
@@ -126,8 +151,10 @@ export const LEVELS: LevelDef[] = [
       playerGarrison: 20,
       enemyGarrison: 18,
       playerRing: true,
+      layouts: ['scatter', 'lanes', 'ringworld', 'clusters'],
     },
     aiConfigs: [NORMAL_AI, NORMAL_AI, FIERCE_AI],
+    personalities: [ECONOMIST, OPPORTUNIST, AGGRESSOR],
   },
   {
     id: 'andromeda',
@@ -141,8 +168,10 @@ export const LEVELS: LevelDef[] = [
       playerGarrison: 20,
       enemyGarrison: 20,
       playerRing: true,
+      layouts: ['scatter', 'lanes', 'ringworld', 'clusters'],
     },
     aiConfigs: [FIERCE_AI, FIERCE_AI, FIERCE_AI],
+    personalities: [ECONOMIST, OPPORTUNIST, AGGRESSOR],
   },
 ];
 

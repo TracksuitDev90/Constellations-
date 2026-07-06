@@ -77,6 +77,8 @@ export class Audio {
   private lastLaunchAt = 0;
   /** Per-planet throttle so a flood of arrivals doesn't drown out the ambient. */
   private lastArriveAt = new Map<number, number>();
+  /** AudioContext timestamp of the last incoming-attack warning cue. */
+  private lastThreatWarnAt = -Infinity;
   private lastRingFillAt = 0;
   private lastRingTickAt = new Map<number, number>();
   private lastAbsorbAt = new Map<number, number>();
@@ -1127,6 +1129,33 @@ export class Audio {
       osc.connect(g).connect(this.sfxGain);
       osc.start(start);
       osc.stop(start + 0.5);
+    }
+  }
+
+  /**
+   * Soft incoming-attack warning: two low descending tones, felt more than
+   * heard under the ambient bed. Rate-limited internally so a match with
+   * waves constantly in the air doesn't nag — at most one warning every
+   * few seconds, however often the threat set changes.
+   */
+  threatWarning(): void {
+    if (!this.ctx || !this.sfxGain || this.muted) return;
+    const now = this.ctx.currentTime;
+    if (now - this.lastThreatWarnAt < 4) return;
+    this.lastThreatWarnAt = now;
+    const notes = [311.13, 233.08]; // Eb4 → Bb3, a wary falling fourth
+    for (let i = 0; i < notes.length; i++) {
+      const osc = this.ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = notes[i];
+      const g = this.ctx.createGain();
+      const start = now + i * 0.16;
+      g.gain.setValueAtTime(0.0001, start);
+      g.gain.exponentialRampToValueAtTime(0.09, start + 0.03);
+      g.gain.exponentialRampToValueAtTime(0.0001, start + 0.5);
+      osc.connect(g).connect(this.sfxGain);
+      osc.start(start);
+      osc.stop(start + 0.55);
     }
   }
 

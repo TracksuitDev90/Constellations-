@@ -9,7 +9,7 @@ Every star you own continuously produces ships. Gather your swarm, send it acros
 - **Movement is free-flight.** Waves fly straight where you send them and fight 1-for-1 wherever enemy swarms cross. The constellation lines are the map's skeleton, not lanes.
 - **Commitment is the skill.** Tap your star once to gather **half** its swarm, again for **all** of it — deciding how much to risk is the whole game.
 - **Feeding is growth.** Send units into your own ringed star (or tap it a third time) to fill its rings; a full set of rings evolves it into a bigger, faster star. The `n / cap` readout under your ringed stars shows exactly what the next evolution costs.
-- **Hazards change each sky.** Drifting planets, asteroid belts that slow crossings, and hostile green swarms that attack everyone.
+- **Hazards change each sky.** Drifting planets, asteroid belts that slow crossings, hostile green swarms that attack everyone, black holes with a fatal core and a slingshot rim, flare stars that detonate on a readable rhythm — cross between the pulses — and wormhole pairs that fold the map: ships (yours *and* theirs) automatically ride a gate whenever it's the shorter road.
 
 ## Controls
 

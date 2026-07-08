@@ -95,7 +95,7 @@ export const LEVELS: LevelDef[] = [
     map: {
       playerCount: 2,
       totalPlanets: [7, 9],
-      hazardPool: ['driftingPlanet', 'asteroidField', 'neutralSwarm'],
+      hazardPool: ['driftingPlanet', 'asteroidField', 'neutralSwarm', 'wormhole'],
       calmChance: 0.25,
       playerGarrison: 20,
       enemyGarrison: 16,
@@ -111,7 +111,7 @@ export const LEVELS: LevelDef[] = [
     map: {
       playerCount: 3,
       totalPlanets: [8, 9],
-      hazardPool: ['driftingPlanet', 'asteroidField', 'neutralSwarm'],
+      hazardPool: ['driftingPlanet', 'asteroidField', 'neutralSwarm', 'wormhole'],
       calmChance: 0.45,
       playerGarrison: 20,
       enemyGarrison: 16,
@@ -129,7 +129,13 @@ export const LEVELS: LevelDef[] = [
     map: {
       playerCount: 3,
       totalPlanets: [8, 10],
-      hazardPool: ['driftingPlanet', 'asteroidField', 'neutralSwarm', 'blackHole'],
+      hazardPool: [
+        'driftingPlanet',
+        'asteroidField',
+        'neutralSwarm',
+        'blackHole',
+        'flareStar',
+      ],
       calmChance: 0.2,
       playerGarrison: 20,
       enemyGarrison: 18,
@@ -146,7 +152,14 @@ export const LEVELS: LevelDef[] = [
     map: {
       playerCount: 4,
       totalPlanets: [9, 10],
-      hazardPool: ['driftingPlanet', 'asteroidField', 'neutralSwarm', 'blackHole'],
+      hazardPool: [
+        'driftingPlanet',
+        'asteroidField',
+        'neutralSwarm',
+        'blackHole',
+        'flareStar',
+        'wormhole',
+      ],
       calmChance: 0.2,
       playerGarrison: 20,
       enemyGarrison: 18,
@@ -163,7 +176,14 @@ export const LEVELS: LevelDef[] = [
     map: {
       playerCount: 4,
       totalPlanets: [10, 11],
-      hazardPool: ['driftingPlanet', 'asteroidField', 'neutralSwarm', 'blackHole'],
+      hazardPool: [
+        'driftingPlanet',
+        'asteroidField',
+        'neutralSwarm',
+        'blackHole',
+        'flareStar',
+        'wormhole',
+      ],
       calmChance: 0.1,
       playerGarrison: 20,
       enemyGarrison: 20,

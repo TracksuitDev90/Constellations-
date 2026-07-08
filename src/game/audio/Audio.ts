@@ -79,6 +79,8 @@ export class Audio {
   private lastArriveAt = new Map<number, number>();
   /** AudioContext timestamp of the last incoming-attack warning cue. */
   private lastThreatWarnAt = -Infinity;
+  /** Throttle so a 20-ship wave riding a wormhole chirps once, not 20 times. */
+  private lastWarpAt = -Infinity;
   private lastRingFillAt = 0;
   private lastRingTickAt = new Map<number, number>();
   private lastAbsorbAt = new Map<number, number>();
@@ -1130,6 +1132,87 @@ export class Audio {
       osc.start(start);
       osc.stop(start + 0.5);
     }
+  }
+
+  /**
+   * Flare star detonation: a deep sub-boom under a long low-passed noise
+   * whoosh — bigger and rounder than the shield-shatter so the two events
+   * never read as the same thing. Fires on the sim's onFlareDetonate.
+   */
+  flareDetonation(): void {
+    if (!this.ctx || !this.sfxGain || this.muted) return;
+    const now = this.ctx.currentTime;
+
+    // Layer 1: low rumble — filtered noise swelling out with the wave.
+    const dur = 0.9;
+    const sampleCount = Math.max(1, Math.floor(this.ctx.sampleRate * dur));
+    const buf = this.ctx.createBuffer(1, sampleCount, this.ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < sampleCount; i++) {
+      const t = i / sampleCount;
+      const env = Math.min(1, t * 12) * Math.pow(1 - t, 2.2);
+      data[i] = (Math.random() * 2 - 1) * env;
+    }
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    const lp = this.ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.Q.value = 0.8;
+    lp.frequency.setValueAtTime(900, now);
+    lp.frequency.exponentialRampToValueAtTime(160, now + dur);
+    const noiseGain = this.ctx.createGain();
+    noiseGain.gain.value = 0.14;
+    src.connect(lp).connect(noiseGain).connect(this.sfxGain);
+    src.start(now);
+    src.stop(now + dur + 0.02);
+
+    // Layer 2: sub-thump, deeper and longer than any combat hit.
+    const thump = this.ctx.createOscillator();
+    thump.type = 'sine';
+    thump.frequency.setValueAtTime(64, now);
+    thump.frequency.exponentialRampToValueAtTime(30, now + 0.5);
+    const thumpGain = this.ctx.createGain();
+    thumpGain.gain.setValueAtTime(0.0001, now);
+    thumpGain.gain.exponentialRampToValueAtTime(0.2, now + 0.012);
+    thumpGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.55);
+    thump.connect(thumpGain).connect(this.sfxGain);
+    thump.start(now);
+    thump.stop(now + 0.6);
+  }
+
+  /**
+   * Wormhole transit: a quick rising chirp with a shimmer partial — the
+   * sound of being squeezed through space. Heavily rate-limited so a wave
+   * pouring through the gate reads as one whoosh, not a machine gun.
+   */
+  shipWarp(): void {
+    if (!this.ctx || !this.sfxGain || this.muted) return;
+    const now = this.ctx.currentTime;
+    if (now - this.lastWarpAt < 0.25) return;
+    this.lastWarpAt = now;
+    const chirp = this.ctx.createOscillator();
+    chirp.type = 'sine';
+    chirp.frequency.setValueAtTime(280, now);
+    chirp.frequency.exponentialRampToValueAtTime(980, now + 0.14);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.0001, now);
+    g.gain.exponentialRampToValueAtTime(0.05, now + 0.015);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + 0.18);
+    chirp.connect(g).connect(this.sfxGain);
+    chirp.start(now);
+    chirp.stop(now + 0.2);
+    // Shimmer partial an octave and a fifth up, trailing slightly.
+    const shimmer = this.ctx.createOscillator();
+    shimmer.type = 'triangle';
+    shimmer.frequency.setValueAtTime(840, now + 0.03);
+    shimmer.frequency.exponentialRampToValueAtTime(2200, now + 0.16);
+    const sg = this.ctx.createGain();
+    sg.gain.setValueAtTime(0.0001, now + 0.03);
+    sg.gain.exponentialRampToValueAtTime(0.02, now + 0.05);
+    sg.gain.exponentialRampToValueAtTime(0.0001, now + 0.2);
+    shimmer.connect(sg).connect(this.sfxGain);
+    shimmer.start(now + 0.03);
+    shimmer.stop(now + 0.22);
   }
 
   /**

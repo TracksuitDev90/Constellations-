@@ -198,6 +198,12 @@ export class Game {
           // A hole eating a wave should read as combat pressure too.
           this.deathTimestamps.push(performance.now());
         },
+        onFlareDetonate: () => {
+          this.audio.flareDetonation();
+        },
+        onShipWarp: () => {
+          this.audio.shipWarp();
+        },
         onPlanetEvolve: (_planetId, owner, newType) => {
           if (owner !== 0) return;
           this.audio.planetEvolve(newType);

@@ -37,6 +37,8 @@ interface AsteroidVisual {
     theta: number;
     /** Per-rock visual scale jitter. */
     scale: number;
+    /** Slow tumbling rotation (rad/s) so rocks read as 3D bodies. */
+    spin: number;
   }>;
 }
 
@@ -82,6 +84,49 @@ const NEUTRAL_GLOW = 0x2f8a1d; // Green is reserved for the swarm — no player 
 
 const ROCK_DENSITY = 1 / 1800; // rocks per square pixel of zone area.
 const ROCK_MAX = 60;
+
+/**
+ * Draw one small lit asteroid into `g`: an irregular silhouette with a
+ * sunlit face (light from upper-left, matching the planets), a shadowed
+ * lower-right limb, one or two crater pocks, and a thin rim line. All cheap
+ * fills — no textures — but enough tonal range that the rock reads as a
+ * tumbling 3D body instead of a flat chip.
+ */
+const drawRock = (g: Graphics, size: number, rng: () => number): void => {
+  const sides = 6 + Math.floor(rng() * 3);
+  const pts = Array.from({ length: sides }, (_, k) => {
+    const a = (k / sides) * Math.PI * 2;
+    const wob = 0.62 + rng() * 0.48;
+    return { x: Math.cos(a) * size * wob, y: Math.sin(a) * size * wob };
+  });
+  // Base body — slight warm-tone variation per rock.
+  const base = [0x6f5a3a, 0x7a6244, 0x64513a, 0x71604a][Math.floor(rng() * 4)];
+  g.poly(pts).fill({ color: base, alpha: 0.95 });
+  // Shadowed limb: the same silhouette shifted toward the light leaves a
+  // crescent of the base poly exposed on the lower-right — fake terminator.
+  const off = size * 0.28;
+  g.poly(pts.map((p) => ({ x: p.x - off, y: p.y - off }))).fill({
+    color: 0x2e2416,
+    alpha: 0.55,
+  });
+  // Sunlit face, shifted further into the light and shrunk.
+  g.poly(pts.map((p) => ({ x: p.x * 0.55 - off * 0.9, y: p.y * 0.55 - off * 0.9 }))).fill({
+    color: 0x9a8258,
+    alpha: 0.5,
+  });
+  // Crater pocks: dark floor with a lit lower rim.
+  const craters = 1 + Math.floor(rng() * 2);
+  for (let c = 0; c < craters; c++) {
+    const ca = rng() * Math.PI * 2;
+    const cr = size * (0.15 + rng() * 0.2);
+    const cx = Math.cos(ca) * size * 0.4;
+    const cy = Math.sin(ca) * size * 0.4;
+    g.circle(cx + cr * 0.25, cy + cr * 0.25, cr).fill({ color: 0xa08a60, alpha: 0.4 });
+    g.circle(cx, cy, cr).fill({ color: 0x241c10, alpha: 0.6 });
+  }
+  // Thin dark rim keeps the silhouette crisp against the zone haze.
+  g.poly(pts).stroke({ width: Math.max(0.6, size * 0.14), color: 0x1c150c, alpha: 0.5 });
+};
 
 const seeded = (seed: number): (() => number) => {
   let a = seed | 0 || 1;
@@ -159,6 +204,7 @@ export class HazardLayer extends Container {
       const a0 = (i / segs) * Math.PI * 2;
       const a1 = ((i + 1) / segs) * Math.PI * 2;
       boundary
+        .moveTo(Math.cos(a0) * star.maxRadius, Math.sin(a0) * star.maxRadius)
         .arc(0, 0, star.maxRadius, a0, a1)
         .stroke({ width: 1.5, color: 0xd88a4a, alpha: 0.3 });
     }
@@ -239,6 +285,7 @@ export class HazardLayer extends Container {
       const a0 = (i / segs) * Math.PI * 2;
       const a1 = ((i + 1) / segs) * Math.PI * 2;
       boundary
+        .moveTo(Math.cos(a0) * hole.gravityRadius, Math.sin(a0) * hole.gravityRadius)
         .arc(0, 0, hole.gravityRadius, a0, a1)
         .stroke({ width: 1.5, color: 0x8a7ad0, alpha: 0.28 });
     }
@@ -313,21 +360,24 @@ export class HazardLayer extends Container {
         .circle(0, 0, rr)
         .fill({ color: 0x3a2c1a, alpha: 0.06 + 0.04 * (1 - t) });
     }
-    // Crisp dotted boundary so the slow-zone edge is unambiguous.
+    // Crisp dotted boundary so the slow-zone edge is unambiguous. Each dash
+    // must moveTo its own start: arc() draws a straight connector from the
+    // current path point, and the halo fills above leave one behind — that
+    // connector rendered as a stray solid line slashing across the zone.
     const ringSegments = 80;
     for (let i = 0; i < ringSegments; i++) {
       if (i % 2 === 0) continue;
       const a0 = (i / ringSegments) * Math.PI * 2;
       const a1 = ((i + 1) / ringSegments) * Math.PI * 2;
       zone
+        .moveTo(Math.cos(a0) * field.radius, Math.sin(a0) * field.radius)
         .arc(0, 0, field.radius, a0, a1)
         .stroke({ width: 2, color: 0xb89a6c, alpha: 0.45 });
     }
     root.addChild(zone);
 
-    // Particle rocks: small dark polygons with a hint of warm tint. Each rock
-    // gets a tiny per-frame swirl so the field looks alive without the cost
-    // of a full physics pass.
+    // Particle rocks: small lit asteroids rather than flat chips — sunlit
+    // face, shadowed limb, a crater pock or two — each tumbling slowly.
     const area = Math.PI * field.radius * field.radius;
     const count = Math.min(ROCK_MAX, Math.max(8, Math.round(area * ROCK_DENSITY)));
     const rng = seeded(field.seed);
@@ -336,17 +386,11 @@ export class HazardLayer extends Container {
       const r = field.radius * Math.sqrt(rng()) * 0.95;
       const theta = rng() * Math.PI * 2;
       const sprite = new Graphics();
-      const size = 2 + rng() * 4;
-      const sides = 5 + Math.floor(rng() * 3);
-      sprite.poly(
-        Array.from({ length: sides }, (_, k) => {
-          const a = (k / sides) * Math.PI * 2;
-          const wob = 0.6 + rng() * 0.5;
-          return { x: Math.cos(a) * size * wob, y: Math.sin(a) * size * wob };
-        }),
-      ).fill({ color: 0x6f5a3a, alpha: 0.9 });
+      const size = 2.2 + rng() * 4.2;
+      drawRock(sprite, size, rng);
       sprite.x = Math.cos(theta) * r;
       sprite.y = Math.sin(theta) * r;
+      sprite.rotation = rng() * Math.PI * 2;
       root.addChild(sprite);
       visual.rocks.push({
         sprite,
@@ -356,6 +400,7 @@ export class HazardLayer extends Container {
         r,
         theta,
         scale: 0.85 + rng() * 0.45,
+        spin: (rng() - 0.5) * 1.6,
       });
     }
     this.asteroidVisuals.push(visual);
@@ -373,6 +418,7 @@ export class HazardLayer extends Container {
         const theta = rock.theta + rock.omega * this.time;
         rock.sprite.x = Math.cos(theta) * rock.r;
         rock.sprite.y = Math.sin(theta) * rock.r;
+        rock.sprite.rotation += rock.spin * dt;
         rock.sprite.scale.set(rock.scale * (0.92 + 0.08 * Math.sin(this.time * 1.7 + rock.theta)));
       }
     }

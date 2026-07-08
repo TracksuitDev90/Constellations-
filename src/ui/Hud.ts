@@ -179,7 +179,9 @@ export class Hud {
   }
 
   update(world: World): void {
-    const strengths = world.players.map((p) => world.totalGarrison(p.id));
+    // fleetStrength (not totalGarrison) so in-progress production counts
+    // fractionally — integer ticks made the share bars wobble at rest.
+    const strengths = world.players.map((p) => world.fleetStrength(p.id));
     const total = Math.max(1, strengths.reduce((a, b) => a + b, 0));
     for (let i = 0; i < this.bars.length; i++) {
       this.bars[i].style.width = `${((strengths[i] ?? 0) / total) * 100}%`;

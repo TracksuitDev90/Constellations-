@@ -2131,6 +2131,23 @@ export class World {
     }
     return t;
   }
+
+  /**
+   * Continuous strength for the HUD bar: totalGarrison plus each owned
+   * planet's fractional in-progress unit. Whole-unit production ticks land
+   * at different moments for each player, so a bar fed by the integer count
+   * visibly see-sawed every few seconds even when nobody made a move — the
+   * ratio jumped on every finished unit. Counting the accumulator makes both
+   * sides grow smoothly and the bar only shifts when relative strength
+   * actually changes.
+   */
+  fleetStrength(owner: number): number {
+    let t = this.totalGarrison(owner);
+    for (const p of this.planets) {
+      if (p.owner === owner) t += Math.min(1, Math.max(0, p.productionAcc));
+    }
+    return t;
+  }
 }
 
 const edgeKey = (a: number, b: number): string => (a < b ? `${a}-${b}` : `${b}-${a}`);

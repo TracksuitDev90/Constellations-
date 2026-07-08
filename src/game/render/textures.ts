@@ -317,7 +317,9 @@ const mulberry32 = (seed: number) => {
  *      within (star-forming pockets), lerped toward white.
  *   4. Dark dust lanes — near-black streaks laid OVER the bright mass, the
  *      signature look of Barnard-style absorption nebulae.
- *   5. A scatter of embedded stars glinting through the fog.
+ *   5. Grain — hundreds of tiny bright/dark motes clustered on the cloud
+ *      mass so the fog has a particulate, film-grain body.
+ *   6. A scatter of embedded stars glinting through the fog.
  *
  * Seeded so each match's sky can roll its own shapes.
  */
@@ -363,21 +365,33 @@ export const makeNebulaTexture = (
       }
     };
 
-    /** Soft radial blob — layered fills approximate a gaussian falloff. */
+    /**
+     * Soft radial blob — layered fills approximate a gaussian falloff. More
+     * layers + a gentler alpha curve than the original bake so each blob's
+     * edge diffuses further before dying out: the whole cloud reads blurrier
+     * without any filter cost.
+     */
     const blob = (x: number, y: number, radius: number, color: number, peak: number): void => {
-      const layers = 7;
+      const layers = 9;
       for (let k = layers; k > 0; k--) {
         const t = k / layers;
         g.circle(x, y, radius * t).fill({
           color,
-          alpha: Math.pow(1 - t, 1.5) * peak + 0.01,
+          alpha: Math.pow(1 - t, 1.35) * peak + 0.008,
         });
       }
     };
 
+    // Every blob center is remembered so the grain pass can seed its speckle
+    // where the cloud actually has mass instead of uniformly across the tile.
+    const grainAnchors: Array<{ x: number; y: number; r: number }> = [];
+
     // 1. Envelope: a short fat walk of big dim blobs — one connected mass.
+    // Radii up / peaks down versus the original bake = softer, hazier mass.
     walk(cx, cy, 18, [22, 46], 1.3, (x, y) => {
-      blob(x, y, 85 + rng() * 70, toward(colorA, colorB, rng() * 0.7), 0.3);
+      const r = 95 + rng() * 80;
+      blob(x, y, r, toward(colorA, colorB, rng() * 0.7), 0.24);
+      grainAnchors.push({ x, y, r: r * 0.6 });
     });
 
     // 2. Filaments: longer, tighter walks of small brighter blobs. Each
@@ -391,7 +405,8 @@ export const makeNebulaTexture = (
       const fy = cy + (rng() - 0.5) * 120;
       walk(fx, fy, 26 + Math.floor(rng() * 12), [9, 18], 0.9, (x, y) => {
         const col = toward(colorA, colorB, Math.min(1, bias + (rng() - 0.5) * 0.3));
-        blob(x, y, 14 + rng() * 22, col, 0.34);
+        blob(x, y, 18 + rng() * 26, col, 0.27);
+        grainAnchors.push({ x, y, r: 26 });
         if (rng() < 0.08) knotSpots.push({ x, y });
       });
     }
@@ -405,8 +420,8 @@ export const makeNebulaTexture = (
           ? knotSpots[Math.floor(rng() * knotSpots.length)]
           : { x: cx + (rng() - 0.5) * 160, y: cy + (rng() - 0.5) * 160 };
       const base = toward(colorA, colorB, rng());
-      blob(spot.x, spot.y, 26 + rng() * 22, toward(base, 0xffffff, 0.45), 0.3);
-      blob(spot.x, spot.y, 9 + rng() * 8, toward(base, 0xffffff, 0.8), 0.5);
+      blob(spot.x, spot.y, 30 + rng() * 24, toward(base, 0xffffff, 0.45), 0.25);
+      blob(spot.x, spot.y, 11 + rng() * 9, toward(base, 0xffffff, 0.8), 0.42);
     }
 
     // 4. Dark dust lanes: absorption streaks drawn over the glow. Normal
@@ -414,11 +429,38 @@ export const makeNebulaTexture = (
     const lanes = 1 + Math.floor(rng() * 2);
     for (let l = 0; l < lanes; l++) {
       walk(cx + (rng() - 0.5) * 140, cy + (rng() - 0.5) * 140, 18, [12, 24], 0.7, (x, y) => {
-        blob(x, y, 16 + rng() * 26, 0x04060c, 0.18);
+        blob(x, y, 20 + rng() * 30, 0x04060c, 0.15);
       });
     }
 
-    // 5. Embedded stars: pinpricks glinting through the fog.
+    // 5. Grain: a dense speckle of sub-2px motes clustered where the cloud
+    // has mass (anchored to the envelope/filament walk points). A mix of
+    // bright dust catching the light and dark absorbing flecks keeps the fog
+    // from reading as an airbrushed gradient — this is the film-grain body
+    // of the cloud, drawn crisp on top of the blurred blobs.
+    const grains = 750;
+    for (let i = 0; i < grains; i++) {
+      const anchor = grainAnchors[Math.floor(rng() * grainAnchors.length)] ?? {
+        x: cx,
+        y: cy,
+        r: 120,
+      };
+      // Sum of two rng()s biases the offset toward the anchor center.
+      const off = anchor.r * (rng() + rng() - 1);
+      const dir = rng() * Math.PI * 2;
+      const x = anchor.x + Math.cos(dir) * off;
+      const y = anchor.y + Math.sin(dir) * off;
+      const size = 0.35 + rng() * 0.95;
+      if (rng() < 0.3) {
+        // Dark fleck — occluding dust.
+        g.circle(x, y, size).fill({ color: 0x05070d, alpha: 0.05 + rng() * 0.1 });
+      } else {
+        const col = toward(toward(colorA, colorB, rng()), 0xffffff, rng() * 0.35);
+        g.circle(x, y, size).fill({ color: col, alpha: 0.05 + rng() * 0.11 });
+      }
+    }
+
+    // 6. Embedded stars: pinpricks glinting through the fog.
     const stars = 10 + Math.floor(rng() * 8);
     for (let s = 0; s < stars; s++) {
       const x = cx + (rng() - 0.5) * 280;

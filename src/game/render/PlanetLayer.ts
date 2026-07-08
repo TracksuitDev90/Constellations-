@@ -25,16 +25,20 @@ const orbiterCapFor = (maxUnitCapacity: number): number =>
   Math.max(32, Math.min(maxUnitCapacity * 2, HARD_ORBITER_CAP));
 /**
  * Seconds a newly-produced orbiter spends "being born" — ramping up from a
- * tiny scale at the planet center out to its ring slot. Long enough that the
- * player's eye reads production as a pump-out even on XXL worlds.
+ * tiny scale at the planet center out to its ring slot. Deliberately unhurried
+ * (production *rate* is unchanged; only the visual journey is longer) so each
+ * spawn reads as an intentional ejection rather than a pop-in, even on XXL
+ * worlds where the ring is always dense.
  */
-const ORBITER_BIRTH_DURATION = 0.55;
+const ORBITER_BIRTH_DURATION = 0.95;
 /**
  * Seconds a production pulse ring lingers on the planet surface after a unit
  * spawns. Drawn on top of the body so even when the orbit is already at cap
- * the player sees a steady "emitting" heartbeat from the planet.
+ * the player sees a steady "emitting" heartbeat from the planet. Kept close
+ * to the birth duration so the surface pulse and the emerging unit read as
+ * one event.
  */
-const PRODUCTION_PULSE_DURATION = 0.65;
+const PRODUCTION_PULSE_DURATION = 0.9;
 /** Major-axis radius of an atom-ring, as a multiple of planet radius. */
 const ORBIT_BAND_MAJOR = 1.85;
 /**
@@ -1021,6 +1025,16 @@ export class PlanetLayer extends Container {
     const minorR = majorR * squish;
     const ease = 1 - Math.exp(-dt * ORBIT_POS_EASE_RATE);
 
+    // Density bloom: the additive halos already stack where units overlap,
+    // but the read stayed subtle. Amplify both the strength and footprint of
+    // every halo as the garrison grows — quadratic in the fill fraction so a
+    // handful of units stays quiet while a significant swarm visibly burns —
+    // with extra overdrive for reinforcement stacks past the full-atom count.
+    const fill = Math.min(1, count / FULL_ATOM_COUNT);
+    const overdrive = Math.min(1, Math.max(0, count - FULL_ATOM_COUNT) / FULL_ATOM_COUNT);
+    const glowAlphaBoost = 1 + 1.1 * fill * fill + 0.5 * overdrive;
+    const glowScaleBoost = 1 + 0.55 * fill * fill + 0.35 * overdrive;
+
     for (let i = 0; i < count; i++) {
       const o = v.orbiters[i];
       o.wanderPhase += dt * 0.7;
@@ -1088,8 +1102,11 @@ export class PlanetLayer extends Container {
       o.glow.y = o.sprite.y;
       const glowFlicker = 0.65 + 0.35 * Math.sin(this.time * 3.1 + o.phase * 1.7);
       const breathe = 0.88 + 0.24 * this.beat;
-      o.glow.alpha = 0.55 * glowFlicker * breathe * (bp < 1 ? bp : 1);
-      o.glow.scale.set(o.glowScale * (bp < 1 ? 0.4 + 0.6 * bp : 1));
+      o.glow.alpha = Math.min(
+        1,
+        0.55 * glowFlicker * breathe * glowAlphaBoost * (bp < 1 ? bp : 1),
+      );
+      o.glow.scale.set(o.glowScale * glowScaleBoost * (bp < 1 ? 0.4 + 0.6 * bp : 1));
     }
   }
 

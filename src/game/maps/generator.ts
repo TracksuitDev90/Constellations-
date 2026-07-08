@@ -30,7 +30,13 @@ const MAP_HEIGHT = 1000;
 /** Per-match rejection-sampling range for minimum planet center distance. */
 const MIN_SEPARATION_RANGE: [number, number] = [200, 280];
 
-export type HazardKind = 'driftingPlanet' | 'asteroidField' | 'neutralSwarm' | 'blackHole';
+export type HazardKind =
+  | 'driftingPlanet'
+  | 'asteroidField'
+  | 'neutralSwarm'
+  | 'blackHole'
+  | 'flareStar'
+  | 'wormhole';
 
 /**
  * Map geography archetypes. Each rolls a different set of neutral placement
@@ -363,9 +369,28 @@ const rollHazardOfKind = (
   cfg: MapGenConfig,
   planets: PlanetDraft[],
   positions: ReadonlyArray<{ x: number; y: number; r: number }>,
+  existing: readonly HazardSpec[] = [],
 ): HazardSpec | null => {
   const starts = positions.slice(0, cfg.playerCount);
   const firstNeutral = cfg.playerCount;
+
+  /**
+   * Danger centers of already-rolled hazards. A second hazard's zone keeps
+   * its distance so the map never rolls e.g. a wormhole exit inside a flare
+   * star's blast radius — a trap the player couldn't have priced.
+   */
+  const hazardPoints: Array<{ x: number; y: number; reach: number }> = [];
+  for (const h of existing) {
+    if (h.type === 'flareStar') hazardPoints.push({ ...h.pos, reach: h.maxRadius });
+    else if (h.type === 'blackHole') hazardPoints.push({ ...h.pos, reach: h.gravityRadius });
+    else if (h.type === 'asteroidField') hazardPoints.push({ ...h.pos, reach: h.radius });
+    else if (h.type === 'wormhole') {
+      hazardPoints.push({ ...h.a, reach: h.radius * 2 });
+      hazardPoints.push({ ...h.b, reach: h.radius * 2 });
+    }
+  }
+  const clearOfHazards = (p: { x: number; y: number }, ownReach: number): boolean =>
+    hazardPoints.every((q) => Math.hypot(p.x - q.x, p.y - q.y) > q.reach + ownReach + 40);
 
   if (variant === 'driftingPlanet') {
     // Only neutral worlds drift — the start worlds stay anchored. Prefer a
@@ -447,7 +472,7 @@ const rollHazardOfKind = (
         const clearOfStarts = starts.every(
           (s) => Math.hypot(candidate.x - s.x, candidate.y - s.y) > 340,
         );
-        if (clearOfPlanets && clearOfStarts) {
+        if (clearOfPlanets && clearOfStarts && clearOfHazards(candidate, gravityRadius)) {
           // Dangerous riches: neutrals in the well's neighborhood gain a
           // ring. Attacking or holding them means flying the slingshot line
           // every time — a skill play with a fatal inner edge.
@@ -467,6 +492,79 @@ const rollHazardOfKind = (
         }
       }
       gravityRadius -= 15;
+    }
+    return null;
+  }
+
+  if (variant === 'flareStar') {
+    // A timing gate: the star claims a patch of contested sky and detonates
+    // on a readable rhythm. Crossing between pulses is free; sloppy crossings
+    // pay in ships. Placement stays clear of every planet (orbiters are safe
+    // anyway, but the star itself must not sit on top of a world) and far
+    // from the starts so nobody's early economy lives inside a blast zone.
+    const maxRadius = frange(150, 195);
+    for (let attempt = 0; attempt < 30; attempt++) {
+      const candidate = {
+        x: frange(MAP_WIDTH * 0.28, MAP_WIDTH * 0.72),
+        y: frange(MAP_HEIGHT * 0.3, MAP_HEIGHT * 0.7),
+      };
+      const clearOfPlanets = positions.every(
+        (p) => Math.hypot(candidate.x - p.x, candidate.y - p.y) > 130,
+      );
+      const clearOfStarts = starts.every(
+        (s) => Math.hypot(candidate.x - s.x, candidate.y - s.y) > 340,
+      );
+      if (!clearOfPlanets || !clearOfStarts || !clearOfHazards(candidate, maxRadius)) continue;
+      // Dangerous riches, same language as the black hole: neutrals inside
+      // the blast's neighborhood gain a ring — holding them means living
+      // with the star's rhythm on every reinforcement run.
+      let sweetened = 0;
+      for (let i = firstNeutral; i < planets.length && sweetened < 2; i++) {
+        const p = planets[i];
+        const d = Math.hypot(candidate.x - p.pos.x, candidate.y - p.pos.y);
+        if (d < maxRadius * 1.5 && addRing(p)) sweetened++;
+      }
+      return {
+        type: 'flareStar',
+        pos: candidate,
+        period: frange(7.5, 10),
+        waveSpeed: frange(130, 170),
+        maxRadius,
+        seed: Math.floor(Math.random() * 1e9),
+      };
+    }
+    return null;
+  }
+
+  if (variant === 'wormhole') {
+    // Pure mobility, no kill zone: two linked gates that fold the map. The
+    // pair spans a long diagonal of contested space so it genuinely rewires
+    // flight routes instead of shaving a corner — and it works for everyone,
+    // so camping your own gate exit is real strategy.
+    const radius = frange(24, 30);
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const a = {
+        x: frange(MAP_WIDTH * 0.15, MAP_WIDTH * 0.85),
+        y: frange(MAP_HEIGHT * 0.18, MAP_HEIGHT * 0.82),
+      };
+      const b = {
+        x: frange(MAP_WIDTH * 0.15, MAP_WIDTH * 0.85),
+        y: frange(MAP_HEIGHT * 0.18, MAP_HEIGHT * 0.82),
+      };
+      const span = Math.hypot(a.x - b.x, a.y - b.y);
+      if (span < 550 || span > 950) continue;
+      const clear = (m: { x: number; y: number }): boolean =>
+        positions.every((p) => Math.hypot(m.x - p.x, m.y - p.y) > 130) &&
+        starts.every((s) => Math.hypot(m.x - s.x, m.y - s.y) > 280) &&
+        clearOfHazards(m, radius * 2);
+      if (!clear(a) || !clear(b)) continue;
+      return {
+        type: 'wormhole',
+        a,
+        b,
+        radius,
+        seed: Math.floor(Math.random() * 1e9),
+      };
     }
     return null;
   }
@@ -539,6 +637,7 @@ const rollHazards = (
       cfg,
       planets,
       positions,
+      hazards,
     );
     if (second) hazards.push(second);
   }

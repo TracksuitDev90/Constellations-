@@ -288,6 +288,13 @@ export class BasicAI {
       if (d < bh.captureRadius + 30) penalty *= 0.25;
       else if (d < bh.gravityRadius) penalty *= 0.7;
     }
+    // A line through a flare star's blast zone loses whatever slice of the
+    // wave the next pulse catches — discounted, not banned, because timing
+    // through between pulses genuinely works.
+    for (const fs of this.world.flareStars) {
+      const d = pointToSegmentDist(fs.pos.x, fs.pos.y, from.x, from.y, to.x, to.y);
+      if (d < fs.maxRadius) penalty *= 0.75;
+    }
     return penalty;
   }
 
@@ -326,6 +333,26 @@ export class BasicAI {
       if (d > bh.captureRadius * (SLINGSHOT_INNER_MULT + 0.1) && d < bh.gravityRadius) {
         cost *= 0.92;
       }
+    }
+    // Flare stars: a chord through the blast zone risks eating a pulse, so
+    // reprice it like hostile territory — expensive but crossable.
+    for (const fs of this.world.flareStars) {
+      const inside = segCircleIntersectionLength(
+        from.x, from.y, to.x, to.y, fs.pos.x, fs.pos.y, fs.maxRadius,
+      );
+      if (inside > 0) cost += inside * 1.5;
+    }
+    // Wormholes: ships auto-route through a gate when it's shorter, so the
+    // AI prices the gate path too (entry leg + exit leg + a small transit
+    // tax) and takes whichever is cheaper — distant targets behind a gate
+    // suddenly read as neighbors, exactly as they do for the player.
+    for (const wh of this.world.wormholes) {
+      const via =
+        Math.min(
+          dist(from, wh.a) + dist(wh.b, to),
+          dist(from, wh.b) + dist(wh.a, to),
+        ) + 60;
+      if (via < cost) cost = via;
     }
     return cost;
   }

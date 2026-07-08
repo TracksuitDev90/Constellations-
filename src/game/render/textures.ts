@@ -269,10 +269,22 @@ export const makePlanetHaloTexture = (
   });
 };
 
-/** Simple starfield texture (tiled). */
-export const makeStarfieldTexture = (app: Application, size = 512): Texture => {
-  return makeGlowTexture(app, `stars:${size}`, (g) => {
-    g.rect(0, 0, size, size).fill({ color: 0x050810, alpha: 1 });
+/**
+ * Simple starfield texture (tiled). `opaque` bakes the deep-space backdrop
+ * color in; pass false for planes stacked ABOVE other art (the near parallax
+ * layer) — an opaque near plane at high alpha acts as a dark curtain over
+ * everything beneath it, which is what made the nebulae nearly invisible.
+ */
+export const makeStarfieldTexture = (
+  app: Application,
+  size = 512,
+  opaque = true,
+): Texture => {
+  return makeGlowTexture(app, `stars:${size}:${opaque ? 'o' : 't'}`, (g) => {
+    g.rect(0, 0, size, size).fill({
+      color: opaque ? 0x050810 : 0x000000,
+      alpha: opaque ? 1 : 0.001,
+    });
     const rng = mulberry32(0xc0ffee);
     for (let i = 0; i < size / 2; i++) {
       const x = rng() * size;
@@ -296,11 +308,18 @@ const mulberry32 = (seed: number) => {
 };
 
 /**
- * A wispy dust cloud for the background nebulae. Soft blobs are scattered
- * along a correlated random walk so the mass reads as one flowing cloud
- * rather than confetti; per-blob color lerps between the two palette
- * endpoints for gentle internal variation. Seeded so each match's sky can
- * roll its own shapes.
+ * A dust cloud for the background nebulae, layered the way real ones are:
+ *
+ *   1. A broad, dim molecular envelope — the diffuse outer mass.
+ *   2. Filaments — correlated random walks tracing wispy internal streamers,
+ *      like the pillars and tendrils in emission nebulae.
+ *   3. Emission knots — a few hot, bright cores where the cloud is lit from
+ *      within (star-forming pockets), lerped toward white.
+ *   4. Dark dust lanes — near-black streaks laid OVER the bright mass, the
+ *      signature look of Barnard-style absorption nebulae.
+ *   5. A scatter of embedded stars glinting through the fog.
+ *
+ * Seeded so each match's sky can roll its own shapes.
  */
 export const makeNebulaTexture = (
   app: Application,
@@ -314,32 +333,201 @@ export const makeNebulaTexture = (
     // though every blob is soft-edged.
     g.rect(0, 0, size, size).fill({ color: 0x000000, alpha: 0.001 });
     const rng = mulberry32(seed);
-    let x = size / 2;
-    let y = size / 2;
-    let dir = rng() * Math.PI * 2;
-    const blobs = 28 + Math.floor(rng() * 12);
     const margin = 96;
-    for (let i = 0; i < blobs; i++) {
-      dir += (rng() - 0.5) * 1.5;
-      const step = 16 + rng() * 30;
-      x += Math.cos(dir) * step;
-      y += Math.sin(dir) * step;
-      if (x < margin || x > size - margin || y < margin || y > size - margin) {
-        // Turn the walk back toward the middle so the cloud stays framed.
-        dir = Math.atan2(size / 2 - y, size / 2 - x) + (rng() - 0.5) * 0.8;
-        x = Math.min(Math.max(x, margin), size - margin);
-        y = Math.min(Math.max(y, margin), size - margin);
+    const cx = size / 2;
+    const cy = size / 2;
+
+    /** Correlated random walk; calls `draw` at every step. */
+    const walk = (
+      x0: number,
+      y0: number,
+      steps: number,
+      stepLen: [number, number],
+      turn: number,
+      draw: (x: number, y: number, t: number) => void,
+    ): void => {
+      let x = x0;
+      let y = y0;
+      let dir = rng() * Math.PI * 2;
+      for (let i = 0; i < steps; i++) {
+        dir += (rng() - 0.5) * turn;
+        x += Math.cos(dir) * (stepLen[0] + rng() * (stepLen[1] - stepLen[0]));
+        y += Math.sin(dir) * (stepLen[0] + rng() * (stepLen[1] - stepLen[0]));
+        if (x < margin || x > size - margin || y < margin || y > size - margin) {
+          // Turn the walk back toward the middle so the cloud stays framed.
+          dir = Math.atan2(cy - y, cx - x) + (rng() - 0.5) * 0.8;
+          x = Math.min(Math.max(x, margin), size - margin);
+          y = Math.min(Math.max(y, margin), size - margin);
+        }
+        draw(x, y, i / (steps - 1));
       }
-      const radius = 30 + rng() * 80;
-      const col = toward(colorA, colorB, rng());
-      const layers = 8 + Math.floor(rng() * 3);
+    };
+
+    /** Soft radial blob — layered fills approximate a gaussian falloff. */
+    const blob = (x: number, y: number, radius: number, color: number, peak: number): void => {
+      const layers = 7;
       for (let k = layers; k > 0; k--) {
         const t = k / layers;
         g.circle(x, y, radius * t).fill({
-          color: col,
-          alpha: Math.pow(1 - t, 1.5) * 0.14 + 0.015,
+          color,
+          alpha: Math.pow(1 - t, 1.5) * peak + 0.01,
         });
       }
+    };
+
+    // 1. Envelope: a short fat walk of big dim blobs — one connected mass.
+    walk(cx, cy, 18, [22, 46], 1.3, (x, y) => {
+      blob(x, y, 85 + rng() * 70, toward(colorA, colorB, rng() * 0.7), 0.3);
+    });
+
+    // 2. Filaments: longer, tighter walks of small brighter blobs. Each
+    // filament keeps its own color bias so the streamers read as distinct
+    // currents inside the same cloud.
+    const filaments = 3 + Math.floor(rng() * 2);
+    const knotSpots: Array<{ x: number; y: number }> = [];
+    for (let f = 0; f < filaments; f++) {
+      const bias = rng();
+      const fx = cx + (rng() - 0.5) * 120;
+      const fy = cy + (rng() - 0.5) * 120;
+      walk(fx, fy, 26 + Math.floor(rng() * 12), [9, 18], 0.9, (x, y) => {
+        const col = toward(colorA, colorB, Math.min(1, bias + (rng() - 0.5) * 0.3));
+        blob(x, y, 14 + rng() * 22, col, 0.34);
+        if (rng() < 0.08) knotSpots.push({ x, y });
+      });
+    }
+
+    // 3. Emission knots: hot pockets lit from within. Prefer spots the
+    // filaments actually passed through so the light sits inside the dust.
+    const knots = 3 + Math.floor(rng() * 3);
+    for (let k = 0; k < knots; k++) {
+      const spot =
+        knotSpots.length > 0
+          ? knotSpots[Math.floor(rng() * knotSpots.length)]
+          : { x: cx + (rng() - 0.5) * 160, y: cy + (rng() - 0.5) * 160 };
+      const base = toward(colorA, colorB, rng());
+      blob(spot.x, spot.y, 26 + rng() * 22, toward(base, 0xffffff, 0.45), 0.3);
+      blob(spot.x, spot.y, 9 + rng() * 8, toward(base, 0xffffff, 0.8), 0.5);
+    }
+
+    // 4. Dark dust lanes: absorption streaks drawn over the glow. Normal
+    // blending with near-black reads as occlusion — the classic rift look.
+    const lanes = 1 + Math.floor(rng() * 2);
+    for (let l = 0; l < lanes; l++) {
+      walk(cx + (rng() - 0.5) * 140, cy + (rng() - 0.5) * 140, 18, [12, 24], 0.7, (x, y) => {
+        blob(x, y, 16 + rng() * 26, 0x04060c, 0.18);
+      });
+    }
+
+    // 5. Embedded stars: pinpricks glinting through the fog.
+    const stars = 10 + Math.floor(rng() * 8);
+    for (let s = 0; s < stars; s++) {
+      const x = cx + (rng() - 0.5) * 280;
+      const y = cy + (rng() - 0.5) * 280;
+      const r = 0.5 + rng() * 1.1;
+      g.circle(x, y, r * 2.4).fill({ color: 0xdfe8ff, alpha: 0.1 });
+      g.circle(x, y, r).fill({ color: 0xffffff, alpha: 0.45 + rng() * 0.4 });
+    }
+  });
+};
+
+/**
+ * A small diffraction-spiked star used for the twinkling foreground layer:
+ * soft halo, four thin rays, hot core. Rendered additively and pulsed by
+ * the BackgroundLayer.
+ */
+export const makeTwinkleTexture = (app: Application): Texture => {
+  return makeGlowTexture(app, 'twinkle', (g) => {
+    const C = 12;
+    for (let i = 8; i > 0; i--) {
+      const t = i / 8;
+      g.circle(C, C, 7 * t).fill({ color: 0xdfe8ff, alpha: 0.05 * (1 - t) + 0.01 });
+    }
+    // Four diffraction rays — slim diamonds so the tips fade naturally.
+    g.poly([
+      { x: C - 9, y: C },
+      { x: C, y: C - 0.8 },
+      { x: C + 9, y: C },
+      { x: C, y: C + 0.8 },
+    ]).fill({ color: 0xffffff, alpha: 0.5 });
+    g.poly([
+      { x: C, y: C - 9 },
+      { x: C + 0.8, y: C },
+      { x: C, y: C + 9 },
+      { x: C - 0.8, y: C },
+    ]).fill({ color: 0xffffff, alpha: 0.5 });
+    g.circle(C, C, 1.5).fill({ color: 0xffffff, alpha: 1 });
+  });
+};
+
+/**
+ * A meteor streak: long fading tail, hot head at +x. The BackgroundLayer
+ * rotates it to the flight heading and slides it across the screen.
+ */
+export const makeShootingStarTexture = (app: Application): Texture => {
+  return makeGlowTexture(app, 'shooting-star', (g) => {
+    const L = 90;
+    const y = 5;
+    for (let i = 0; i < 26; i++) {
+      const t = i / 25;
+      g.circle(t * L, y, 0.4 + 2.2 * t).fill({
+        color: toward(0xbfd4ff, 0xffffff, t),
+        alpha: 0.02 + 0.3 * t * t * t,
+      });
+    }
+    g.circle(L, y, 4.6).fill({ color: 0xffffff, alpha: 0.2 });
+    g.circle(L, y, 2.4).fill({ color: 0xffffff, alpha: 1 });
+  });
+};
+
+/**
+ * A flare star's body: white-hot core inside a broad amber corona. The
+ * HazardLayer scales/brightens it against the charge fraction so the star
+ * visibly overloads before every detonation.
+ */
+export const makeFlareStarTexture = (app: Application): Texture => {
+  return makeGlowTexture(app, 'flare-star', (g) => {
+    const R = 28;
+    for (let i = 20; i > 0; i--) {
+      const t = i / 20;
+      g.circle(R, R, R * t).fill({
+        color: toward(0xffd9a0, 0xff7830, t),
+        alpha: 0.06 * (1 - t) + 0.008,
+      });
+    }
+    g.circle(R, R, 5.5).fill({ color: 0xffd9a0, alpha: 1 });
+    g.circle(R, R, 3.2).fill({ color: 0xfff6e0, alpha: 1 });
+  });
+};
+
+/**
+ * A wormhole mouth: violet-to-cyan spiral arms winding into a dark throat,
+ * with a crisp cyan rim. The HazardLayer stacks two counter-rotating copies
+ * so the gate visibly churns.
+ */
+export const makeWormholeTexture = (app: Application, seed: number): Texture => {
+  return makeGlowTexture(app, `wormhole:${seed}`, (g) => {
+    const R = 30;
+    g.rect(0, 0, R * 2, R * 2).fill({ color: 0x000000, alpha: 0.001 });
+    const rng = mulberry32(seed || 1);
+    const arms = 3;
+    for (let a = 0; a < arms; a++) {
+      const phase = (a / arms) * Math.PI * 2 + rng() * 0.5;
+      for (let k = 0; k < 22; k++) {
+        const t = k / 22;
+        const r = R * (0.24 + 0.72 * (1 - t));
+        const a0 = phase + t * 3.4;
+        g.arc(R, R, r, a0, a0 + 0.9 - t * 0.3).stroke({
+          width: 1.2 + 1.4 * t,
+          color: toward(0x6f5bd8, 0x9adcff, t),
+          alpha: 0.14 + 0.3 * t,
+        });
+      }
+    }
+    g.circle(R, R, R * 0.97).stroke({ width: 1.6, color: 0x9adcff, alpha: 0.65 });
+    // Dark throat — the gate should read as a hole, not a disc.
+    for (let i = 6; i > 0; i--) {
+      const t = i / 6;
+      g.circle(R, R, R * 0.24 * t).fill({ color: 0x050310, alpha: 0.35 });
     }
   });
 };

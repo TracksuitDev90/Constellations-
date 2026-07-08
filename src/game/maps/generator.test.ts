@@ -140,6 +140,48 @@ describe('hazard–reward coupling', () => {
     expect(sawTreasure).toBe(true);
   });
 
+  it('flare stars land in contested space, clear of every planet', () => {
+    let sawFlare = false;
+    for (let run = 0; run < 60 && !sawFlare; run++) {
+      const map = generateMap(baseCfg({ hazardPool: ['flareStar'], calmChance: 0 }));
+      for (const h of map.hazards ?? []) {
+        if (h.type !== 'flareStar') continue;
+        sawFlare = true;
+        expect(h.period).toBeGreaterThan(0);
+        expect(h.waveSpeed).toBeGreaterThan(0);
+        expect(h.maxRadius).toBeGreaterThan(100);
+        for (const p of map.planets) {
+          expect(
+            Math.hypot(h.pos.x - p.pos.x, h.pos.y - p.pos.y),
+          ).toBeGreaterThan(100);
+        }
+      }
+    }
+    expect(sawFlare).toBe(true);
+  });
+
+  it('wormhole gates span a long diagonal with both mouths clear of planets', () => {
+    let sawGate = false;
+    for (let run = 0; run < 60 && !sawGate; run++) {
+      const map = generateMap(baseCfg({ hazardPool: ['wormhole'], calmChance: 0 }));
+      for (const h of map.hazards ?? []) {
+        if (h.type !== 'wormhole') continue;
+        sawGate = true;
+        const span = Math.hypot(h.a.x - h.b.x, h.a.y - h.b.y);
+        expect(span).toBeGreaterThanOrEqual(550);
+        expect(span).toBeLessThanOrEqual(950);
+        for (const mouth of [h.a, h.b]) {
+          for (const p of map.planets) {
+            expect(
+              Math.hypot(mouth.x - p.pos.x, mouth.y - p.pos.y),
+            ).toBeGreaterThan(100);
+          }
+        }
+      }
+    }
+    expect(sawGate).toBe(true);
+  });
+
   it('drifting planets are always worth chasing (ringed)', () => {
     for (let run = 0; run < 40; run++) {
       const map = generateMap(

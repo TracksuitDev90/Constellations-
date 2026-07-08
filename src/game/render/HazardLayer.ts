@@ -1,12 +1,14 @@
 import { Application, Container, Graphics, Sprite, Texture } from 'pixi.js';
-import type { World, AsteroidField, BlackHole } from '../sim/World.js';
+import type { World, AsteroidField, BlackHole, FlareStar, Wormhole } from '../sim/World.js';
 import {
   BH_TEXTURE_HORIZON,
   makeAccretionDiskTexture,
   makeEngineFlareTexture,
+  makeFlareStarTexture,
   makeHostileShipTexture,
   makeLensHaloTexture,
   makeShipGlowTexture,
+  makeWormholeTexture,
 } from './textures.js';
 
 /**
@@ -58,6 +60,24 @@ interface BlackHoleVisual {
   particles: InfallParticle[];
 }
 
+interface FlareStarVisual {
+  star: FlareStar;
+  core: Sprite;
+  /** Redrawn each frame while a shockwave is live. */
+  wave: Graphics;
+  /** Dotted blast-reach boundary; brightens as the charge builds. */
+  boundary: Graphics;
+  baseScale: number;
+}
+
+interface WormholeMouthVisual {
+  swirl: Sprite;
+  counterSwirl: Sprite;
+  /** Spin direction — the two mouths of a pair churn opposite ways. */
+  dir: number;
+  phase: number;
+}
+
 const NEUTRAL_GLOW = 0x2f8a1d; // Green is reserved for the swarm — no player palette uses it.
 
 const ROCK_DENSITY = 1 / 1800; // rocks per square pixel of zone area.
@@ -82,9 +102,13 @@ export class HazardLayer extends Container {
   private asteroidVisuals: AsteroidVisual[] = [];
   private neutralVisuals: NeutralVisual[] = [];
   private blackHoleVisuals: BlackHoleVisual[] = [];
+  private flareVisuals: FlareStarVisual[] = [];
+  private wormholeVisuals: WormholeMouthVisual[] = [];
   private neutralRoot: Container;
   private asteroidRoot: Container;
   private blackHoleRoot: Container;
+  private flareRoot: Container;
+  private wormholeRoot: Container;
   private time = 0;
 
   constructor(app: Application, world: World) {
@@ -95,9 +119,13 @@ export class HazardLayer extends Container {
     this.engineTex = makeEngineFlareTexture(app);
     this.asteroidRoot = new Container();
     this.blackHoleRoot = new Container();
+    this.flareRoot = new Container();
+    this.wormholeRoot = new Container();
     this.neutralRoot = new Container();
     this.addChild(this.asteroidRoot);
     this.addChild(this.blackHoleRoot);
+    this.addChild(this.flareRoot);
+    this.addChild(this.wormholeRoot);
     this.addChild(this.neutralRoot);
 
     for (const f of world.asteroidFields) {
@@ -105,6 +133,86 @@ export class HazardLayer extends Container {
     }
     for (const bh of world.blackHoles) {
       this.blackHoleRoot.addChild(this.buildBlackHoleVisual(app, bh));
+    }
+    for (const fs of world.flareStars) {
+      this.flareRoot.addChild(this.buildFlareStarVisual(app, fs));
+    }
+    for (const wh of world.wormholes) {
+      this.buildWormholeVisuals(app, wh);
+    }
+  }
+
+  /**
+   * A flare star: dotted blast boundary (the standard danger telegraph),
+   * an amber core that overloads visibly as its charge builds, and a
+   * Graphics ring redrawn per frame while the shockwave runs.
+   */
+  private buildFlareStarVisual(app: Application, star: FlareStar): Container {
+    const root = new Container();
+    root.x = star.pos.x;
+    root.y = star.pos.y;
+
+    const boundary = new Graphics();
+    const segs = 90;
+    for (let i = 0; i < segs; i++) {
+      if (i % 2 === 0) continue;
+      const a0 = (i / segs) * Math.PI * 2;
+      const a1 = ((i + 1) / segs) * Math.PI * 2;
+      boundary
+        .arc(0, 0, star.maxRadius, a0, a1)
+        .stroke({ width: 1.5, color: 0xd88a4a, alpha: 0.3 });
+    }
+    root.addChild(boundary);
+
+    const wave = new Graphics();
+    wave.blendMode = 'add';
+    root.addChild(wave);
+
+    const core = new Sprite(makeFlareStarTexture(app));
+    core.anchor.set(0.5);
+    core.blendMode = 'add';
+    const baseScale = 1.7;
+    core.scale.set(baseScale);
+    root.addChild(core);
+
+    this.flareVisuals.push({ star, core, wave, boundary, baseScale });
+    return root;
+  }
+
+  /**
+   * A wormhole pair: each mouth is two counter-rotating copies of the same
+   * spiral texture (churn without shaders), spinning opposite ways at the
+   * two ends so the pair reads as entrance/exit of one tunnel.
+   */
+  private buildWormholeVisuals(app: Application, wh: Wormhole): void {
+    const tex = makeWormholeTexture(app, wh.seed);
+    const mouths: Array<{ pos: { x: number; y: number }; dir: number }> = [
+      { pos: wh.a, dir: 1 },
+      { pos: wh.b, dir: -1 },
+    ];
+    for (const m of mouths) {
+      const root = new Container();
+      root.x = m.pos.x;
+      root.y = m.pos.y;
+      const scale = wh.radius / 30; // texture baked at R = 30
+      const swirl = new Sprite(tex);
+      swirl.anchor.set(0.5);
+      swirl.blendMode = 'add';
+      swirl.scale.set(scale);
+      const counterSwirl = new Sprite(tex);
+      counterSwirl.anchor.set(0.5);
+      counterSwirl.blendMode = 'add';
+      counterSwirl.scale.set(-scale * 0.72, scale * 0.72);
+      counterSwirl.alpha = 0.7;
+      root.addChild(swirl);
+      root.addChild(counterSwirl);
+      this.wormholeRoot.addChild(root);
+      this.wormholeVisuals.push({
+        swirl,
+        counterSwirl,
+        dir: m.dir,
+        phase: Math.random() * Math.PI * 2,
+      });
     }
   }
 
@@ -287,6 +395,47 @@ export class HazardLayer extends Container {
         p.dot.y = Math.sin(p.theta) * p.r;
         p.dot.alpha = 0.2 + 0.55 * (1 - p.r / hole.gravityRadius);
       }
+    }
+
+    // Flare stars: the core pulses faster and swells as charge builds (the
+    // telegraph), the dotted boundary brightens with it, and a live wave is
+    // drawn as three trailing rings that fade toward the blast's edge.
+    for (const v of this.flareVisuals) {
+      const fs = v.star;
+      if (fs.waveRadius >= 0) {
+        v.core.alpha = 1;
+        v.core.scale.set(v.baseScale * 1.5);
+        v.boundary.alpha = 1;
+        v.wave.clear();
+        const r = fs.waveRadius;
+        const fade = 1 - (r / fs.maxRadius) * 0.65;
+        v.wave.circle(0, 0, r).stroke({ width: 3, color: 0xfff1d0, alpha: 0.85 * fade });
+        if (r > 8) {
+          v.wave.circle(0, 0, r - 6).stroke({ width: 2, color: 0xffb060, alpha: 0.4 * fade });
+        }
+        if (r > 16) {
+          v.wave
+            .circle(0, 0, r - 13)
+            .stroke({ width: 1.5, color: 0xff7830, alpha: 0.2 * fade });
+        }
+      } else {
+        v.wave.clear();
+        const c = fs.charge / fs.period;
+        const pulse = 0.5 + 0.5 * Math.sin(this.time * (2 + 10 * c * c));
+        v.core.alpha = 0.65 + 0.35 * c * (0.6 + 0.4 * pulse);
+        v.core.scale.set(v.baseScale * (1 + 0.4 * c + 0.12 * pulse * c));
+        v.boundary.alpha = 0.6 + 0.8 * c;
+      }
+    }
+
+    // Wormholes: churn the spirals (mouths of a pair rotate opposite ways)
+    // and let the whole gate breathe slowly.
+    for (const v of this.wormholeVisuals) {
+      v.swirl.rotation += dt * 0.9 * v.dir;
+      v.counterSwirl.rotation -= dt * 1.5 * v.dir;
+      const breathe = 0.82 + 0.18 * Math.sin(this.time * 1.7 + v.phase);
+      v.swirl.alpha = breathe;
+      v.counterSwirl.alpha = 0.7 * breathe;
     }
 
     // Sync neutral ship visuals to the live entity list. New entities

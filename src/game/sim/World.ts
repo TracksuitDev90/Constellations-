@@ -68,6 +68,17 @@ export interface MapSpec {
  *     the event horizon. The outer band doubles as a slingshot lane — ships
  *     riding it fly meaningfully faster — so the hardest hazard is also the
  *     boldest shortcut.
+ *   - flareStar: a volatile star that detonates every `period` seconds,
+ *     sending a shockwave from its core out to `maxRadius` at `waveSpeed`.
+ *     The wavefront destroys every free-flying ship it sweeps (orbiting
+ *     garrisons are sheltered by their planet). The blast is telegraphed —
+ *     the star visibly overcharges before it pops — so crossing the zone is
+ *     a timing game: dart through between pulses or pay in ships.
+ *   - wormhole: a linked pair of gates at `a` and `b`. A transit ship that
+ *     flies into either mouth is thrown out of the other, keeping its
+ *     heading. Ships automatically route through a gate whenever the gate
+ *     path is meaningfully shorter than the direct line — for every player,
+ *     so a wormhole is both your shortcut and the enemy's flank route.
  */
 export type HazardSpec =
   | { type: 'driftingPlanet'; planetId: number; vx: number; vy: number }
@@ -80,7 +91,16 @@ export type HazardSpec =
       seed: number;
       guardPlanetId?: number;
     }
-  | { type: 'blackHole'; pos: Vec2; horizonRadius: number; gravityRadius: number; seed: number };
+  | { type: 'blackHole'; pos: Vec2; horizonRadius: number; gravityRadius: number; seed: number }
+  | {
+      type: 'flareStar';
+      pos: Vec2;
+      period: number;
+      waveSpeed: number;
+      maxRadius: number;
+      seed: number;
+    }
+  | { type: 'wormhole'; a: Vec2; b: Vec2; radius: number; seed: number };
 
 export interface AsteroidField {
   pos: Vec2;
@@ -103,6 +123,29 @@ export interface BlackHole {
   seed: number;
 }
 
+export interface FlareStar {
+  pos: Vec2;
+  /** Seconds of charge-up between detonations. */
+  period: number;
+  /** Shockwave expansion speed (px/s). */
+  waveSpeed: number;
+  /** Blast reach — the wave dies here and the star begins recharging. */
+  maxRadius: number;
+  seed: number;
+  /** Charge accumulated toward the next detonation (renderer reads this). */
+  charge: number;
+  /** Current shockwave radius, or -1 while the star is recharging. */
+  waveRadius: number;
+}
+
+export interface Wormhole {
+  a: Vec2;
+  b: Vec2;
+  /** Mouth radius — a transit ship inside either mouth is warped. */
+  radius: number;
+  seed: number;
+}
+
 export interface WorldEvents {
   onShipLaunch?: (owner: number) => void;
   onPlanetCapture?: (planetId: number, newOwner: number) => void;
@@ -120,6 +163,10 @@ export interface WorldEvents {
   onNeutralDeath?: (x: number, y: number) => void;
   /** Fired when a ship finishes its doomed spiral and crosses a black hole's horizon. */
   onShipConsumed?: (owner: number, x: number, y: number) => void;
+  /** Fired when a flare star detonates (start of a shockwave). */
+  onFlareDetonate?: (x: number, y: number) => void;
+  /** Fired when a ship rides a wormhole. Carries entry and exit points. */
+  onShipWarp?: (owner: number, fromX: number, fromY: number, toX: number, toY: number) => void;
   /**
    * Fired every time an absorbed unit ticks up a ring's fill counter. Distinct
    * from `onRingFilled` which only fires on the final unit that completes the ring.
@@ -201,6 +248,18 @@ const DOOM_INFALL_ACCEL = 30;
 const DOOM_SPIN_BASE = 1.4;
 const DOOM_SPIN_ACCEL = 3.4;
 
+/**
+ * Wormhole tuning. The cooldown keeps a freshly-warped ship from being
+ * re-swallowed while it clears the exit mouth; the detour margin is how many
+ * pixels of path a gate must actually save before a transit ship bothers
+ * steering into it — without it, near-tie routes make waves split and dither.
+ */
+export const WARP_COOLDOWN = 1.5;
+const WORMHOLE_EXIT_PAD = 8;
+const WORMHOLE_DETOUR_MARGIN = 60;
+/** Extra sweep slack (px) behind the flare wavefront so no ship slips between frames. */
+const FLARE_WAVE_PAD = 2;
+
 /** True when the planet still has something absorb can usefully fill. */
 const canAbsorb = (p: Planet): boolean =>
   p.ringCount > 0 || p.health < p.maxHealth;
@@ -241,6 +300,10 @@ export class World {
   asteroidFields: AsteroidField[] = [];
   /** Gravity wells from the `blackHole` hazard; consulted by every flight pass. */
   blackHoles: BlackHole[] = [];
+  /** Periodic shockwave stars from the `flareStar` hazard. */
+  flareStars: FlareStar[] = [];
+  /** Linked gate pairs from the `wormhole` hazard. */
+  wormholes: Wormhole[] = [];
   /** Pool of green hostile units spawned by the `neutralSwarm` hazard. */
   neutrals: NeutralPool = new NeutralPool();
   time = 0;
@@ -371,6 +434,25 @@ export class World {
           horizonRadius: h.horizonRadius,
           gravityRadius: h.gravityRadius,
           captureRadius: h.horizonRadius * BLACK_HOLE_CAPTURE_MULT,
+          seed: h.seed,
+        });
+      } else if (h.type === 'flareStar') {
+        this.flareStars.push({
+          pos: { ...h.pos },
+          period: h.period,
+          waveSpeed: h.waveSpeed,
+          maxRadius: h.maxRadius,
+          seed: h.seed,
+          // Stagger the opening charge off the seed so twin stars never sync
+          // and the first blast isn't instant.
+          charge: ((h.seed % 997) / 997) * h.period * 0.6,
+          waveRadius: -1,
+        });
+      } else if (h.type === 'wormhole') {
+        this.wormholes.push({
+          a: { ...h.a },
+          b: { ...h.b },
+          radius: h.radius,
           seed: h.seed,
         });
       }
@@ -668,6 +750,7 @@ export class World {
       const ship = ships[i];
       if (!ship.active) continue;
       ship.age += dt;
+      if (ship.warpCooldown > 0) ship.warpCooldown -= dt;
       if (ship.state === 'orbiting') this.stepOrbiting(i, ship, dt);
       else if (ship.state === 'absorbing') this.stepAbsorbing(i, ship, dt);
       else if (ship.state === 'hovering') this.stepHovering(ship, dt, ships);
@@ -677,6 +760,9 @@ export class World {
 
     // Mid-flight combat: enemy streams that cross destroy each other 1:1.
     this.stepShipCombat();
+
+    // Flare stars: advance charge timers and sweep any active shockwaves.
+    this.stepFlareStars(dt);
 
     // Neutral hostile pass — wandering green units that attack any ship in
     // range regardless of owner, and never capture planets.
@@ -1451,8 +1537,24 @@ export class World {
         return;
       }
     }
-    const dx = targetX - ship.x;
-    const dy = targetY - ship.y;
+    // Wormhole routing: when a gate path is meaningfully shorter than the
+    // straight line, seek the gate mouth instead of the target. The arrival
+    // checks above still run against the true target, so a ship that has
+    // already warped just flies its final leg normally.
+    let seekX = targetX;
+    let seekY = targetY;
+    let seekingGate = false;
+    if (this.wormholes.length > 0 && ship.warpCooldown <= 0) {
+      const gate = this.wormholeEntranceFor(ship.x, ship.y, targetX, targetY);
+      if (gate) {
+        seekX = gate.x;
+        seekY = gate.y;
+        seekingGate = true;
+      }
+    }
+
+    const dx = seekX - ship.x;
+    const dy = seekY - ship.y;
     const d = Math.hypot(dx, dy);
 
     // Seek (Arrive): force toward the target, slowing near arrival.
@@ -1546,12 +1648,14 @@ export class World {
         return;
       }
     }
-    if (step >= d) {
+    if (step >= d && !seekingGate) {
       if (tgt) this.arrive(idx, tgt);
       else this.beginHover(ship);
     } else {
       ship.x += ship.vx * dt;
       ship.y += ship.vy * dt;
+      // Wormhole first: a ship that flew into a mouth is elsewhere now.
+      if (this.applyWormholes(ship)) return;
       // Gravity last, after the speed cap and integration — a ship at full
       // steering authority still accumulates inward drift it cannot cancel,
       // which is what makes flying near the well genuinely costly.
@@ -1624,6 +1728,114 @@ export class World {
       this.events.onShipConsumed?.(ship.owner, ship.x, ship.y);
       this.ships.kill(idx);
     }
+  }
+
+  /**
+   * Flare star pass. While recharging, the star accumulates `charge`; at
+   * `period` it detonates (event for audio/FX) and the shockwave expands at
+   * `waveSpeed` until `maxRadius`. Each tick the wave kills everything
+   * free-flying — transit and hovering ships plus live neutral hostiles —
+   * inside the annulus it swept this frame. Orbiting and absorbing units are
+   * sheltered by their planet, and doomed ships are already lost to the
+   * black hole, so the blast is purely a transit-timing hazard: the map is
+   * safe if you respect the star's rhythm.
+   */
+  private stepFlareStars(dt: number): void {
+    for (const fs of this.flareStars) {
+      if (fs.waveRadius < 0) {
+        fs.charge += dt;
+        if (fs.charge >= fs.period) {
+          fs.charge = 0;
+          fs.waveRadius = 0;
+          this.events.onFlareDetonate?.(fs.pos.x, fs.pos.y);
+        }
+        continue;
+      }
+      const prev = fs.waveRadius;
+      fs.waveRadius = Math.min(fs.maxRadius, fs.waveRadius + fs.waveSpeed * dt);
+      const lo = Math.max(0, prev - FLARE_WAVE_PAD);
+      const lo2 = lo * lo;
+      const hi2 = fs.waveRadius * fs.waveRadius;
+      const ships = this.ships.all;
+      for (let i = 0; i < ships.length; i++) {
+        const s = ships[i];
+        if (!s.active) continue;
+        if (s.state !== 'transit' && s.state !== 'hovering') continue;
+        const dx = s.x - fs.pos.x;
+        const dy = s.y - fs.pos.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < lo2 || d2 > hi2) continue;
+        this.events.onShipDeath?.(s.owner, s.x, s.y);
+        this.ships.kill(i);
+      }
+      const neutrals = this.neutrals.all;
+      for (let i = 0; i < neutrals.length; i++) {
+        const n = neutrals[i];
+        if (!n.active || n.state === 'doomed') continue;
+        const dx = n.x - fs.pos.x;
+        const dy = n.y - fs.pos.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < lo2 || d2 > hi2) continue;
+        this.events.onNeutralDeath?.(n.x, n.y);
+        this.neutrals.kill(i);
+      }
+      if (fs.waveRadius >= fs.maxRadius) fs.waveRadius = -1;
+    }
+  }
+
+  /**
+   * The wormhole gate (if any) a transit ship at (x, y) headed for (tx, ty)
+   * should fly into instead of the direct line. A gate qualifies only when
+   * entry-mouth + exit-leg beats the direct distance by a real margin —
+   * near-ties would make a wave dither between routes mid-flight.
+   */
+  private wormholeEntranceFor(x: number, y: number, tx: number, ty: number): Vec2 | null {
+    let best: Vec2 | null = null;
+    let bestCost = Math.hypot(tx - x, ty - y) - WORMHOLE_DETOUR_MARGIN;
+    for (const wh of this.wormholes) {
+      const ends: Array<[Vec2, Vec2]> = [
+        [wh.a, wh.b],
+        [wh.b, wh.a],
+      ];
+      for (const [enter, exit] of ends) {
+        const c =
+          Math.hypot(enter.x - x, enter.y - y) + Math.hypot(tx - exit.x, ty - exit.y);
+        if (c < bestCost) {
+          bestCost = c;
+          best = enter;
+        }
+      }
+    }
+    return best;
+  }
+
+  /**
+   * Warp `ship` if it sits inside a wormhole mouth: throw it out of the twin
+   * mouth along its current heading and start the re-entry cooldown. Returns
+   * true when the ship was warped this tick.
+   */
+  private applyWormholes(ship: Ship): boolean {
+    if (ship.warpCooldown > 0) return false;
+    for (const wh of this.wormholes) {
+      const ends: Array<[Vec2, Vec2]> = [
+        [wh.a, wh.b],
+        [wh.b, wh.a],
+      ];
+      for (const [enter, exit] of ends) {
+        const dx = ship.x - enter.x;
+        const dy = ship.y - enter.y;
+        if (dx * dx + dy * dy > wh.radius * wh.radius) continue;
+        const fromX = ship.x;
+        const fromY = ship.y;
+        const vm = Math.hypot(ship.vx, ship.vy) || 1;
+        ship.x = exit.x + (ship.vx / vm) * (wh.radius + WORMHOLE_EXIT_PAD);
+        ship.y = exit.y + (ship.vy / vm) * (wh.radius + WORMHOLE_EXIT_PAD);
+        ship.warpCooldown = WARP_COOLDOWN;
+        this.events.onShipWarp?.(ship.owner, fromX, fromY, ship.x, ship.y);
+        return true;
+      }
+    }
+    return false;
   }
 
   /**

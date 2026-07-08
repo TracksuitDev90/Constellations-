@@ -56,6 +56,98 @@ describe('black hole slingshot', () => {
   });
 });
 
+describe('flare star', () => {
+  const flareMap: MapSpec = {
+    width: 800,
+    height: 400,
+    planets: [
+      { pos: { x: 60, y: 200 }, radius: 16, owner: 0, garrison: 30 },
+      { pos: { x: 740, y: 200 }, radius: 16, owner: null, garrison: 5 },
+    ],
+    edges: [[0, 1]],
+    hazards: [
+      {
+        type: 'flareStar',
+        pos: { x: 400, y: 200 },
+        period: 2,
+        waveSpeed: 220,
+        maxRadius: 160,
+        seed: 7,
+      },
+    ],
+  };
+
+  it('sweeps free-flying ships crossing the blast zone', () => {
+    let deaths = 0;
+    const w = new World(flareMap, players, {
+      onShipDeath: () => deaths++,
+    });
+    for (const p of w.planets) p.productionRate = 0;
+    // The direct line from planet 0 to 1 runs straight through the star; the
+    // crossing takes far longer than one period, so every ship eats a pulse.
+    w.openStream(0, 0, 1, 20);
+    for (let i = 0; i < 900; i++) w.step(1 / 30);
+    expect(deaths).toBeGreaterThan(0);
+    expect(w.planets[1].owner).toBeNull();
+  });
+
+  it('never touches orbiting garrisons', () => {
+    const shelteredMap: MapSpec = {
+      ...flareMap,
+      // Planet parked INSIDE the blast radius — orbiters must survive.
+      planets: [{ pos: { x: 470, y: 200 }, radius: 16, owner: 0, garrison: 5 }],
+      edges: [],
+    };
+    const w = new World(shelteredMap, players);
+    for (const p of w.planets) p.productionRate = 0;
+    expect(w.ships.activeCount()).toBe(5);
+    for (let i = 0; i < 10 * 30; i++) w.step(1 / 30);
+    expect(w.ships.activeCount()).toBe(5);
+  });
+});
+
+describe('wormholes', () => {
+  const gateMap: MapSpec = {
+    width: 1300,
+    height: 400,
+    planets: [
+      { pos: { x: 60, y: 200 }, radius: 16, owner: 0, garrison: 30 },
+      { pos: { x: 1240, y: 200 }, radius: 16, owner: null, garrison: 3 },
+    ],
+    edges: [[0, 1]],
+    hazards: [
+      {
+        type: 'wormhole',
+        a: { x: 200, y: 200 },
+        b: { x: 1100, y: 200 },
+        radius: 28,
+        seed: 11,
+      },
+    ],
+  };
+
+  it('warps transit ships through the gate and fires onShipWarp', () => {
+    let warps = 0;
+    const w = new World(gateMap, players, {
+      onShipWarp: () => warps++,
+    });
+    for (const p of w.planets) p.productionRate = 0;
+    w.openStream(0, 0, 1, 10);
+    for (let i = 0; i < 10 * 30; i++) w.step(1 / 30);
+    expect(warps).toBeGreaterThan(0);
+  });
+
+  it('lets a wave capture a far target much faster than direct flight', () => {
+    const w = new World(gateMap, players);
+    for (const p of w.planets) p.productionRate = 0;
+    // Direct flight is ~1180px ≈ 24.5s at SHIP_SPEED; via the gate it's
+    // under 300px of real flying. 12 seconds is only enough with the warp.
+    w.openStream(0, 0, 1, 20);
+    for (let i = 0; i < 12 * 30; i++) w.step(1 / 30);
+    expect(w.planets[1].owner).toBe(0);
+  });
+});
+
 describe('guardian swarms', () => {
   const guardedMap: MapSpec = {
     width: 600,

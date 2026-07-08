@@ -69,6 +69,11 @@ export interface Ship {
   doomRadius: number;
   /** Spiral direction (+1 CCW / -1 CW), chosen from approach tangent. */
   doomDir: number;
+  /**
+   * Seconds until this ship may ride a wormhole again. Set on every warp so a
+   * ship exiting one mouth can't be instantly re-swallowed by it.
+   */
+  warpCooldown: number;
 }
 
 export interface SpawnOptions {
@@ -138,6 +143,7 @@ export class ShipPool {
       s.doomAngle = 0;
       s.doomRadius = 0;
       s.doomDir = 1;
+      s.warpCooldown = 0;
       return idx;
     }
     const ship: Ship = {
@@ -167,6 +173,7 @@ export class ShipPool {
       doomAngle: 0,
       doomRadius: 0,
       doomDir: 1,
+      warpCooldown: 0,
     };
     this.ships.push(ship);
     return this.ships.length - 1;

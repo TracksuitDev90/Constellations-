@@ -9,7 +9,7 @@ import { ringCapacity, type Planet } from './sim/Planet.js';
 import { loadPlanetAssets } from './render/planetAssets.js';
 import { assignPlanetArchetypes } from './render/textures.js';
 import { Renderer } from './render/Renderer.js';
-import { World } from './sim/World.js';
+import { ORBIT_RADIUS_MULT, World } from './sim/World.js';
 import { Hud } from '../ui/Hud.js';
 import { showOverlay } from '../ui/Overlay.js';
 import { Tutorial, tutorialCompleted } from '../ui/Tutorial.js';
@@ -244,6 +244,11 @@ export class Game {
       (window as unknown as { __world?: World }).__world = this.world;
     }
 
+    // Every match spins a fresh track — ice, fire, or rock space — never the
+    // same one twice in a row. The roll re-instruments the live ambient bed
+    // in place, so replays feel like a new movement rather than a loop.
+    this.audio.rollMusicTheme();
+
     // Matches with a black hole get a dedicated dark drone under the ambient
     // bed; hole-free matches must not carry it over from a previous game.
     this.audio.setBlackHolePresence(this.world.blackHoles.length > 0);
@@ -253,8 +258,9 @@ export class Game {
       (cfg, i) => new BasicAI(this.world, i + 1, cfg, level.personalities?.[i]),
     );
 
-    this.input = new Input(this.app.canvas as unknown as HTMLCanvasElement, this.renderer, this.world, {
-      tapPlanet: (id) => {
+    // Named handler so the empty-space callback can reroute near-miss taps
+    // (a tap on a planet's visible swarm band) into the planet tap cycle.
+    const tapPlanetHandler = (id: number): void => {
         const p = this.world.planets[id];
         const hasPlanets = this.selection.ids.size > 0;
         const hasUnits = this.selection.hasSelectedUnits();
@@ -299,8 +305,22 @@ export class Game {
           this.selection.clear();
           this.tutorial?.notify('command');
         }
-      },
+    };
+
+    this.input = new Input(this.app.canvas as unknown as HTMLCanvasElement, this.renderer, this.world, {
+      tapPlanet: tapPlanetHandler,
       tapEmpty: (wx, wy) => {
+        // Forgiving hit-test: a tap that lands on an owned planet's visible
+        // swarm band (the ring the orbiters actually fly) counts as tapping
+        // the planet. Players aiming at "their units around the planet" —
+        // especially to reabsorb into a damaged world — kept missing the
+        // strict body hit-test and accidentally sending the swarm to hover
+        // on empty space instead.
+        const bandHit = this.ownedPlanetAtSwarmBand(wx, wy);
+        if (bandHit !== null) {
+          tapPlanetHandler(bandHit);
+          return;
+        }
         const now = performance.now();
         if (this.selection.ids.size > 0 || this.selection.hasSelectedUnits()) {
           // With units selected, tap-empty sends them to hold that point.
@@ -374,6 +394,26 @@ export class Game {
 
     window.addEventListener('resize', this.onResize);
     this.matchRunning = true;
+  }
+
+  /**
+   * Owned planet whose swarm band (orbit ring + a touch of slop) contains
+   * the given world point, or null. Only friendly planets get the generous
+   * band — attacks on enemy worlds keep the strict body hit-test so a
+   * near-miss never commits an accidental wave.
+   */
+  private ownedPlanetAtSwarmBand(wx: number, wy: number): number | null {
+    let best: number | null = null;
+    let bestD = Infinity;
+    for (const p of this.world.planets) {
+      if (p.owner !== 0) continue;
+      const d = Math.hypot(p.pos.x - wx, p.pos.y - wy);
+      if (d <= p.radius * ORBIT_RADIUS_MULT + 12 && d < bestD) {
+        bestD = d;
+        best = p.id;
+      }
+    }
+    return best;
   }
 
   /** Undo everything `startMatch` set up. Safe to call when nothing is live. */

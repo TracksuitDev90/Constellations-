@@ -27,47 +27,116 @@ const ABSORB_LADDER = [
 ];
 
 /**
- * Slow ambient chord progression for the pad bed. All chords live in the
- * A-minor / C-major diatonic family so every SFX ladder (pentatonic chimes,
- * absorb plucks) stays consonant no matter which chord is up. Voice-led:
- * adjacent chords share tones or move by small steps, so the 8–11s glides
- * between them read as the drone slowly "turning over" rather than a key
- * change. Index 0 is the boot chord (matches the original static pad).
+ * The soundtrack ships three "tracks" — generative themes that re-instrument
+ * the whole ambient engine. One is rolled at random for every match:
+ *
+ *   - ICE  — cold, frozen, alone, isolated. Hollow sus2 voicings pitched an
+ *     octave above the others, glassy sine timbres with long slow attacks,
+ *     prominent high shimmer, a thin floor, high icy wind, and crystalline
+ *     crack one-shots. Phrases arrive rarer and farther apart.
+ *   - FIRE — warm, inviting, tantalizing, powerful. Full add9/major-color
+ *     voicings in the low-mids, triangle timbres for harmonic warmth, a
+ *     rounder filter, present sub, low roaring air, and soft ember-crackle
+ *     one-shots. Phrases come a little closer together — the hearth invites.
+ *   - ROCK — firm, unforgiving, solid. Bare open fifths at the bottom of the
+ *     register, a dark filter, heavy sub, almost no shimmer, subterranean
+ *     noise, and deep stone-thud / grinding one-shots. Slow and immovable.
+ *
+ * Every theme stays inside the A-minor / C-major diatonic family so all the
+ * SFX ladders (pentatonic chimes, absorb plucks) remain consonant no matter
+ * which track is up. Chord lists are voice-led: adjacent chords share tones
+ * or move by small steps, so the 8–11s glides between them read as the drone
+ * slowly "turning over" rather than a key change. Index 0 is the boot chord.
  */
-const AMBIENT_CHORDS: ReadonlyArray<readonly [number, number, number]> = [
-  [110.0, 164.81, 246.94], // Am add9  (A2  E3 B3)
-  [87.31, 130.81, 196.0],  // F quartal (F2  C3 G3)
-  [130.81, 196.0, 293.66], // C add9   (C3  G3 D4)
-  [98.0, 146.83, 220.0],   // Gsus2    (G2  D3 A3)
-  [82.41, 123.47, 196.0],  // Em7      (E2  B2 G3)
-  [110.0, 146.83, 196.0],  // A quartal (A2  D3 G3)
-  [73.42, 110.0, 164.81],  // Dsus low  (D2  A2 E3)
-];
+export type MusicThemeName = 'ice' | 'fire' | 'rock';
 
-/**
- * Note pool for the sparse generative motif — A-minor pentatonic across
- * nearly four octaves. Diatonic to every chord in AMBIENT_CHORDS, so a
- * phrase can start under one chord and finish under the next without ever
- * clashing. The wide range lets the random walk sketch longer arcs: low
- * openings that climb, high phrases that sink back down.
- */
-const MOTIF_POOL = [
-  164.81, // E3
-  196.0,  // G3
-  220.0,  // A3
-  261.63, // C4
-  293.66, // D4
-  329.63, // E4
-  392.0,  // G4
-  440.0,  // A4
-  523.25, // C5
-  587.33, // D5
-  659.25, // E5
-  783.99, // G5
-];
+interface MusicTheme {
+  name: MusicThemeName;
+  chords: ReadonlyArray<readonly [number, number, number]>;
+  /** Note pool for the sparse generative motif phrases. */
+  motifPool: readonly number[];
+  /** Low pool for the slow bass counter-voice. */
+  bassPool: readonly number[];
+  padOscType: OscillatorType;
+  motifOscType: OscillatorType;
+  /** Main lowpass base cutoff (Hz) — the drone's overall color. */
+  filterBase: number;
+  /** Base gain of the high shimmer pair (air) and the sub voice (floor). */
+  shimmerGain: number;
+  subGain: number;
+  /** Motif note attack (s): ice blooms slowly, fire speaks sooner. */
+  motifAttack: number;
+  /** Multiplier on scheduler gaps — >1 spreads events out (isolation). */
+  gapMult: number;
+  /** Bandpass center range (Hz) for the "wind" noise beds. */
+  noiseBedCenter: readonly [number, number];
+}
 
-/** Low pool for the slow bass counter-voice under the motif register. */
-const BASS_MOTIF_POOL = [110.0, 130.81, 146.83, 164.81]; // A2 C3 D3 E3
+const THEMES: Record<MusicThemeName, MusicTheme> = {
+  ice: {
+    name: 'ice',
+    chords: [
+      [220.0, 329.63, 493.88], // A3 E4 B4 — hollow add9, high and thin
+      [174.61, 261.63, 392.0], // F3 C4 G4 — quartal, weightless
+      [196.0, 293.66, 440.0],  // G3 D4 A4 — sus2 glass
+      [164.81, 246.94, 392.0], // E3 B3 G4 — Em, the coldest color
+      [146.83, 220.0, 329.63], // D3 A3 E4 — open fifths stacked
+    ],
+    motifPool: [440.0, 523.25, 587.33, 659.25, 783.99, 880.0, 1046.5, 1174.66],
+    bassPool: [164.81, 196.0, 220.0], // barely a floor — the cold is above
+    padOscType: 'sine',
+    motifOscType: 'sine',
+    filterBase: 1150,
+    shimmerGain: 0.024,
+    subGain: 0.022,
+    motifAttack: 0.6,
+    gapMult: 1.35,
+    noiseBedCenter: [620, 950], // high, thin polar wind
+  },
+  fire: {
+    name: 'fire',
+    chords: [
+      [110.0, 164.81, 261.63], // A2 E3 C4 — Am with a warm high third
+      [87.31, 130.81, 220.0],  // F2 C3 A3 — Fmaj, the invitation
+      [130.81, 196.0, 329.63], // C3 G3 E4 — C major, full glow
+      [98.0, 146.83, 246.94],  // G2 D3 B3 — G, tantalizing lean
+      [110.0, 164.81, 246.94], // A2 E3 B3 — Am add9, banked embers
+      [87.31, 174.61, 261.63], // F2 F3 C4 — power-octave F, the roar
+    ],
+    motifPool: [164.81, 196.0, 220.0, 261.63, 293.66, 329.63, 392.0, 440.0, 523.25],
+    bassPool: [110.0, 130.81, 146.83, 164.81], // A2 C3 D3 E3
+    padOscType: 'triangle',
+    motifOscType: 'triangle',
+    filterBase: 700,
+    shimmerGain: 0.012,
+    subGain: 0.05,
+    motifAttack: 0.22,
+    gapMult: 0.8,
+    noiseBedCenter: [190, 340], // low roaring draft
+  },
+  rock: {
+    name: 'rock',
+    chords: [
+      [82.41, 123.47, 164.81], // E2 B2 E3 — bare fifth + octave, granite
+      [110.0, 164.81, 220.0],  // A2 E3 A3 — the same shape moved, unmoved
+      [73.42, 110.0, 146.83],  // D2 A2 D3 — deeper still
+      [98.0, 146.83, 196.0],   // G2 D3 G3 — a ledge to stand on
+      [82.41, 110.0, 164.81],  // E2 A2 E3 — fourths, unforgiving
+    ],
+    motifPool: [82.41, 98.0, 110.0, 130.81, 146.83, 164.81, 196.0, 220.0],
+    bassPool: [55.0, 65.41, 73.42, 82.41, 98.0], // A1 C2 D2 E2 G2
+    padOscType: 'sine',
+    motifOscType: 'triangle',
+    filterBase: 520,
+    shimmerGain: 0.006,
+    subGain: 0.075,
+    motifAttack: 0.35,
+    gapMult: 1.1,
+    noiseBedCenter: [110, 220], // subterranean movement
+  },
+};
+
+const THEME_NAMES: readonly MusicThemeName[] = ['ice', 'fire', 'rock'];
 
 export class Audio {
   private ctx: AudioContext | null = null;
@@ -102,10 +171,20 @@ export class Audio {
   /** Live pad oscillator pairs (main + detuned twin) for chord glides. */
   private padOscPairs: Array<{ a: OscillatorNode; b: OscillatorNode }> = [];
   private subOscNode: OscillatorNode | null = null;
+  private subGainNode: GainNode | null = null;
   private shimmerOscA: OscillatorNode | null = null;
   private shimmerOscB: OscillatorNode | null = null;
-  /** Index into AMBIENT_CHORDS the pad currently sits on (or glides toward). */
+  private shimmerGainNode: GainNode | null = null;
+  private filterNode: BiquadFilterNode | null = null;
+  /** Index into the theme's chord list the pad currently sits on. */
   private chordIdx = 0;
+  /**
+   * The generative track this match plays — ice, fire, or rock. Rolled at
+   * random per match by `rollMusicTheme`; every scheduler reads pools and
+   * gaps off this reference so a re-roll re-instruments the live graph.
+   */
+  private theme: MusicTheme = THEMES[THEME_NAMES[Math.floor(Math.random() * THEME_NAMES.length)]];
+  private signatureTimer: number | null = null;
   /** Live nodes of the black-hole drone layer; null when no hole is present. */
   private blackHoleNodes: Array<OscillatorNode | AudioBufferSourceNode | GainNode> = [];
   private lastConsumeAt = 0;
@@ -165,12 +244,63 @@ export class Audio {
     this.muted = muted;
     if (this.musicGain) this.musicGain.gain.value = muted ? 0 : this.musicVolume;
     if (this.sfxGain) this.sfxGain.gain.value = muted ? 0 : this.sfxVolume;
-    if (muted && this.etherealTimer !== null) {
-      clearTimeout(this.etherealTimer);
-      this.etherealTimer = null;
-    } else if (!muted && this.musicStarted && this.etherealTimer === null) {
-      this.scheduleEthereal();
+    if (muted) {
+      if (this.etherealTimer !== null) {
+        clearTimeout(this.etherealTimer);
+        this.etherealTimer = null;
+      }
+      if (this.signatureTimer !== null) {
+        clearTimeout(this.signatureTimer);
+        this.signatureTimer = null;
+      }
+    } else if (!muted && this.musicStarted) {
+      if (this.etherealTimer === null) this.scheduleEthereal();
+      if (this.signatureTimer === null) this.scheduleSignature();
     }
+  }
+
+  /**
+   * Roll a fresh track for a new match — ice, fire or rock, never the same
+   * one twice in a row so consecutive matches feel like a changing playlist.
+   * If the ambient bed is already sounding, the live graph re-instruments in
+   * place: pads glide to the new track's boot chord, the filter/shimmer/sub
+   * move to the new color, and every scheduler picks up the new pools.
+   * Returns the rolled track name (handy for debugging/HUD).
+   */
+  rollMusicTheme(): MusicThemeName {
+    const options = THEME_NAMES.filter((n) => n !== this.theme.name);
+    this.theme = THEMES[options[Math.floor(Math.random() * options.length)]];
+    this.applyThemeLive();
+    return this.theme.name;
+  }
+
+  /** Retune the live ambient graph to `this.theme` (no-op before boot). */
+  private applyThemeLive(): void {
+    if (!this.ctx || !this.musicStarted) return;
+    const theme = this.theme;
+    const now = this.ctx.currentTime;
+    const glide = 4; // faster than an in-track chord drift — a scene change
+    const rampTo = (param: AudioParam, target: number): void => {
+      const from = Math.max(1e-3, param.value);
+      param.cancelScheduledValues(now);
+      param.setValueAtTime(from, now);
+      param.exponentialRampToValueAtTime(Math.max(1e-3, target), now + glide);
+    };
+    this.chordIdx = 0;
+    const chord = theme.chords[0];
+    for (let i = 0; i < this.padOscPairs.length; i++) {
+      const f = chord[i] ?? chord[chord.length - 1];
+      this.padOscPairs[i].a.type = theme.padOscType;
+      this.padOscPairs[i].b.type = theme.padOscType;
+      rampTo(this.padOscPairs[i].a.frequency, f);
+      rampTo(this.padOscPairs[i].b.frequency, f * 1.003);
+    }
+    if (this.subOscNode) rampTo(this.subOscNode.frequency, chord[0] / 2);
+    if (this.subGainNode) rampTo(this.subGainNode.gain, theme.subGain);
+    if (this.shimmerOscA) rampTo(this.shimmerOscA.frequency, chord[1] * 4);
+    if (this.shimmerOscB) rampTo(this.shimmerOscB.frequency, chord[2] * 4);
+    if (this.shimmerGainNode) rampTo(this.shimmerGainNode.gain, theme.shimmerGain);
+    if (this.filterNode) rampTo(this.filterNode.frequency, theme.filterBase);
   }
 
   private startAmbient(): void {
@@ -192,25 +322,29 @@ export class Audio {
     // ── Filter bus ────────────────────────────────────────────────────────
     // Main lowpass with THREE summed LFOs at prime-ish rates. The combined
     // modulation never repeats cleanly so the cutoff meanders instead of
-    // pulsing — the drone never sits on the same color for long.
+    // pulsing — the drone never sits on the same color for long. The base
+    // cutoff is the theme's color: bright glass for ice, warm for fire,
+    // dark for rock. (LFO depths stay under the darkest base so the summed
+    // cutoff never dips through zero.)
     const filter = this.ctx.createBiquadFilter();
     filter.type = 'lowpass';
-    filter.frequency.value = 820;
+    filter.frequency.value = this.theme.filterBase;
     filter.Q.value = 0.8;
     filter.connect(bed);
+    this.filterNode = filter;
 
-    this.attachSlowLfo(filter.frequency, 0.067, 360);
-    this.attachSlowLfo(filter.frequency, 0.023, 190);
-    this.attachSlowLfo(filter.frequency, 0.013, 95);
+    this.attachSlowLfo(filter.frequency, 0.067, 240);
+    this.attachSlowLfo(filter.frequency, 0.023, 130);
+    this.attachSlowLfo(filter.frequency, 0.013, 70);
     // Slowly drifting Q adds a breathing "open / close" quality to the pad.
     this.attachSlowLfo(filter.Q, 0.031, 0.35);
 
     // ── Core pad voices ───────────────────────────────────────────────────
     // Each voice has its own tremolo at a different slow rate + an independent
     // detune drift, so pairs of voices drift in and out of phase with each
-    // other instead of breathing in unison. Voices boot on AMBIENT_CHORDS[0]
-    // and are re-pitched by the chord-drift scheduler over the match.
-    const bootChord = AMBIENT_CHORDS[0];
+    // other instead of breathing in unison. Voices boot on the theme's first
+    // chord and are re-pitched by the chord-drift scheduler over the match.
+    const bootChord = this.theme.chords[0];
     const padVoices = [
       { freq: bootChord[0], tremRate: 0.041, tremDepth: 0.045, driftRate: 0.019 },
       { freq: bootChord[1], tremRate: 0.063, tremDepth: 0.055, driftRate: 0.027 },
@@ -229,11 +363,13 @@ export class Audio {
     subOsc.frequency.value = bootChord[0] / 2; // an octave under the chord root
     this.subOscNode = subOsc;
     const subGain = this.ctx.createGain();
-    subGain.gain.value = 0.045;
+    subGain.gain.value = this.theme.subGain;
+    this.subGainNode = subGain;
     subOsc.connect(subGain).connect(bed);
     subOsc.start();
-    // Breath LFO on the sub gain — slow, deep.
-    this.attachSlowLfo(subGain.gain, 0.011, 0.04);
+    // Breath LFO on the sub gain — slow, deep, shallower than any theme's
+    // base so the swell never crosses into phase-inverting negative gain.
+    this.attachSlowLfo(subGain.gain, 0.011, 0.018);
     // Subtle pitch drift on the sub (microtonal), gives an "engine humming"
     // quality without ever sounding mechanical.
     this.attachSlowLfo(subOsc.detune, 0.007, 12);
@@ -244,21 +380,23 @@ export class Audio {
     // the pad feels more grounded.
     const shimmerA = this.ctx.createOscillator();
     shimmerA.type = 'sine';
-    shimmerA.frequency.value = bootChord[1] * 4; // E5 at boot
+    shimmerA.frequency.value = bootChord[1] * 4;
     const shimmerB = this.ctx.createOscillator();
     shimmerB.type = 'sine';
-    shimmerB.frequency.value = bootChord[2] * 4; // B5 at boot
+    shimmerB.frequency.value = bootChord[2] * 4;
     this.shimmerOscA = shimmerA;
     this.shimmerOscB = shimmerB;
     const shimmerGain = this.ctx.createGain();
-    shimmerGain.gain.value = 0.014;
+    shimmerGain.gain.value = this.theme.shimmerGain;
+    this.shimmerGainNode = shimmerGain;
     shimmerA.connect(shimmerGain);
     shimmerB.connect(shimmerGain);
     shimmerGain.connect(filter);
     shimmerA.start();
     shimmerB.start();
     // Very slow swell on shimmer — absent most of the time, present briefly.
-    this.attachSlowLfo(shimmerGain.gain, 0.009, 0.012);
+    // Depth stays under the quietest theme's base (rock) so it never inverts.
+    this.attachSlowLfo(shimmerGain.gain, 0.009, 0.005);
     this.attachSlowLfo(shimmerA.detune, 0.043, 8);
     this.attachSlowLfo(shimmerB.detune, 0.037, 8);
 
@@ -294,6 +432,12 @@ export class Audio {
     // Rare 2-3 note phrases from the low pool with very slow attacks — a
     // second melodic register answering the motif from far below.
     this.scheduleBassMotif();
+
+    // ── Track signature texture ──────────────────────────────────────────
+    // Each theme's identity one-shot: crystalline cracks for ice, ember
+    // crackle for fire, deep stone thuds for rock. Dispatches off the LIVE
+    // theme at fire time, so a mid-session re-roll changes the texture too.
+    this.scheduleSignature();
   }
 
   /**
@@ -308,10 +452,10 @@ export class Audio {
   ): { a: OscillatorNode; b: OscillatorNode } | null {
     if (!this.ctx) return null;
     const osc1 = this.ctx.createOscillator();
-    osc1.type = 'sine';
+    osc1.type = this.theme.padOscType;
     osc1.frequency.value = spec.freq;
     const osc2 = this.ctx.createOscillator();
-    osc2.type = 'sine';
+    osc2.type = this.theme.padOscType;
     osc2.frequency.value = spec.freq * 1.003;
 
     const voiceGain = this.ctx.createGain();
@@ -350,10 +494,11 @@ export class Audio {
     if (!this.ctx || this.ctx.state !== 'running') return;
     // Muted just means the master gain is 0 — keep drifting silently so the
     // harmony is somewhere new when the player unmutes.
-    let next = Math.floor(Math.random() * AMBIENT_CHORDS.length);
-    if (next === this.chordIdx) next = (next + 1) % AMBIENT_CHORDS.length;
+    const chords = this.theme.chords;
+    let next = Math.floor(Math.random() * chords.length);
+    if (next === this.chordIdx) next = (next + 1) % chords.length;
     this.chordIdx = next;
-    const chord = AMBIENT_CHORDS[next];
+    const chord = chords[next];
     const now = this.ctx.currentTime;
     const glide = 8 + Math.random() * 3;
 
@@ -381,7 +526,7 @@ export class Audio {
    * so phrases feel like rare transmissions, not background muzak.
    */
   private scheduleMotif(): void {
-    const delay = 35000 + Math.random() * 35000;
+    const delay = (35000 + Math.random() * 35000) * this.theme.gapMult;
     window.setTimeout(() => {
       if (!this.muted) this.playMotif();
       this.scheduleMotif();
@@ -397,9 +542,10 @@ export class Audio {
   private playMotif(): void {
     if (!this.ctx || !this.musicGain) return;
     if (this.ctx.state !== 'running') return;
+    const pool = this.theme.motifPool;
     const now = this.ctx.currentTime;
     const noteCount = 3 + Math.floor(Math.random() * 4);
-    let idx = Math.floor(Math.random() * MOTIF_POOL.length);
+    let idx = Math.floor(Math.random() * pool.length);
     let t = now + 0.05;
     const phrase: number[] = [];
     // Soften the phrase through a gentle lowpass so it sits behind the SFX.
@@ -409,7 +555,7 @@ export class Audio {
     lp.Q.value = 0.5;
     lp.connect(this.bedGain ?? this.musicGain);
     for (let n = 0; n < noteCount; n++) {
-      const f = MOTIF_POOL[idx];
+      const f = pool[idx];
       phrase.push(f);
       const fade = 1 - (n / noteCount) * 0.45; // phrase decrescendo
       const peak = (0.035 + Math.random() * 0.012) * fade;
@@ -418,11 +564,11 @@ export class Audio {
       const gains = [peak, peak * 0.35];
       for (let i = 0; i < partials.length; i++) {
         const osc = this.ctx.createOscillator();
-        osc.type = 'sine';
+        osc.type = this.theme.motifOscType;
         osc.frequency.value = partials[i];
         const g = this.ctx.createGain();
         g.gain.setValueAtTime(0.0001, t);
-        g.gain.exponentialRampToValueAtTime(gains[i], t + 0.25);
+        g.gain.exponentialRampToValueAtTime(gains[i], t + this.theme.motifAttack);
         g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
         osc.connect(g).connect(lp);
         osc.start(t);
@@ -430,8 +576,8 @@ export class Audio {
       }
       // Random walk: mostly steps, occasional leap, clamped to the pool.
       const step = Math.random() < 0.7 ? (Math.random() < 0.5 ? -1 : 1) : (Math.random() < 0.5 ? -2 : 2);
-      idx = Math.max(0, Math.min(MOTIF_POOL.length - 1, idx + step));
-      t += 0.7 + Math.random() * 0.7;
+      idx = Math.max(0, Math.min(pool.length - 1, idx + step));
+      t += (0.7 + Math.random() * 0.7) * this.theme.gapMult;
     }
     // Sometimes a distant answer: the phrase's opening notes return several
     // seconds later, an octave down and darker — call-and-response structure
@@ -472,7 +618,7 @@ export class Audio {
 
   /** Queue the next bass counter-phrase — even rarer than the motif. */
   private scheduleBassMotif(): void {
-    const delay = 70000 + Math.random() * 50000;
+    const delay = (70000 + Math.random() * 50000) * this.theme.gapMult;
     window.setTimeout(() => {
       if (!this.muted) this.playBassMotif();
       this.scheduleBassMotif();
@@ -480,19 +626,20 @@ export class Audio {
   }
 
   /**
-   * 2-3 notes from the low pool with very slow (~0.8s) attacks — felt as the
-   * floor of the music briefly finding a melody of its own.
+   * 2-3 notes from the theme's low pool with very slow (~0.8s) attacks —
+   * felt as the floor of the music briefly finding a melody of its own.
    */
   private playBassMotif(): void {
     if (!this.ctx || !this.musicGain) return;
     if (this.ctx.state !== 'running') return;
+    const pool = this.theme.bassPool;
     let t = this.ctx.currentTime + 0.05;
     const noteCount = 2 + (Math.random() < 0.5 ? 1 : 0);
-    let idx = Math.floor(Math.random() * BASS_MOTIF_POOL.length);
+    let idx = Math.floor(Math.random() * pool.length);
     for (let n = 0; n < noteCount; n++) {
       const osc = this.ctx.createOscillator();
       osc.type = 'sine';
-      osc.frequency.value = BASS_MOTIF_POOL[idx];
+      osc.frequency.value = pool[idx];
       const g = this.ctx.createGain();
       const dur = 4 + Math.random() * 1.5;
       g.gain.setValueAtTime(0.0001, t);
@@ -501,7 +648,7 @@ export class Audio {
       osc.connect(g).connect(this.bedGain ?? this.musicGain);
       osc.start(t);
       osc.stop(t + dur + 0.05);
-      idx = Math.max(0, Math.min(BASS_MOTIF_POOL.length - 1, idx + (Math.random() < 0.5 ? -1 : 1)));
+      idx = Math.max(0, Math.min(pool.length - 1, idx + (Math.random() < 0.5 ? -1 : 1)));
       t += 2 + Math.random() * 1.2;
     }
   }
@@ -602,7 +749,10 @@ export class Audio {
     const bp = this.ctx.createBiquadFilter();
     bp.type = 'bandpass';
     bp.Q.value = 0.5;
-    const centerStart = 340 + Math.random() * 280;
+    // The wind blows where the theme lives: high polar hiss for ice, a low
+    // roaring draft for fire, subterranean movement for rock.
+    const [lo, hi] = this.theme.noiseBedCenter;
+    const centerStart = lo + Math.random() * (hi - lo);
     bp.frequency.setValueAtTime(centerStart, now);
     bp.frequency.linearRampToValueAtTime(centerStart * (0.6 + Math.random() * 0.6), now + dur);
     const g = this.ctx.createGain();
@@ -621,7 +771,7 @@ export class Audio {
    */
   private scheduleEthereal(): void {
     if (this.etherealTimer !== null) clearTimeout(this.etherealTimer);
-    const delay = 6000 + Math.random() * 13000;
+    const delay = (6000 + Math.random() * 13000) * this.theme.gapMult;
     this.etherealTimer = window.setTimeout(() => {
       this.etherealTimer = null;
       if (!this.muted) this.playEthereal();
@@ -649,6 +799,165 @@ export class Audio {
     else if (pick === 7) this.etherealHarmonicRain();
     else if (pick === 8) this.etherealGravityHum();
     else this.etherealVoidBreath();
+  }
+
+  /**
+   * Queue the next theme-signature one-shot. Spacing rides the theme's gap
+   * multiplier: ice signatures are rare and lonely, fire's crackle keeps
+   * the hearth alive, rock's thuds land on their own unhurried clock.
+   */
+  private scheduleSignature(): void {
+    if (this.signatureTimer !== null) clearTimeout(this.signatureTimer);
+    const delay = (9000 + Math.random() * 14000) * this.theme.gapMult;
+    this.signatureTimer = window.setTimeout(() => {
+      this.signatureTimer = null;
+      if (!this.muted && this.ctx && this.ctx.state === 'running') {
+        if (this.theme.name === 'ice') this.signatureIceCrack();
+        else if (this.theme.name === 'fire') this.signatureEmberCrackle();
+        else this.signatureStoneThud();
+      }
+      this.scheduleSignature();
+    }, delay);
+  }
+
+  /**
+   * ICE: a run of tiny glassy plinks with instant attacks — a frozen sheet
+   * settling somewhere far away — under one thin, sustained high harmonic
+   * that hangs in the air after the cracks stop.
+   */
+  private signatureIceCrack(): void {
+    if (!this.ctx || !this.musicGain) return;
+    const now = this.ctx.currentTime;
+    const bus = this.bedGain ?? this.musicGain;
+    const hp = this.ctx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.value = 1400;
+    hp.connect(bus);
+    const cracks = 3 + Math.floor(Math.random() * 4);
+    for (let i = 0; i < cracks; i++) {
+      const t = now + i * (0.14 + Math.random() * 0.22);
+      const osc = this.ctx.createOscillator();
+      osc.type = 'sine';
+      // Inharmonic high pitches — cracking, not melody.
+      osc.frequency.value = 2100 + Math.random() * 2600;
+      const g = this.ctx.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.016 + Math.random() * 0.01, t + 0.006);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.28);
+      osc.connect(g).connect(hp);
+      osc.start(t);
+      osc.stop(t + 0.32);
+    }
+    // The hanging harmonic: E6, diatonic, barely there.
+    const hang = this.ctx.createOscillator();
+    hang.type = 'sine';
+    hang.frequency.value = 1318.5;
+    const hg = this.ctx.createGain();
+    const dur = 4 + Math.random() * 2;
+    hg.gain.setValueAtTime(0.0001, now + 0.3);
+    hg.gain.exponentialRampToValueAtTime(0.008, now + 1.2);
+    hg.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    hang.connect(hg).connect(bus);
+    hang.start(now + 0.3);
+    hang.stop(now + dur + 0.05);
+  }
+
+  /**
+   * FIRE: a low bed of soft bandpassed noise pops — embers shifting in the
+   * grate. Each pop is a few milliseconds of noise with a warm center; the
+   * cluster decays away like a log settling.
+   */
+  private signatureEmberCrackle(): void {
+    if (!this.ctx || !this.musicGain) return;
+    const now = this.ctx.currentTime;
+    const bus = this.bedGain ?? this.musicGain;
+    const pops = 6 + Math.floor(Math.random() * 6);
+    const sr = this.ctx.sampleRate;
+    for (let i = 0; i < pops; i++) {
+      const t = now + i * (0.08 + Math.random() * 0.16);
+      const dur = 0.03 + Math.random() * 0.05;
+      const buf = this.ctx.createBuffer(1, Math.max(1, Math.floor(sr * dur)), sr);
+      const data = buf.getChannelData(0);
+      for (let k = 0; k < data.length; k++) {
+        const decay = Math.pow(1 - k / data.length, 2.5);
+        data[k] = (Math.random() * 2 - 1) * decay;
+      }
+      const src = this.ctx.createBufferSource();
+      src.buffer = buf;
+      const bp = this.ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.Q.value = 1.5;
+      bp.frequency.value = 700 + Math.random() * 1600;
+      const g = this.ctx.createGain();
+      // Cluster decrescendo — the flare-up settles back down.
+      g.gain.value = (0.03 + Math.random() * 0.02) * (1 - (i / pops) * 0.6);
+      src.connect(bp).connect(g).connect(bus);
+      src.start(t);
+      src.stop(t + dur + 0.01);
+    }
+  }
+
+  /**
+   * ROCK: one deep stone thud — a sub sine drop with a short dark noise
+   * bloom — occasionally followed by a slow grinding sweep, something vast
+   * shifting its weight and settling for good.
+   */
+  private signatureStoneThud(): void {
+    if (!this.ctx || !this.musicGain) return;
+    const now = this.ctx.currentTime;
+    const bus = this.bedGain ?? this.musicGain;
+    const thud = this.ctx.createOscillator();
+    thud.type = 'sine';
+    thud.frequency.setValueAtTime(58, now);
+    thud.frequency.exponentialRampToValueAtTime(32, now + 0.4);
+    const tg = this.ctx.createGain();
+    tg.gain.setValueAtTime(0.0001, now);
+    tg.gain.exponentialRampToValueAtTime(0.07, now + 0.02);
+    tg.gain.exponentialRampToValueAtTime(0.0001, now + 0.6);
+    thud.connect(tg).connect(bus);
+    thud.start(now);
+    thud.stop(now + 0.65);
+
+    const sr = this.ctx.sampleRate;
+    const dur = 0.5;
+    const buf = this.ctx.createBuffer(1, Math.max(1, Math.floor(sr * dur)), sr);
+    const data = buf.getChannelData(0);
+    for (let k = 0; k < data.length; k++) {
+      const t = k / data.length;
+      data[k] = (Math.random() * 2 - 1) * Math.min(1, t * 25) * Math.pow(1 - t, 2);
+    }
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    const lp = this.ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = 240;
+    const ng = this.ctx.createGain();
+    ng.gain.value = 0.05;
+    src.connect(lp).connect(ng).connect(bus);
+    src.start(now);
+    src.stop(now + dur + 0.02);
+
+    // Sometimes the mountain grinds: a long dark noise sweep after the thud.
+    if (Math.random() < 0.4) {
+      const gDur = 2.5 + Math.random() * 2;
+      const gBuf = this.ctx.createBuffer(1, Math.max(1, Math.floor(sr * gDur)), sr);
+      const gData = gBuf.getChannelData(0);
+      for (let k = 0; k < gData.length; k++) gData[k] = Math.random() * 2 - 1;
+      const gSrc = this.ctx.createBufferSource();
+      gSrc.buffer = gBuf;
+      const bp = this.ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.Q.value = 2.2;
+      bp.frequency.setValueAtTime(140, now + 0.5);
+      bp.frequency.linearRampToValueAtTime(80, now + 0.5 + gDur);
+      const gg = this.ctx.createGain();
+      gg.gain.setValueAtTime(0.0001, now + 0.5);
+      gg.gain.exponentialRampToValueAtTime(0.028, now + 0.5 + gDur * 0.4);
+      gg.gain.exponentialRampToValueAtTime(0.0001, now + 0.5 + gDur);
+      gSrc.connect(bp).connect(gg).connect(bus);
+      gSrc.start(now + 0.5);
+      gSrc.stop(now + 0.5 + gDur + 0.05);
+    }
   }
 
   /**

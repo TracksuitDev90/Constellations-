@@ -71,6 +71,102 @@ describe('layout archetypes', () => {
   });
 });
 
+describe('star patterns (zodiac maps)', () => {
+  // A recognizable little figure — five stars in an arc.
+  const pattern: Array<[number, number]> = [
+    [0.14, 0.52],
+    [0.38, 0.34],
+    [0.6, 0.3],
+    [0.8, 0.42],
+    [0.9, 0.62],
+  ];
+
+  it('places one neutral near each authored star, in bounds and connected', () => {
+    for (let run = 0; run < 25; run++) {
+      const map = generateMap(
+        baseCfg({ totalPlanets: [7, 7], starPattern: pattern }),
+      );
+      expect(map.planets.length).toBe(7);
+      const neutrals = map.planets.slice(2);
+      expect(neutrals.length).toBe(pattern.length);
+      // Every star of the figure has a planet within jitter + de-clump slack.
+      for (const [nx, ny] of pattern) {
+        const sx = 300 + nx * 1000;
+        const sy = 200 + ny * 630;
+        const nearest = Math.min(
+          ...neutrals.map((p) => Math.hypot(p.pos.x - sx, p.pos.y - sy)),
+        );
+        expect(nearest).toBeLessThan(150);
+      }
+      for (const p of map.planets) {
+        expect(p.pos.x).toBeGreaterThan(0);
+        expect(p.pos.x).toBeLessThan(map.width);
+        expect(p.pos.y).toBeGreaterThan(0);
+        expect(p.pos.y).toBeLessThan(map.height);
+      }
+      expect(isConnected(map.planets.length, map.edges)).toBe(true);
+    }
+  });
+
+  it('keeps every pair of planets a readable distance apart', () => {
+    for (let run = 0; run < 25; run++) {
+      const map = generateMap(
+        baseCfg({ totalPlanets: [7, 7], starPattern: pattern }),
+      );
+      for (let a = 0; a < map.planets.length; a++) {
+        for (let b = a + 1; b < map.planets.length; b++) {
+          const d = Math.hypot(
+            map.planets[a].pos.x - map.planets[b].pos.x,
+            map.planets[a].pos.y - map.planets[b].pos.y,
+          );
+          expect(d).toBeGreaterThan(100);
+        }
+      }
+    }
+  });
+});
+
+describe('placement fairness', () => {
+  it('every start world has expansion food within reach on standard layouts', () => {
+    const layouts: LayoutKind[] = ['scatter', 'lanes', 'ringworld', 'clusters'];
+    for (const layout of layouts) {
+      for (let run = 0; run < 30; run++) {
+        const map = generateMap(
+          baseCfg({ playerCount: 3, totalPlanets: [8, 10], layouts: [layout] }),
+        );
+        const starts = map.planets.slice(0, 3);
+        const neutrals = map.planets.slice(3);
+        for (const s of starts) {
+          const nearest = Math.min(
+            ...neutrals.map((p) =>
+              Math.hypot(p.pos.x - s.pos.x, p.pos.y - s.pos.y),
+            ),
+          );
+          expect(nearest).toBeLessThanOrEqual(430);
+        }
+      }
+    }
+  });
+
+  it('no two planets end up clumped on top of each other', () => {
+    const layouts: LayoutKind[] = ['scatter', 'lanes', 'ringworld', 'clusters'];
+    for (const layout of layouts) {
+      for (let run = 0; run < 30; run++) {
+        const map = generateMap(baseCfg({ layouts: [layout] }));
+        for (let a = 0; a < map.planets.length; a++) {
+          for (let b = a + 1; b < map.planets.length; b++) {
+            const d = Math.hypot(
+              map.planets[a].pos.x - map.planets[b].pos.x,
+              map.planets[a].pos.y - map.planets[b].pos.y,
+            );
+            expect(d).toBeGreaterThan(130);
+          }
+        }
+      }
+    }
+  });
+});
+
 describe('value gradient', () => {
   it('contested-space neutrals are richer than doorstep neutrals on average', () => {
     let nearSum = 0;

@@ -369,15 +369,17 @@ export const makeNebulaTexture = (
      * Soft radial blob — layered fills approximate a gaussian falloff. More
      * layers + a gentler alpha curve than the original bake so each blob's
      * edge diffuses further before dying out: the whole cloud reads blurrier
-     * without any filter cost.
+     * without any filter cost. The extra 12% radius overdraw past the
+     * nominal edge lets neighboring blobs melt together instead of reading
+     * as individual stacked discs.
      */
     const blob = (x: number, y: number, radius: number, color: number, peak: number): void => {
-      const layers = 9;
+      const layers = 11;
       for (let k = layers; k > 0; k--) {
         const t = k / layers;
-        g.circle(x, y, radius * t).fill({
+        g.circle(x, y, radius * 1.12 * t).fill({
           color,
-          alpha: Math.pow(1 - t, 1.35) * peak + 0.008,
+          alpha: Math.pow(1 - t, 1.55) * peak + 0.006,
         });
       }
     };
@@ -437,8 +439,10 @@ export const makeNebulaTexture = (
     // has mass (anchored to the envelope/filament walk points). A mix of
     // bright dust catching the light and dark absorbing flecks keeps the fog
     // from reading as an airbrushed gradient — this is the film-grain body
-    // of the cloud, drawn crisp on top of the blurred blobs.
-    const grains = 750;
+    // of the cloud. Each mote sits on a soft halo ~3× its size so the
+    // speckle diffuses into the surrounding fog instead of reading as
+    // individually placed pieces.
+    const grains = 865;
     for (let i = 0; i < grains; i++) {
       const anchor = grainAnchors[Math.floor(rng() * grainAnchors.length)] ?? {
         x: cx,
@@ -452,11 +456,13 @@ export const makeNebulaTexture = (
       const y = anchor.y + Math.sin(dir) * off;
       const size = 0.35 + rng() * 0.95;
       if (rng() < 0.3) {
-        // Dark fleck — occluding dust.
-        g.circle(x, y, size).fill({ color: 0x05070d, alpha: 0.05 + rng() * 0.1 });
+        // Dark fleck — occluding dust, blurred outward by its halo.
+        g.circle(x, y, size * 2.8).fill({ color: 0x05070d, alpha: 0.02 });
+        g.circle(x, y, size).fill({ color: 0x05070d, alpha: 0.04 + rng() * 0.09 });
       } else {
         const col = toward(toward(colorA, colorB, rng()), 0xffffff, rng() * 0.35);
-        g.circle(x, y, size).fill({ color: col, alpha: 0.05 + rng() * 0.11 });
+        g.circle(x, y, size * 2.8).fill({ color: col, alpha: 0.022 });
+        g.circle(x, y, size).fill({ color: col, alpha: 0.04 + rng() * 0.1 });
       }
     }
 

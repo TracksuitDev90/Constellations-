@@ -200,8 +200,10 @@ const EXIT_CONE = Math.PI / 7; // ±~25°
 /** Distance (world units) at which two enemy ships mutually destroy each other. */
 const SHIP_COLLIDE_RADIUS = 5;
 
-/** Target orbit radius around a planet, expressed as a multiple of planet radius. */
-const ORBIT_RADIUS_MULT = 1.75;
+/** Target orbit radius around a planet, expressed as a multiple of planet
+ * radius. Exported so input handling can treat a tap on the visible swarm
+ * band as a tap on the planet it belongs to. */
+export const ORBIT_RADIUS_MULT = 1.75;
 /** How far (px) inside the orbit band counts as "settled into orbit". */
 const ORBIT_SETTLE_TOLERANCE = 3;
 /** How far (px) from planet center before an absorbing unit is consumed. */
@@ -1410,11 +1412,20 @@ export class World {
       this.ships.kill(idx);
       return;
     }
+    // The planet has nothing left to feed (healed to full, rings done —
+    // e.g. the units ahead of this one finished the job mid-pull): return
+    // to orbit instead of being consumed for zero effect. Committed
+    // reinforcements included — "committed" means surviving an absorb
+    // toggle, never volunteering into a sink with no payoff.
+    if (!canAbsorb(planet)) {
+      this.releaseAbsorberToOrbit(ship, planet);
+      return;
+    }
     // If the planet has turned absorb off, fall back to orbit — unless this
     // unit was sent as a reinforcement specifically to be absorbed, in which
     // case it stays committed and finishes its pull to the center.
     if (!planet.absorbing && !ship.absorbOnArrive) {
-      ship.state = 'orbiting';
+      this.releaseAbsorberToOrbit(ship, planet);
       return;
     }
     const dx = planet.pos.x - ship.x;
@@ -1431,6 +1442,22 @@ export class World {
     ship.vy = (dy / d) * pullSpeed;
     ship.x += ship.vx * dt;
     ship.y += ship.vy * dt;
+  }
+
+  /**
+   * Return an absorbing unit to a healthy orbit around its planet. Ships
+   * that arrived as tagged reinforcements never carried orbit parameters,
+   * and a mid-pull ship can be sitting well inside the planet body — both
+   * need a sane orbit radius or they'd circle the core forever.
+   */
+  private releaseAbsorberToOrbit(ship: Ship, planet: Planet): void {
+    ship.state = 'orbiting';
+    ship.absorbOnArrive = false;
+    if (ship.orbitRadius < planet.radius) {
+      ship.orbitRadius = planet.radius * ORBIT_RADIUS_MULT + (Math.random() - 0.5) * 6;
+      ship.orbitDir = Math.random() < 0.5 ? 1 : -1;
+      ship.wanderPhase = Math.random() * Math.PI * 2;
+    }
   }
 
   private consumeAbsorbed(planet: Planet): void {

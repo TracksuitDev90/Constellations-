@@ -68,6 +68,15 @@ export interface MapGenConfig {
   playerRing: boolean;
   /** Layout archetypes this level may roll. Defaults to ['scatter']. */
   layouts?: LayoutKind[];
+  /**
+   * Authored constellation figure: normalized (0..1) star coordinates that
+   * the neutral planets trace, in figure order. When set it overrides
+   * `layouts` — the zodiac levels use the real principal stars of their
+   * constellation so the map IS the sign in the sky. Each planet lands in a
+   * small jitter box around its star so the figure stays recognizable while
+   * every match still varies.
+   */
+  starPattern?: ReadonlyArray<readonly [number, number]>;
 }
 
 interface PlacementZone {
@@ -236,6 +245,45 @@ const boxAround = (x: number, y: number, half: number): PlacementZone =>
  * zones are the whole difference between layouts — placement itself always
  * runs through the same rejection sampler.
  */
+/** Band of the map a star pattern is scaled into. Inset from the corner
+ * start zones so the figure reads as the contested middle of the sky. */
+const PATTERN_BAND: PlacementZone = { x: [300, 1300], y: [200, 830] };
+/** Jitter box half-size around each pattern star — small enough that the
+ * constellation figure survives the roll, big enough that no two matches
+ * put a planet on the exact same pixel. */
+const PATTERN_JITTER = 42;
+
+/**
+ * Turn an authored star pattern into one placement slot per neutral planet.
+ * When the map wants fewer planets than the figure has stars, stars are
+ * sampled evenly along the figure so the silhouette survives; extra planets
+ * beyond the star count double up with a wider jitter.
+ */
+const buildPatternSlots = (
+  pattern: ReadonlyArray<readonly [number, number]>,
+  count: number,
+): NeutralSlot[] => {
+  const spanX = PATTERN_BAND.x[1] - PATTERN_BAND.x[0];
+  const spanY = PATTERN_BAND.y[1] - PATTERN_BAND.y[0];
+  const slots: NeutralSlot[] = [];
+  for (let i = 0; i < count; i++) {
+    const starIdx =
+      count <= pattern.length
+        ? Math.floor((i * pattern.length) / count)
+        : i % pattern.length;
+    const [nx, ny] = pattern[starIdx];
+    const half = i < pattern.length ? PATTERN_JITTER : PATTERN_JITTER * 2.2;
+    slots.push({
+      zone: boxAround(
+        PATTERN_BAND.x[0] + nx * spanX,
+        PATTERN_BAND.y[0] + ny * spanY,
+        half,
+      ),
+    });
+  }
+  return slots;
+};
+
 const buildNeutralSlots = (layout: LayoutKind, count: number): NeutralSlot[] => {
   if (layout === 'lanes') {
     const laneCount = count >= 6 && Math.random() < 0.5 ? 3 : 2;
@@ -644,14 +692,186 @@ const rollHazards = (
   return hazards;
 };
 
+/**
+ * How close (px) a start world's nearest neutral must be for the opening to
+ * feel fair — beyond this, one player spends the early game commuting while
+ * a rival snowballs. The fairness pass relocates a redundant neutral into
+ * reach when a roll leaves a start stranded.
+ */
+const EXPANSION_REACH = 430;
+/** Hard floor (px) between any two planet centers after the de-clump pass. */
+const DECLUMP_FLOOR = 150;
+/** Star-pattern maps allow a tighter floor so authored figures survive. */
+const PATTERN_DECLUMP_FLOOR = 118;
+
+/**
+ * Post-placement strategy audit, run on every map (old layouts included):
+ *
+ *   1. Guaranteed opening: every start world must have at least one neutral
+ *      inside EXPANSION_REACH. A start without expansion food loses on the
+ *      spawn roll, not on play — so the most redundant neutral (the one
+ *      packed tightest against its nearest sibling) is relocated into the
+ *      stranded start's neighborhood. Skipped on star-pattern maps, where
+ *      the authored figure is the strategy and must not be broken up.
+ *
+ *   2. De-clump: the sampler's last-resort fallback can drop two planets
+ *      nearly on top of each other. A short relaxation pushes any pair
+ *      apart to a readable floor so every world is a distinct target and
+ *      lanes between planets stay flyable.
+ *
+ * Mutates `neutralPositions` and the parallel tail of `placed` in place.
+ */
+const fairnessPass = (
+  cfg: MapGenConfig,
+  neutralPositions: Array<{ x: number; y: number; rich: boolean }>,
+  placed: Array<{ x: number; y: number; r: number }>,
+  patterned: boolean,
+): void => {
+  const starts = placed.slice(0, cfg.playerCount);
+  const syncPlaced = (i: number): void => {
+    placed[cfg.playerCount + i].x = neutralPositions[i].x;
+    placed[cfg.playerCount + i].y = neutralPositions[i].y;
+  };
+  const clampX = (x: number): number => Math.min(MAP_WIDTH - 150, Math.max(150, x));
+  const clampY = (y: number): number => Math.min(MAP_HEIGHT - 130, Math.max(130, y));
+
+  // 2. De-clump relaxation over every planet pair (starts stay anchored —
+  // only neutrals move, and only enough to reach the floor). Defined first
+  // because the fairness loop re-runs it after every relocation.
+  const floor = patterned ? PATTERN_DECLUMP_FLOOR : DECLUMP_FLOOR;
+  const declump = (): void => {
+    for (let iter = 0; iter < 4; iter++) {
+      let moved = false;
+      for (let a = 0; a < placed.length; a++) {
+        for (let b = a + 1; b < placed.length; b++) {
+          const dx = placed[b].x - placed[a].x;
+          const dy = placed[b].y - placed[a].y;
+          const d = Math.hypot(dx, dy);
+          if (d >= floor) continue;
+          // Degenerate exact-overlap roll: separate along a fixed heading.
+          const ux = d > 0.001 ? dx / d : Math.cos(a + b);
+          const uy = d > 0.001 ? dy / d : Math.sin(a + b);
+          const push = (floor - d) / 2 + 1;
+          const canMoveA = a >= cfg.playerCount;
+          const canMoveB = b >= cfg.playerCount;
+          if (!canMoveA && !canMoveB) continue;
+          const shareA = canMoveA ? (canMoveB ? push : push * 2) : 0;
+          const shareB = canMoveB ? (canMoveA ? push : push * 2) : 0;
+          if (canMoveA) {
+            const i = a - cfg.playerCount;
+            neutralPositions[i].x = clampX(neutralPositions[i].x - ux * shareA);
+            neutralPositions[i].y = clampY(neutralPositions[i].y - uy * shareA);
+            syncPlaced(i);
+          }
+          if (canMoveB) {
+            const i = b - cfg.playerCount;
+            neutralPositions[i].x = clampX(neutralPositions[i].x + ux * shareB);
+            neutralPositions[i].y = clampY(neutralPositions[i].y + uy * shareB);
+            syncPlaced(i);
+          }
+          moved = true;
+        }
+      }
+      if (!moved) break;
+    }
+  };
+
+  declump();
+  if (patterned || neutralPositions.length === 0) return;
+
+  // 1. Guaranteed opening, iterated with de-clump to a fixpoint: relocating
+  // one neutral can nudge others (and a nudge can in principle strand a
+  // start again), so the check re-runs until every start is fed.
+  const foodOf = (s: { x: number; y: number }): number[] => {
+    const ids: number[] = [];
+    for (let i = 0; i < neutralPositions.length; i++) {
+      const p = neutralPositions[i];
+      if (Math.hypot(p.x - s.x, p.y - s.y) <= EXPANSION_REACH) ids.push(i);
+    }
+    return ids;
+  };
+
+  for (let round = 0; round < 4; round++) {
+    // Neutrals that are some start's ONLY reachable food must not be the
+    // ones relocated to feed a different start.
+    const protectedIds = new Set<number>();
+    for (const s of starts) {
+      const food = foodOf(s);
+      if (food.length === 1) protectedIds.add(food[0]);
+    }
+    let relocated = false;
+    for (const s of starts) {
+      if (foodOf(s).length > 0) continue;
+      // Most redundant neutral: the non-rich, non-protected one sitting
+      // closest to another neutral — moving it costs the least texture.
+      let moveIdx = -1;
+      let bestCrowd = Infinity;
+      for (let i = 0; i < neutralPositions.length; i++) {
+        if (neutralPositions[i].rich || protectedIds.has(i)) continue;
+        let nearest = Infinity;
+        for (let j = 0; j < neutralPositions.length; j++) {
+          if (j === i) continue;
+          nearest = Math.min(
+            nearest,
+            Math.hypot(
+              neutralPositions[i].x - neutralPositions[j].x,
+              neutralPositions[i].y - neutralPositions[j].y,
+            ),
+          );
+        }
+        if (nearest < bestCrowd) {
+          bestCrowd = nearest;
+          moveIdx = i;
+        }
+      }
+      if (moveIdx < 0) continue;
+      // Re-place it on a comfortable ring around the stranded start,
+      // relaxing the clearance requirement rather than ever giving up —
+      // a slightly tight relocation beats a start with no opening at all.
+      let best: { x: number; y: number; clearance: number } | null = null;
+      for (let attempt = 0; attempt < 60; attempt++) {
+        const ang = Math.random() * Math.PI * 2;
+        const r = frange(240, EXPANSION_REACH - 60);
+        const x = clampX(s.x + Math.cos(ang) * r);
+        const y = clampY(s.y + Math.sin(ang) * r);
+        // Clamping can drag the point out of reach near a map edge.
+        if (Math.hypot(x - s.x, y - s.y) > EXPANSION_REACH - 20) continue;
+        let clearance = Infinity;
+        for (let k = 0; k < placed.length; k++) {
+          if (k === cfg.playerCount + moveIdx) continue;
+          clearance = Math.min(
+            clearance,
+            Math.hypot(placed[k].x - x, placed[k].y - y),
+          );
+        }
+        if (!best || clearance > best.clearance) best = { x, y, clearance };
+        if (clearance >= DECLUMP_FLOOR + 40) break; // comfortably clear — done
+      }
+      if (best) {
+        neutralPositions[moveIdx].x = best.x;
+        neutralPositions[moveIdx].y = best.y;
+        syncPlaced(moveIdx);
+        relocated = true;
+      }
+    }
+    if (!relocated) break;
+    declump();
+  }
+};
+
 /** Generate a fresh constellation for the given level configuration. */
 export const generateMap = (cfg: MapGenConfig): MapSpec => {
+  const patterned = (cfg.starPattern?.length ?? 0) > 0;
   const totalPlanets = Math.max(
     cfg.playerCount + 2,
     irange(cfg.totalPlanets[0], cfg.totalPlanets[1]),
   );
   const neutralCount = totalPlanets - cfg.playerCount;
-  const minSep = frange(MIN_SEPARATION_RANGE[0], MIN_SEPARATION_RANGE[1]);
+  // Star patterns place neighboring figure stars closer than the scatter
+  // floor allows, so the sampler runs with a tighter separation there.
+  const minSep = patterned
+    ? 140
+    : frange(MIN_SEPARATION_RANGE[0], MIN_SEPARATION_RANGE[1]);
   const layouts = cfg.layouts && cfg.layouts.length > 0 ? cfg.layouts : ['scatter' as const];
   const layout = layouts[Math.floor(Math.random() * layouts.length)];
 
@@ -676,7 +896,9 @@ export const generateMap = (cfg: MapGenConfig): MapSpec => {
   // Neutrals — place first (layout decides where), value them second (their
   // position decides what they're worth). Placement uses a mid-size radius
   // stand-in; the separation floor dwarfs any radius delta.
-  const slots = buildNeutralSlots(layout, neutralCount);
+  const slots = patterned
+    ? buildPatternSlots(cfg.starPattern!, neutralCount)
+    : buildNeutralSlots(layout, neutralCount);
   const neutralPositions: Array<{ x: number; y: number; rich: boolean }> = [];
   for (const slot of slots) {
     let pos = tryPlace(slot.zone, placed, SIZE_RADIUS[1], minSep);
@@ -689,6 +911,14 @@ export const generateMap = (cfg: MapGenConfig): MapSpec => {
     neutralPositions.push({ ...pos, rich: slot.rich ?? false });
     placed.push({ ...pos, r: SIZE_RADIUS[1] });
   }
+
+  // ── Placement fairness pass ────────────────────────────────────────────
+  // The rejection sampler is blind to strategy: a roll can strand one start
+  // with no safe expansion while a rival has three, or (via the sampler's
+  // last-resort fallback) drop two neutrals nearly on top of each other.
+  // Both are fixed here, before the value gradient prices the worlds, so
+  // relocated planets are valued at their FINAL position.
+  fairnessPass(cfg, neutralPositions, placed, patterned);
 
   // Contestedness: distance to the nearest start, min-max normalized across
   // this map's neutrals. Worlds near somebody's doorstep come out cheap;

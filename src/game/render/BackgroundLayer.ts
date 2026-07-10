@@ -154,9 +154,11 @@ export class BackgroundLayer extends Container {
           spinB: -dir * (0.004 + rng() * 0.006),
           driftPhase: rng() * Math.PI * 2,
           driftRate: 0.01 + rng() * 0.012,
-          // The 0.85 factor is a deliberate 15% transparency cut — at full
-          // strength the clouds pulled the eye away from the planets.
-          baseAlpha: (0.45 + rng() * 0.15) * 0.85,
+          // 0.85 was the original 15% transparency cut (full-strength clouds
+          // pulled the eye away from the planets); the further 0.9 is a
+          // deliberate extra 10% cut so the dust reads subtle and real
+          // rather than painted on.
+          baseAlpha: (0.45 + rng() * 0.15) * 0.85 * 0.9,
         };
         root.alpha = cloud.baseAlpha;
         this.clouds.push(cloud);

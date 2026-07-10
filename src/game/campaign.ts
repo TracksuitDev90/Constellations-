@@ -193,6 +193,183 @@ export const LEVELS: LevelDef[] = [
     aiConfigs: [FIERCE_AI, FIERCE_AI, FIERCE_AI],
     personalities: [ECONOMIST, OPPORTUNIST, AGGRESSOR],
   },
+
+  // ── The Zodiac ──────────────────────────────────────────────────────────
+  // A second arc after the main campaign: each sky IS a real zodiac sign —
+  // the neutral planets trace the constellation's principal stars (see
+  // `starPattern` in the map generator), so the figure you fight over is the
+  // figure in the night sky. Difficulty deliberately mixes easy, medium and
+  // hard, driven by hazards and by AI intelligence/aggression, so the arc
+  // reads as a tour of the ecliptic rather than one long final exam.
+  {
+    id: 'aries',
+    name: 'Aries',
+    blurb: 'The Ram — an easy sky. A drowsy rival grazes along the horns.',
+    map: {
+      playerCount: 2,
+      totalPlanets: [7, 7],
+      hazardPool: ['asteroidField', 'driftingPlanet'],
+      calmChance: 0.6,
+      playerGarrison: 24,
+      enemyGarrison: 11,
+      playerRing: true,
+      // Hamal–Sheratan–Mesarthim arc with the fainter flank stars.
+      starPattern: [
+        [0.14, 0.52],
+        [0.38, 0.34],
+        [0.6, 0.3],
+        [0.8, 0.42],
+        [0.9, 0.62],
+      ],
+    },
+    aiConfigs: [CHILL_AI],
+  },
+  {
+    id: 'taurus',
+    name: 'Taurus',
+    blurb: 'The Bull — easy, but stubborn: a hoarder digs in among the Hyades.',
+    map: {
+      playerCount: 2,
+      totalPlanets: [9, 9],
+      hazardPool: ['asteroidField', 'neutralSwarm', 'driftingPlanet'],
+      calmChance: 0.35,
+      playerGarrison: 22,
+      enemyGarrison: 14,
+      playerRing: true,
+      // The V of the Hyades opening into the long horns (β Tau / ζ Tau).
+      starPattern: [
+        [0.9, 0.08],
+        [0.94, 0.6],
+        [0.68, 0.22],
+        [0.72, 0.5],
+        [0.5, 0.36],
+        [0.3, 0.34],
+        [0.1, 0.4],
+      ],
+    },
+    aiConfigs: [NORMAL_AI],
+    personalities: [ECONOMIST],
+  },
+  {
+    id: 'gemini',
+    name: 'Gemini',
+    blurb: 'The Twins — medium. Two matched minds, and twin gates that fold the sky.',
+    map: {
+      playerCount: 3,
+      totalPlanets: [11, 11],
+      hazardPool: ['wormhole', 'driftingPlanet', 'asteroidField'],
+      calmChance: 0.2,
+      playerGarrison: 20,
+      enemyGarrison: 15,
+      playerRing: true,
+      // Castor's and Pollux's stick figures, shoulder to shoulder.
+      starPattern: [
+        [0.3, 0.1],
+        [0.52, 0.16],
+        [0.34, 0.34],
+        [0.56, 0.4],
+        [0.38, 0.58],
+        [0.6, 0.64],
+        [0.44, 0.84],
+        [0.68, 0.88],
+      ],
+    },
+    aiConfigs: [NORMAL_AI, NORMAL_AI],
+    // Identical temperaments — the whole point of the Twins.
+    personalities: [OPPORTUNIST, OPPORTUNIST],
+  },
+  {
+    id: 'leo',
+    name: 'Leo',
+    blurb: 'The Lion — medium-hard. A fierce aggressor prowls the Sickle, and Regulus flares.',
+    map: {
+      playerCount: 2,
+      totalPlanets: [11, 11],
+      hazardPool: ['flareStar', 'neutralSwarm', 'asteroidField'],
+      calmChance: 0.12,
+      playerGarrison: 20,
+      enemyGarrison: 17,
+      playerRing: true,
+      // The Sickle (head/mane, Regulus at its foot) plus the hindquarter
+      // triangle out to Denebola.
+      starPattern: [
+        [0.78, 0.72],
+        [0.76, 0.52],
+        [0.84, 0.36],
+        [0.74, 0.2],
+        [0.58, 0.12],
+        [0.48, 0.26],
+        [0.38, 0.44],
+        [0.3, 0.68],
+        [0.08, 0.56],
+      ],
+    },
+    aiConfigs: [FIERCE_AI],
+    personalities: [AGGRESSOR],
+  },
+  {
+    id: 'scorpius',
+    name: 'Scorpius',
+    blurb: 'The Scorpion — hard. A dark star burns in the claws; the sting is live.',
+    map: {
+      playerCount: 3,
+      totalPlanets: [12, 12],
+      hazardPool: ['blackHole', 'flareStar', 'neutralSwarm', 'wormhole'],
+      calmChance: 0.08,
+      playerGarrison: 20,
+      enemyGarrison: 18,
+      playerRing: true,
+      // Head and claws top-right, the long body curving down into the
+      // hooked stinger — Antares glowing a third of the way along.
+      starPattern: [
+        [0.86, 0.14],
+        [0.94, 0.28],
+        [0.8, 0.3],
+        [0.68, 0.36],
+        [0.58, 0.46],
+        [0.5, 0.62],
+        [0.48, 0.8],
+        [0.6, 0.92],
+        [0.74, 0.86],
+      ],
+    },
+    aiConfigs: [NORMAL_AI, FIERCE_AI],
+    personalities: [OPPORTUNIST, AGGRESSOR],
+  },
+  {
+    id: 'sagittarius',
+    name: 'Sagittarius',
+    blurb: 'The Archer — hard. Four armies fight over the Teapot with everything turned on.',
+    map: {
+      playerCount: 4,
+      totalPlanets: [12, 12],
+      hazardPool: [
+        'driftingPlanet',
+        'asteroidField',
+        'neutralSwarm',
+        'blackHole',
+        'flareStar',
+        'wormhole',
+      ],
+      calmChance: 0.05,
+      playerGarrison: 20,
+      enemyGarrison: 19,
+      playerRing: true,
+      // The Teapot: lid, body, spout tip and handle.
+      starPattern: [
+        [0.48, 0.16],
+        [0.34, 0.38],
+        [0.62, 0.34],
+        [0.3, 0.62],
+        [0.66, 0.6],
+        [0.1, 0.46],
+        [0.84, 0.42],
+        [0.8, 0.66],
+      ],
+    },
+    aiConfigs: [FIERCE_AI, FIERCE_AI, FIERCE_AI],
+    personalities: [ECONOMIST, OPPORTUNIST, AGGRESSOR],
+  },
 ];
 
 const PROGRESS_KEY = 'constellations.unlocked';

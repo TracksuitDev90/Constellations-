@@ -768,3 +768,85 @@ describe('fractional sends', () => {
     expect(w.planets[0].garrison).toBeGreaterThan(0);
   });
 });
+
+describe('reinforce / reabsorb reliability', () => {
+  const soloMap: MapSpec = {
+    width: 200,
+    height: 100,
+    planets: [{ pos: { x: 100, y: 50 }, radius: 16, owner: 0, garrison: 20 }],
+    edges: [],
+  };
+
+  it('absorb heals a damaged ringless planet exactly to full, then releases the rest', () => {
+    const w = new World(soloMap, [{ id: 0, isAI: false, name: 'P' }]);
+    const p = w.planets[0];
+    p.productionRate = 0;
+    p.health = p.maxHealth - 3;
+    w.triggerAbsorb(0, 0, true);
+    for (let i = 0; i < 400; i++) w.step(0.05);
+    expect(p.health).toBe(p.maxHealth);
+    // Absorb auto-cancelled once there was nothing left to feed.
+    expect(p.absorbing).toBe(false);
+    // Exactly 3 units were consumed to heal 3 damage — nobody else was
+    // wasted feeding a full planet.
+    expect(p.garrison).toBe(17);
+    const orbiters = w.ships.all.filter(
+      (s) => s.active && s.state === 'orbiting' && s.parentPlanet === 0,
+    );
+    expect(orbiters.length).toBe(17);
+    // No unit left stuck mid-pull.
+    expect(
+      w.ships.all.filter((s) => s.active && s.state === 'absorbing').length,
+    ).toBe(0);
+  });
+
+  it('re-selecting the local swarm and sending it home heals the planet', () => {
+    const w = new World(soloMap, [{ id: 0, isAI: false, name: 'P' }]);
+    const p = w.planets[0];
+    p.productionRate = 0;
+    p.health = p.maxHealth - 2;
+    // The player taps the planet / lassoes the swarm, then taps the planet:
+    // Selection.routeTo(planet, absorb=true) → commandSelectedTo on itself.
+    for (const s of w.ships.all) {
+      if (s.active && s.state === 'orbiting' && s.parentPlanet === 0) {
+        s.isSelected = true;
+      }
+    }
+    const sent = w.commandSelectedTo(0, { planetId: 0 }, { absorbOnArrive: true });
+    expect(sent).toBe(20);
+    for (let i = 0; i < 600; i++) w.step(0.05);
+    expect(p.health).toBe(p.maxHealth);
+    // 2 consumed to heal; the other 18 are back home in orbit, not lost.
+    expect(p.garrison).toBe(18);
+    const orbiters = w.ships.all.filter(
+      (s) => s.active && s.state === 'orbiting' && s.parentPlanet === 0,
+    );
+    expect(orbiters.length).toBe(18);
+  });
+
+  it('tagged reinforcements arriving after the heal completes join orbit instead of vanishing', () => {
+    const map: MapSpec = {
+      width: 400,
+      height: 100,
+      planets: [
+        { pos: { x: 40, y: 50 }, radius: 16, owner: 0, garrison: 20 },
+        { pos: { x: 360, y: 50 }, radius: 16, owner: 0, garrison: 15 },
+      ],
+      edges: [[0, 1]],
+    };
+    const w = new World(map, [{ id: 0, isAI: false, name: 'P' }]);
+    for (const p of w.planets) p.productionRate = 0;
+    const target = w.planets[0];
+    target.health = target.maxHealth - 1;
+    // Reinforce the damaged planet with a tagged absorb wave far bigger
+    // than the 1 HP it needs.
+    w.openStream(0, 1, 0, 10, { absorbOnArrive: true });
+    for (let i = 0; i < 800; i++) w.step(0.05);
+    expect(target.health).toBe(target.maxHealth);
+    // 10 arrived (+10), exactly 1 was consumed healing (−1).
+    expect(target.garrison).toBe(29);
+    expect(
+      w.ships.all.filter((s) => s.active && s.state === 'absorbing').length,
+    ).toBe(0);
+  });
+});

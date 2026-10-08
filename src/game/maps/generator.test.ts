@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { generateMap, type LayoutKind, type MapGenConfig } from './generator.js';
+import {
+  generateMap,
+  rotateMapQuarterTurn,
+  type LayoutKind,
+  type MapGenConfig,
+} from './generator.js';
 import { MAX_RING_COUNT } from '../sim/Planet.js';
 import type { PlanetType } from '../sim/Planet.js';
 
@@ -290,5 +295,64 @@ describe('hazard–reward coupling', () => {
         expect(drifter.ringCount ?? 0).toBeGreaterThanOrEqual(1);
       }
     }
+  });
+});
+
+describe('rotateMapQuarterTurn', () => {
+  it('turns the sky for portrait screens without changing any distance', () => {
+    const map = generateMap(
+      baseCfg({
+        hazardPool: ['wormhole', 'driftingPlanet', 'asteroidField'],
+        calmChance: 0,
+      }),
+    );
+    const turned = rotateMapQuarterTurn(map);
+    expect(turned.width).toBe(map.height);
+    expect(turned.height).toBe(map.width);
+    const d = (a: { x: number; y: number }, b: { x: number; y: number }): number =>
+      Math.hypot(a.x - b.x, a.y - b.y);
+    for (let i = 0; i < map.planets.length; i++) {
+      const p = turned.planets[i].pos;
+      expect(p.x).toBeGreaterThanOrEqual(0);
+      expect(p.x).toBeLessThanOrEqual(turned.width);
+      expect(p.y).toBeGreaterThanOrEqual(0);
+      expect(p.y).toBeLessThanOrEqual(turned.height);
+      for (let j = 0; j < i; j++) {
+        expect(d(p, turned.planets[j].pos)).toBeCloseTo(
+          d(map.planets[i].pos, map.planets[j].pos),
+          6,
+        );
+      }
+    }
+    // Rotation, not reflection: the signed area of any planet triangle
+    // keeps its sign, so a zodiac figure is never mirrored.
+    const cross = (m: typeof map): number => {
+      const [a, b, c] = m.planets.map((p) => p.pos);
+      return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    };
+    expect(Math.sign(cross(turned))).toBe(Math.sign(cross(map)));
+    expect(turned.hazards?.length).toBe(map.hazards?.length);
+  });
+});
+
+describe('hazard roll honors calmChance', () => {
+  it('a crowded four-player sky is only as calm as configured, and can hold a black hole', () => {
+    const cfg = baseCfg({
+      playerCount: 4,
+      totalPlanets: [12, 12],
+      hazardPool: ['blackHole', 'flareStar', 'wormhole'],
+      calmChance: 0.05,
+    });
+    let calm = 0;
+    let holes = 0;
+    const runs = 150;
+    for (let i = 0; i < runs; i++) {
+      const hz = generateMap(cfg).hazards ?? [];
+      if (hz.length === 0) calm++;
+      if (hz.some((h) => h.type === 'blackHole')) holes++;
+    }
+    // Unplaceable kinds used to silently turn the match calm (~35% here).
+    expect(calm / runs).toBeLessThan(0.15);
+    expect(holes).toBeGreaterThan(0);
   });
 });

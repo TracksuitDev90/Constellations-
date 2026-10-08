@@ -70,6 +70,50 @@ export const makeShipGlowTexture = (app: Application): Texture => {
 };
 
 /**
+ * Comet tail for in-flight ships: a tapered streak, hot at the head (right
+ * edge) and fading to nothing at the tail. Anchored at its head so a ship's
+ * core dot sits on the bright end and the streak trails along its heading.
+ */
+export const SHIP_TRAIL_LENGTH = 40;
+export const makeShipTrailTexture = (app: Application): Texture => {
+  return makeGlowTexture(app, 'ship-trail', (g) => {
+    const L = SHIP_TRAIL_LENGTH;
+    const H = 6;
+    const steps = 20;
+    // t = 0 at the tail, 1 at the head; half-height tapers toward the tail.
+    const half = (t: number): number => 0.3 + (H / 2 - 0.3) * t;
+    for (let i = 0; i < steps; i++) {
+      const t0 = i / steps;
+      const t1 = (i + 1) / steps;
+      g.poly([
+        t0 * L, H / 2 - half(t0),
+        t1 * L, H / 2 - half(t1),
+        t1 * L, H / 2 + half(t1),
+        t0 * L, H / 2 + half(t0),
+      ]).fill({ color: 0xffffff, alpha: Math.pow(t1, 1.8) * 0.55 });
+    }
+  });
+};
+
+/**
+ * Thin bright ring with a soft inner bloom, used by FxLayer as the expanding
+ * shock of a burst. Baked at R = 16 so a scale of 1 is a 16-unit ring.
+ */
+export const FX_RING_RADIUS = 16;
+export const makeFxRingTexture = (app: Application): Texture => {
+  return makeGlowTexture(app, 'fx-ring', (g) => {
+    const R = FX_RING_RADIUS;
+    const C = R + 4;
+    for (let i = 4; i > 0; i--) {
+      g.circle(C, C, R - 1 + i * 0.6).stroke({ width: 1.2, color: 0xffffff, alpha: 0.06 * i });
+    }
+    g.circle(C, C, R).stroke({ width: 1.6, color: 0xffffff, alpha: 0.95 });
+    // Faint fill so the ring's first frames read as a flash, not a hoop.
+    g.circle(C, C, R - 1).fill({ color: 0xffffff, alpha: 0.05 });
+  });
+};
+
+/**
  * An archetype id is the base filename of one of the equirectangular maps in
  * public/textures (e.g. 'IMG_0314'). Every planet pulls a stable archetype id
  * from the pool and the baker projects that map onto a lit sphere at runtime.

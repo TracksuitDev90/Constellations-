@@ -4,17 +4,20 @@ import { Audio } from './audio/Audio.js';
 import { LEVELS, loadUnlockedCount, recordVictory } from './campaign.js';
 import { Input } from './input/Input.js';
 import { Selection } from './input/Selection.js';
-import { generateMap } from './maps/generator.js';
+import { generateMap, rotateMapQuarterTurn } from './maps/generator.js';
 import { ringCapacity, type Planet } from './sim/Planet.js';
 import { loadPlanetAssets } from './render/planetAssets.js';
 import { assignPlanetArchetypes } from './render/textures.js';
 import { Renderer } from './render/Renderer.js';
 import { ORBIT_RADIUS_MULT, World } from './sim/World.js';
 import { Hud } from '../ui/Hud.js';
+import { paletteFor } from '../util/color.js';
 import { showOverlay } from '../ui/Overlay.js';
 import { Tutorial, tutorialCompleted } from '../ui/Tutorial.js';
 
 const FIXED_DT = 1 / 30;
+/** Burst tint for a downed swarm hostile — the hazard's reserved green. */
+const SWARM_BURST_COLOR = 0x7dff6a;
 
 export class Game {
   private app: Application;
@@ -56,6 +59,8 @@ export class Game {
   /** Player planets currently under inbound attack; refreshed ~4×/second. */
   private threatened = new Set<number>();
   private threatScanAcc = 0;
+  /** Reused per-frame buffer for Selection.committedCounts. */
+  private selectionCounts = new Map<number, number>();
 
   constructor(app: Application, ui: HTMLElement) {
     this.app = app;
@@ -138,7 +143,12 @@ export class Game {
     // Generate the map and assign each planet its texture archetype before
     // loading, so we fetch + alpha-scan only the ≤11 stickers this match
     // actually draws instead of the whole 39-image pool.
-    const map = generateMap(level.map);
+    // Portrait phones get the sky turned a quarter so the long axis of the
+    // map runs down the long axis of the screen — the landscape layout
+    // otherwise shrinks to a thin strip of tiny planets.
+    const generated = generateMap(level.map);
+    const portrait = window.innerHeight > window.innerWidth * 1.1;
+    const map = portrait ? rotateMapQuarterTurn(generated) : generated;
     const archetypes = assignPlanetArchetypes(
       map.planets.map((_, i) => i),
       // Wall-clock seed so replays shuffle the pool.
@@ -189,20 +199,36 @@ export class Game {
           if (owner !== 0) return;
           this.audio.shipAbsorbed(planetId);
         },
-        onShipDeath: () => {
+        onShipDeath: (owner, x, y) => {
           this.audio.shipDeath();
           this.deathTimestamps.push(performance.now());
+          this.renderer.fx.burst(x, y, paletteFor(owner).ship);
         },
-        onShipConsumed: () => {
+        onShipImpact: (_planetId, owner, x, y) => {
+          this.renderer.fx.burst(x, y, paletteFor(owner).core, {
+            size: 7,
+            ttl: 0.34,
+            strength: 0.75,
+          });
+        },
+        onNeutralDeath: (x, y) => {
+          this.renderer.fx.burst(x, y, SWARM_BURST_COLOR);
+        },
+        onShipConsumed: (_owner, x, y) => {
           this.audio.shipConsumed();
           // A hole eating a wave should read as combat pressure too.
           this.deathTimestamps.push(performance.now());
+          this.renderer.fx.burst(x, y, 0xd8ccff, { size: 6, strength: 0.6 });
         },
         onFlareDetonate: () => {
           this.audio.flareDetonation();
         },
-        onShipWarp: () => {
+        onShipWarp: (owner, fromX, fromY, toX, toY) => {
           this.audio.shipWarp();
+          const color = paletteFor(owner).ship;
+          const warp = { size: 12, ttl: 0.5, strength: 0.6 };
+          this.renderer.fx.burst(fromX, fromY, color, warp);
+          this.renderer.fx.burst(toX, toY, color, warp);
         },
         onPlanetEvolve: (_planetId, owner, newType) => {
           if (owner !== 0) return;
@@ -344,10 +370,23 @@ export class Game {
       dragCommit: (src, tgt) => {
         if (this.world.planets[src].owner !== 0) return;
         this.world.openStream(0, src, tgt);
+        this.tutorial?.notify('command');
       },
-      dragPreview: () => {
-        // Could render a preview arrow; skipped for v1 to keep visuals clean.
+      dragCommitPoint: (src, wx, wy) => {
+        const p = this.world.planets[src];
+        if (p.owner !== 0) return;
+        // Released inside the planet's own swarm band: an aborted drag, not
+        // an order to park the fleet a hair off the surface.
+        const d = Math.hypot(wx - p.pos.x, wy - p.pos.y);
+        if (d <= p.radius * ORBIT_RADIUS_MULT + 12) return;
+        // Drag into open space parks the whole swarm there — the same order
+        // as gathering it and tapping empty space, in one gesture.
+        this.selection.set(src);
+        this.selection.escalate(src);
+        this.selection.routeToPoint(wx, wy);
+        this.selection.clear();
       },
+      dragPreview: (src, tgt, wx, wy) => this.renderer.setDragPreview(src, tgt, wx, wy),
       lassoUpdate: (x0, y0, x1, y1) => this.renderer.setLasso(x0, y0, x1, y1),
       lassoCommit: (x0, y0, x1, y1) => {
         const radius = Math.hypot(x1 - x0, y1 - y0);
@@ -529,7 +568,10 @@ export class Game {
     this.renderer.planetLayer.setBeat(beat);
     this.renderer.shipLayer.setBeat(beat);
 
-    this.renderer.planetLayer.setSelection(this.selection.ids);
+    this.renderer.planetLayer.setSelection(
+      this.selection.ids,
+      this.selection.committedCounts(this.selectionCounts),
+    );
     this.renderer.update(dt);
     this.hud?.update(this.world);
 

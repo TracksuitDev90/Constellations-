@@ -3,7 +3,16 @@
 An audit-driven list of design changes that would move Constellations from
 "inspired by Auralux" to "plays like Auralux," ordered roughly by impact.
 Each item names the code it touches so it can be picked up as a standalone
-task. Nothing here is implemented yet — this is the design backlog.
+task.
+
+> **Status:** most of this backlog has shipped — free-flight movement (1),
+> half/full commitment (2), the `n / cap` readout (3), absorbing and
+> escalating AI with personalities (4), the steeper production curve (5),
+> free-for-alls (6), 1×/2×/4× speed (7), the campaign shell (8), beat-synced
+> glow and end-of-match FX (9), and the guided tutorial (10). Later passes
+> added Auralux-style capture contests on neutral stars, production that
+> pauses at capacity, and portrait-phone framing. The notes below are kept
+> as the design rationale.
 
 ## 1. Commit to one movement model (highest impact)
 

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { World, type MapSpec } from '../sim/World.js';
-import { BasicAI, NORMAL_AI, AGGRESSOR, ECONOMIST } from './BasicAI.js';
+import { BasicAI, CHILL_AI, NORMAL_AI, AGGRESSOR, ECONOMIST } from './BasicAI.js';
 
 const players = [
   { id: 0, isAI: false, name: 'P' },
@@ -133,5 +133,29 @@ describe('hazard-aware targeting', () => {
     expect(streams.length).toBe(2);
     const committed = streams.reduce((sum, s) => sum + s.remaining, 0);
     expect(committed).toBeGreaterThan(40);
+  });
+});
+
+describe('capacity-aware offense', () => {
+  it('a cautious rival still attacks from a world that is full', () => {
+    // At capacity, production has stopped. A chill rival used to hold back
+    // 85% of the swarm and never field the minimum wave from a small world.
+    const map: MapSpec = {
+      width: 600,
+      height: 200,
+      planets: [
+        { pos: { x: 100, y: 100 }, type: 0, owner: 1, garrison: 40 },
+        { pos: { x: 400, y: 100 }, type: 0, owner: 0, garrison: 4 },
+        { pos: { x: 550, y: 180 }, type: 0, owner: 0, garrison: 4 },
+      ],
+      edges: [],
+    };
+    const w = new World(map, players);
+    const ai = new BasicAI(w, 1, CHILL_AI);
+    ai.update(CHILL_AI.tickInterval + 0.1);
+    const outbound = w.streams.filter((s) => s.owner === 1);
+    expect(outbound.length).toBe(1);
+    // Sized for defenders + hull + the regrowth during the flight.
+    expect(outbound[0].remaining).toBeGreaterThan(4 + 3);
   });
 });

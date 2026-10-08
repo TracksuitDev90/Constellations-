@@ -14,6 +14,8 @@ export class Selection {
   private playerId: number;
   private selected = new Set<number>();
   private stages = new Map<number, SelectionStage>();
+  /** Per-planet live-orbiter tally reused by committedCounts. */
+  private localScratch = new Map<number, number>();
 
   constructor(world: World, playerId: number) {
     this.world = world;
@@ -27,6 +29,33 @@ export class Selection {
   /** Current stage of a selected planet (undefined when not selected). */
   stageOf(planetId: number): SelectionStage | undefined {
     return this.stages.get(planetId);
+  }
+
+  /**
+   * How many units each selected planet will launch on the next order:
+   * its selected live orbiters, plus — for a full (stage 2) selection — the
+   * production overflow the send drains from the garrison. Filled into
+   * `out` (cleared first) so the per-frame HUD read allocates nothing.
+   */
+  committedCounts(out: Map<number, number>): Map<number, number> {
+    out.clear();
+    if (this.selected.size === 0) return out;
+    const local = this.localScratch;
+    local.clear();
+    for (const s of this.world.ships.all) {
+      if (!s.active || s.owner !== this.playerId || s.state !== 'orbiting') continue;
+      if (!this.selected.has(s.parentPlanet)) continue;
+      local.set(s.parentPlanet, (local.get(s.parentPlanet) ?? 0) + 1);
+      if (s.isSelected) out.set(s.parentPlanet, (out.get(s.parentPlanet) ?? 0) + 1);
+    }
+    for (const id of this.selected) {
+      const p = this.world.planets[id];
+      let n = out.get(id) ?? 0;
+      if (this.stages.get(id) === 2) n += Math.max(0, p.garrison - (local.get(id) ?? 0));
+      else if (n === 0) n = Math.ceil(p.garrison / 2);
+      out.set(id, n);
+    }
+    return out;
   }
 
   /** True when any unit (orbiting, transiting, or hovering) is selected. */

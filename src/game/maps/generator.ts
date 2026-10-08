@@ -505,41 +505,52 @@ const rollHazardOfKind = (
     // must leave every planet's orbit band untouched (center far enough that
     // orbiters never feel pull) and stay well clear of the start worlds. If
     // the map is too dense, shrink the well before giving up — a null roll
-    // just means this match stays hole-free.
+    // hands the slot to another hazard kind.
+    // Two search tiers: the contested middle with a roomy margin first; on
+    // dense maps (12 planets, four starts) that box is always full, so the
+    // second tier widens to the whole playfield with a tighter margin. Gravity
+    // only acts on ships in flight — orbiting garrisons never feel it — so
+    // the tighter margin costs nothing but a slightly bolder launch lane.
     const horizonRadius = irange(16, 20);
-    let gravityRadius = frange(130, 170);
-    while (gravityRadius >= 110) {
-      for (let attempt = 0; attempt < 25; attempt++) {
-        const candidate = {
-          x: frange(MAP_WIDTH * 0.28, MAP_WIDTH * 0.72),
-          y: frange(MAP_HEIGHT * 0.3, MAP_HEIGHT * 0.7),
-        };
-        const clearOfPlanets = positions.every(
-          (p) => Math.hypot(candidate.x - p.x, candidate.y - p.y) > gravityRadius + 110,
-        );
-        const clearOfStarts = starts.every(
-          (s) => Math.hypot(candidate.x - s.x, candidate.y - s.y) > 340,
-        );
-        if (clearOfPlanets && clearOfStarts && clearOfHazards(candidate, gravityRadius)) {
-          // Dangerous riches: neutrals in the well's neighborhood gain a
-          // ring. Attacking or holding them means flying the slingshot line
-          // every time — a skill play with a fatal inner edge.
-          let sweetened = 0;
-          for (let i = firstNeutral; i < planets.length && sweetened < 2; i++) {
-            const p = planets[i];
-            const d = Math.hypot(candidate.x - p.pos.x, candidate.y - p.pos.y);
-            if (d < gravityRadius * 2.2 && addRing(p)) sweetened++;
-          }
-          return {
-            type: 'blackHole',
-            pos: candidate,
-            horizonRadius,
-            gravityRadius,
-            seed: Math.floor(Math.random() * 1e9),
+    const tiers = [
+      { x: [0.28, 0.72], y: [0.3, 0.7], margin: 110, minGravity: 110 },
+      { x: [0.14, 0.86], y: [0.16, 0.84], margin: 70, minGravity: 100 },
+    ];
+    for (const tier of tiers) {
+      let gravityRadius = frange(130, 170);
+      while (gravityRadius >= tier.minGravity) {
+        for (let attempt = 0; attempt < 25; attempt++) {
+          const candidate = {
+            x: frange(MAP_WIDTH * tier.x[0], MAP_WIDTH * tier.x[1]),
+            y: frange(MAP_HEIGHT * tier.y[0], MAP_HEIGHT * tier.y[1]),
           };
+          const clearOfPlanets = positions.every(
+            (p) => Math.hypot(candidate.x - p.x, candidate.y - p.y) > gravityRadius + tier.margin,
+          );
+          const clearOfStarts = starts.every(
+            (s) => Math.hypot(candidate.x - s.x, candidate.y - s.y) > 340,
+          );
+          if (clearOfPlanets && clearOfStarts && clearOfHazards(candidate, gravityRadius)) {
+            // Dangerous riches: neutrals in the well's neighborhood gain a
+            // ring. Attacking or holding them means flying the slingshot line
+            // every time — a skill play with a fatal inner edge.
+            let sweetened = 0;
+            for (let i = firstNeutral; i < planets.length && sweetened < 2; i++) {
+              const p = planets[i];
+              const d = Math.hypot(candidate.x - p.pos.x, candidate.y - p.pos.y);
+              if (d < gravityRadius * 2.2 && addRing(p)) sweetened++;
+            }
+            return {
+              type: 'blackHole',
+              pos: candidate,
+              horizonRadius,
+              gravityRadius,
+              seed: Math.floor(Math.random() * 1e9),
+            };
+          }
         }
+        gravityRadius -= 15;
       }
-      gravityRadius -= 15;
     }
     return null;
   }
@@ -673,21 +684,26 @@ const rollHazards = (
 ): HazardSpec[] => {
   if (cfg.hazardPool.length === 0) return [];
   if (Math.random() < cfg.calmChance) return [];
+  // Kinds are tried in a shuffled order until one fits. A kind that can't
+  // be placed on this particular map (no open sky for a black hole on a
+  // crowded four-player board) used to turn the whole match calm — far
+  // calmer than the level's `calmChance` promised.
   const pool = [...new Set(cfg.hazardPool)];
-  const first = pool[Math.floor(Math.random() * pool.length)];
+  for (let i = pool.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [pool[i], pool[j]] = [pool[j], pool[i]];
+  }
   const hazards: HazardSpec[] = [];
-  const rolled = rollHazardOfKind(first, cfg, planets, positions);
-  if (rolled) hazards.push(rolled);
-  const rest = pool.filter((k) => k !== first);
-  if (hazards.length > 0 && rest.length > 0 && Math.random() < SECOND_HAZARD_CHANCE) {
-    const second = rollHazardOfKind(
-      rest[Math.floor(Math.random() * rest.length)],
-      cfg,
-      planets,
-      positions,
-      hazards,
-    );
-    if (second) hazards.push(second);
+  let k = 0;
+  while (k < pool.length && hazards.length === 0) {
+    const rolled = rollHazardOfKind(pool[k++], cfg, planets, positions);
+    if (rolled) hazards.push(rolled);
+  }
+  if (hazards.length > 0 && k < pool.length && Math.random() < SECOND_HAZARD_CHANCE) {
+    while (k < pool.length && hazards.length === 1) {
+      const second = rollHazardOfKind(pool[k++], cfg, planets, positions, hazards);
+      if (second) hazards.push(second);
+    }
   }
   return hazards;
 };
@@ -952,6 +968,43 @@ export const generateMap = (cfg: MapGenConfig): MapSpec => {
     height: MAP_HEIGHT,
     planets,
     edges,
+    hazards,
+  };
+};
+
+/**
+ * Turn a generated map a quarter turn clockwise, swapping width and height —
+ * used when the match starts on a portrait screen, where the landscape sky
+ * would shrink to a thin strip. A rotation preserves every distance, so the
+ * match plays exactly as generated, and preserves handedness, so a zodiac
+ * figure is still its constellation, only turned (as it turns across a
+ * night) rather than mirrored.
+ */
+export const rotateMapQuarterTurn = (spec: MapSpec): MapSpec => {
+  const h = spec.height;
+  const rot = (p: { x: number; y: number }): { x: number; y: number } => ({
+    x: h - p.y,
+    y: p.x,
+  });
+  const hazards = spec.hazards?.map((hz): HazardSpec => {
+    switch (hz.type) {
+      case 'driftingPlanet':
+        // Velocities turn with the map: (vx, vy) → (−vy, vx).
+        return { ...hz, vx: -hz.vy, vy: hz.vx };
+      case 'wormhole':
+        return { ...hz, a: rot(hz.a), b: rot(hz.b) };
+      case 'asteroidField':
+      case 'neutralSwarm':
+      case 'blackHole':
+      case 'flareStar':
+        return { ...hz, pos: rot(hz.pos) };
+    }
+  });
+  return {
+    width: spec.height,
+    height: spec.width,
+    planets: spec.planets.map((p) => ({ ...p, pos: rot(p.pos) })),
+    edges: spec.edges.map(([a, b]) => [a, b]),
     hazards,
   };
 };

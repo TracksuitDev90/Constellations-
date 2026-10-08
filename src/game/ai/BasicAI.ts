@@ -1,6 +1,7 @@
 import { clamp, dist, segCircleIntersectionLength, type Vec2 } from '../../util/math.js';
 import {
   pointToSegmentDist,
+  SHIP_SPEED,
   SLINGSHOT_INNER_MULT,
   type World,
 } from '../sim/World.js';
@@ -166,6 +167,12 @@ const SWARM_ROUTE_MARGIN = 60;
  * surplus toward the front instead of letting it idle out of the fight.
  */
 const LOGISTICS_SURPLUS_FRAC = 0.7;
+/**
+ * Reserve multiplier for a planet at capacity. Production pauses when a world
+ * is full, so idling there is pure waste; halving the held-back fraction lets
+ * even a cautious rival's capped worlds field a real wave.
+ */
+const FULL_RESERVE_RELIEF = 0.5;
 
 /** Smoothstep — gentle start and finish for the escalation ramp. */
 const smoothstep = (t: number): number => {
@@ -426,8 +433,16 @@ export class BasicAI {
     const sortedByGarrison = [...myPlanets]
       .filter((p) => !usedSources.has(p.id))
       .sort((a, b) => b.garrison - a.garrison);
-    const availableOf = (p: (typeof myPlanets)[number]): number =>
-      p.absorbing ? 0 : p.garrison - Math.ceil(p.garrison * cfg.reserveFrac);
+    // A world at capacity has stopped producing — every second it sits full
+    // is production thrown away — so its reserve relaxes and it spends.
+    const availableOf = (p: (typeof myPlanets)[number]): number => {
+      if (p.absorbing) return 0;
+      const full = p.garrison >= p.maxUnitCapacity;
+      const reserve = Math.ceil(
+        Math.min(p.garrison, p.maxUnitCapacity) * cfg.reserveFrac * (full ? FULL_RESERVE_RELIEF : 1),
+      );
+      return p.garrison - reserve;
+    };
     let wavesLeft = cfg.maxWaves;
     const planned = new Map<number, number>();
 
@@ -454,8 +469,27 @@ export class BasicAI {
       for (const tgt of this.world.planets) {
         if (tgt.owner === me) continue;
         const committed = planned.get(tgt.id) ?? 0;
+        const cost = Math.max(60, this.effectiveTravelCost(p.pos, tgt.pos, available));
+        // An owned target keeps producing while the wave is in flight; size
+        // for the garrison it will have on arrival, not the one it has now.
+        // (Without this every "just enough" wave landed a dozen ships short
+        // and lopsided matches trickled on for many minutes.)
+        const regrowth =
+          tgt.owner === null
+            ? 0
+            : Math.min(
+                tgt.productionRate * (cost / SHIP_SPEED),
+                Math.max(0, tgt.maxUnitCapacity - tgt.garrison),
+              );
+        // True landing cost: hull as well as defenders on enemy worlds, and
+        // the extra landings to erase a rival's claim on a contested neutral.
         const needed =
-          tgt.garrison - this.incomingFriendly(tgt.id) - committed + ATTACK_MARGIN;
+          this.world.shipsToTake(tgt.id, me) -
+          1 +
+          Math.ceil(regrowth) -
+          this.incomingFriendly(tgt.id) -
+          committed +
+          ATTACK_MARGIN;
         // Already fully covered by this tick's earlier waves — don't pile on.
         if (needed <= 0) continue;
         const soloOk = available >= needed;
@@ -468,7 +502,6 @@ export class BasicAI {
           available + partnerAvailable >= needed &&
           available >= needed * 0.4;
         if (!soloOk && !jointOk) continue;
-        const cost = Math.max(60, this.effectiveTravelCost(p.pos, tgt.pos, available));
         // Prefer neutral targets early; neighbours over long-range gambles.
         const neutralBonus = tgt.owner === null ? 1.2 : 0.85;
         // Ringed worlds are worth more — the AI hunts the same treasure the

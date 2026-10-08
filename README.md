@@ -9,6 +9,8 @@ Every star you own continuously produces ships. Gather your swarm, send it acros
 - **Movement is free-flight.** Waves fly straight where you send them and fight 1-for-1 wherever enemy swarms cross. The constellation lines are the map's skeleton, not lanes.
 - **Commitment is the skill.** Tap your star once to gather **half** its swarm, again for **all** of it — deciding how much to risk is the whole game.
 - **Feeding is growth.** Send units into your own ringed star (or tap it a third time) to fill its rings; a full set of rings evolves it into a bigger, faster star. The `n / cap` readout under your ringed stars shows exactly what the next evolution costs.
+- **Full stars rest.** A star stops producing once its swarm reaches capacity (40 / 70 / 100 / 130 by size), so strength comes from spending units — tempo and map control — never from a hoarded stockpile.
+- **Capture is a contest.** Neutral stars show their defenders as a dim grey swarm. Every ship you land drains one, and a ring in your color fills around the star. A rival landing there first winds *your* claim back before it can start its own, so nobody snipes a nearly-taken star with a single ship.
 - **Hazards change each sky.** Drifting planets, asteroid belts that slow crossings, hostile green swarms that attack everyone, black holes with a fatal core and a slingshot rim, flare stars that detonate on a readable rhythm — cross between the pulses — and wormhole pairs that fold the map: ships (yours *and* theirs) automatically ride a gate whenever it's the shorter road.
 
 ## Controls
@@ -20,8 +22,11 @@ Every star you own continuously produces ships. Gather your swarm, send it acros
 - Tap empty space with a swarm gathered → send it there to hold position.
 - Double-tap empty space → gather your entire fleet.
 - Drag across empty space → lasso any of your units, anywhere.
-- Drag from one of your stars to a target → quick full-garrison wave.
+- Drag from one of your stars to a target → quick full-garrison wave. A dashed aim line, lock-on ring and unit count show exactly what the release will send; release over empty space to park the swarm there.
+- The number above a selected star is how many units your next order will launch from it.
 - Pinch to zoom, two-finger drag to pan.
+
+On a portrait phone the sky is turned a quarter so it fills the tall screen, every star answers taps within a fingertip-sized radius, and units grow slightly when you're zoomed out so swarms never shrink to specks. Add the page to your home screen to play it fullscreen, without browser chrome.
 
 **Mouse + keyboard:**
 - Click follows the same rules as tap.

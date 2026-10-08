@@ -850,3 +850,145 @@ describe('reinforce / reabsorb reliability', () => {
     ).toBe(0);
   });
 });
+
+describe('defender casualties', () => {
+  it('removes the physical orbiter when a defender trades with an attacker', () => {
+    const map: MapSpec = {
+      width: 1000,
+      height: 600,
+      planets: [
+        { pos: { x: 200, y: 300 }, type: 1, owner: 0, garrison: 20 },
+        { pos: { x: 800, y: 300 }, type: 1, owner: 1, garrison: 40 },
+        { pos: { x: 500, y: 100 }, type: 0, owner: null, garrison: 10 },
+      ],
+      edges: [[0, 1]],
+    };
+    const w = new World(map, [
+      { id: 0, isAI: false, name: 'P' },
+      { id: 1, isAI: true, name: 'A' },
+    ]);
+    for (const p of w.planets) p.productionRate = 0;
+    w.openStream(1, 1, 0, 15);
+    for (let i = 0; i < 30 * 25; i++) w.step(1 / 30);
+    const home = w.planets[0];
+    expect(home.owner).toBe(0);
+    expect(home.garrison).toBe(5);
+    const orbiters = w.ships.all.filter(
+      (s) => s.active && s.state === 'orbiting' && s.parentPlanet === 0,
+    );
+    expect(orbiters.length).toBe(5);
+    // Commanding the whole swarm can never launch more than the garrison.
+    for (const s of orbiters) s.isSelected = true;
+    expect(w.commandSelectedTo(0, { planetId: 2 })).toBe(5);
+  });
+});
+
+describe('neutral claim contest', () => {
+  const contestMap: MapSpec = {
+    width: 1200,
+    height: 400,
+    planets: [
+      { pos: { x: 100, y: 200 }, radius: 16, owner: 0, garrison: 40 },
+      { pos: { x: 1100, y: 200 }, radius: 16, owner: 1, garrison: 40 },
+      { pos: { x: 600, y: 200 }, radius: 16, owner: null, garrison: 10 },
+    ],
+    edges: [],
+  };
+  const contestPlayers = [
+    { id: 0, isAI: false, name: 'P' },
+    { id: 1, isAI: true, name: 'A' },
+  ];
+  const settle = (w: World): void => {
+    for (let i = 0; i < 30 * 30; i++) w.step(1 / 30);
+  };
+
+  it('a rival cannot snipe a nearly-drained neutral with one ship', () => {
+    const w = new World(contestMap, contestPlayers);
+    for (const p of w.planets) p.productionRate = 0;
+    const prize = w.planets[2];
+    w.openStream(0, 0, 2, 9);
+    settle(w);
+    expect(prize.owner).toBeNull();
+    expect(prize.captureOwner).toBe(0);
+    expect(prize.garrison).toBe(1);
+    // Under the old shared-counter rule, two rival ships stole it here.
+    w.openStream(1, 1, 2, 2);
+    settle(w);
+    expect(prize.owner).toBeNull();
+    expect(prize.captureOwner).toBe(0);
+    expect(prize.garrison).toBe(3);
+    expect(w.shipsToTake(2, 1)).toBe(3 + 2 * 7 + 1);
+    expect(w.shipsToTake(2, 0)).toBe(4);
+  });
+
+  it('erasing a rival claim fully hands the neutral back to open contest', () => {
+    const w = new World(contestMap, contestPlayers);
+    for (const p of w.planets) p.productionRate = 0;
+    const prize = w.planets[2];
+    w.openStream(0, 0, 2, 4);
+    settle(w);
+    expect(prize.garrison).toBe(6);
+    // 4 landings erase player 0's claim, the next 11 drain and capture.
+    w.openStream(1, 1, 2, 15);
+    settle(w);
+    expect(prize.owner).toBe(1);
+    // The capturing ship stays on as the new world's first defender.
+    expect(prize.garrison).toBe(1);
+    const orbiters = w.ships.all.filter(
+      (s) => s.active && s.state === 'orbiting' && s.parentPlanet === 2,
+    );
+    expect(orbiters.length).toBe(1);
+    expect(orbiters[0].owner).toBe(1);
+  });
+
+  it('a hull-broken world falls to the very next landing', () => {
+    // Player 1 keeps a second world so the match doesn't end mid-test.
+    const w = new World(
+      {
+        ...contestMap,
+        planets: [
+          ...contestMap.planets,
+          { pos: { x: 1100, y: 380 }, radius: 16, owner: 1, garrison: 5 },
+        ],
+      },
+      contestPlayers,
+    );
+    for (const p of w.planets) p.productionRate = 0;
+    const target = w.planets[1];
+    target.garrison = 0;
+    w.ships.all.forEach((s, i) => {
+      if (s.active && s.parentPlanet === 1) w.ships.kill(i);
+    });
+    expect(w.shipsToTake(1, 0)).toBe(target.health + 1);
+    w.openStream(0, 0, 1, target.health + 1);
+    settle(w);
+    expect(target.owner).toBe(0);
+  });
+});
+
+describe('production capacity', () => {
+  it('a full world stops producing instead of banking an unbounded reserve', () => {
+    const map: MapSpec = {
+      width: 400,
+      height: 200,
+      planets: [
+        { pos: { x: 100, y: 100 }, type: 0, owner: 0, garrison: 30 },
+        { pos: { x: 300, y: 100 }, type: 0, owner: 1, garrison: 5 },
+      ],
+      edges: [],
+    };
+    const w = new World(map, [
+      { id: 0, isAI: false, name: 'P' },
+      { id: 1, isAI: true, name: 'A' },
+    ]);
+    const p = w.planets[0];
+    for (let i = 0; i < 30 * 120; i++) w.step(1 / 30);
+    expect(p.garrison).toBe(p.maxUnitCapacity);
+    // Spending makes room, and production resumes.
+    for (const s of w.ships.all) if (s.active && s.parentPlanet === 0) s.isSelected = true;
+    w.commandSelectedTo(0, { x: 100, y: 180 });
+    expect(p.garrison).toBe(0);
+    for (let i = 0; i < 30 * 5; i++) w.step(1 / 30);
+    expect(p.garrison).toBeGreaterThan(0);
+  });
+});

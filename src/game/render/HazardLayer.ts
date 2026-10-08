@@ -155,6 +155,8 @@ export class HazardLayer extends Container {
   private flareRoot: Container;
   private wormholeRoot: Container;
   private time = 0;
+  /** Zoom compensation from the Renderer — keeps hostiles legible on phones. */
+  unitScale = 1;
 
   constructor(app: Application, world: World) {
     super();
@@ -519,12 +521,15 @@ export class HazardLayer extends Container {
         v.hull.x = n.x;
         v.hull.y = n.y;
         v.hull.rotation = n.heading;
+        v.hull.scale.set(0.9 * this.unitScale);
+        v.glow.scale.set(0.95 * this.unitScale);
+        v.engine.scale.set(this.unitScale);
         v.glow.x = n.x;
         v.glow.y = n.y;
         const cos = Math.cos(n.heading);
         const sin = Math.sin(n.heading);
-        v.engine.x = n.x - cos * 5;
-        v.engine.y = n.y - sin * 5;
+        v.engine.x = n.x - cos * 5 * this.unitScale;
+        v.engine.y = n.y - sin * 5 * this.unitScale;
         v.engine.rotation = n.heading;
         // Engine output telegraphs intent: hot in pursuit, idling on patrol.
         const flicker = 0.8 + 0.2 * Math.sin(this.time * 11 + n.phase);

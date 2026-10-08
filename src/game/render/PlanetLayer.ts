@@ -87,6 +87,8 @@ const ORBITER_POOL_MAX = 64;
 const RING_ALPHA_EASE_RATE = 0.6;
 /** How quickly the eased ring count catches its discrete target. */
 const RING_COUNT_EASE_RATE = 0.4;
+/** Neutral defenders read as a dim, calm swarm next to owned ones. */
+const NEUTRAL_SWARM_ALPHA = 0.8;
 
 const ringCountFor = (count: number): number => {
   if (count <= 0) return 0;
@@ -199,6 +201,17 @@ interface PlanetView {
    */
   costLabel: Text | null;
   lastCostText: string;
+  /** "how many will launch" count above a selected planet; lazy. */
+  selLabel: Text | null;
+  lastSelCount: number;
+  /** Whether each per-frame Graphics holds geometry (clear only if so). */
+  shockDrawn: boolean;
+  ringDrawn: boolean;
+  pulsesDrawn: boolean;
+  /** Eased neutral-claim progress (0..1) driving the claim arc. */
+  claimProgress: number;
+  /** Claimant whose colour the arc is painted in (sticky while it drains). */
+  claimOwner: number | null;
   lastOwner: number | null;
   displayScale: number;
   baseRadius: number;
@@ -248,7 +261,9 @@ export class PlanetLayer extends Container {
   private app: Application;
   private world: World;
   private views: PlanetView[] = [];
-  private selectedSources = new Set<number>();
+  private selectedSources: ReadonlySet<number> = new Set<number>();
+  /** Units each selected planet will commit (see Selection.committedCounts). */
+  private selectedCounts: ReadonlyMap<number, number> = new Map();
   /** Planets currently under inbound attack (see setThreatened). */
   private threatened = new Set<number>();
   private shipTex: Texture;
@@ -256,6 +271,10 @@ export class PlanetLayer extends Container {
   private time = 0;
   /** Ambient-music breathing (0..1), fed by Game each frame via setBeat. */
   private beat = 0;
+  /** Zoom compensation from the Renderer — keeps swarms legible on phones. */
+  unitScale = 1;
+  /** Same idea for world-space text: keeps labels ≥ ~11px on screen. */
+  labelScale = 1;
 
   constructor(app: Application, world: World) {
     super();
@@ -346,6 +365,13 @@ export class PlanetLayer extends Container {
         celebratePulse: 0,
         costLabel: null,
         lastCostText: '',
+        selLabel: null,
+        lastSelCount: -1,
+        shockDrawn: true,
+        ringDrawn: true,
+        pulsesDrawn: true,
+        claimProgress: 0,
+        claimOwner: null,
         lastOwner: planet.owner,
         displayScale: 1,
         baseRadius: planet.radius,
@@ -376,8 +402,13 @@ export class PlanetLayer extends Container {
     }
   }
 
-  setSelection(ids: Iterable<number>): void {
-    this.selectedSources = new Set(ids);
+  /**
+   * Selected source planets and how many units each will commit. Both are
+   * held by reference (the caller owns and refreshes them every frame).
+   */
+  setSelection(ids: ReadonlySet<number>, counts: ReadonlyMap<number, number>): void {
+    this.selectedSources = ids;
+    this.selectedCounts = counts;
   }
 
   /**
@@ -565,8 +596,16 @@ export class PlanetLayer extends Container {
       }
 
       // Evolve shockwave: a fading ring that expands outward past the halo
-      // whenever a planet has just grown to a new tier.
-      v.shockwave.clear();
+      // whenever a planet has just grown to a new tier. clear() re-uploads
+      // the geometry even when there's nothing to draw, so idle planets skip
+      // it — dozens of empty Graphics re-batched every frame added up.
+      const shockLive =
+        p.evolvePulse > 0.01 ||
+        p.capturePulse > 0.01 ||
+        v.celebrateDelay > 0 ||
+        v.celebratePulse > 0.01;
+      if (shockLive || v.shockDrawn) v.shockwave.clear();
+      v.shockDrawn = shockLive;
       if (p.evolvePulse > 0.01) {
         const t = 1 - p.evolvePulse; // 0 at spawn → 1 as it fades.
         const baseR = effRadius;
@@ -612,8 +651,14 @@ export class PlanetLayer extends Container {
           .stroke({ width: 2, color: 0xffffff, alpha: alpha * 0.5 });
       }
 
-      // Selection ring (pulsing) sits outside the capacity rings.
-      v.ring.clear();
+      // Selection ring (pulsing) sits outside the capacity rings. Same
+      // idle-skip as the shockwave: only clear when something was drawn.
+      const ringLive =
+        this.selectedSources.has(p.id) ||
+        this.threatened.has(p.id) ||
+        (p.owner === null && (p.captureOwner !== null || v.claimProgress >= 0.005));
+      if (ringLive || v.ringDrawn) v.ring.clear();
+      v.ringDrawn = ringLive;
       if (this.selectedSources.has(p.id)) {
         const ringsOuter =
           p.ringCount > 0
@@ -621,6 +666,9 @@ export class PlanetLayer extends Container {
             : 8;
         const outer = effRadius + ringsOuter + 8 + Math.sin(this.time * 4) * 1.6;
         v.ring.circle(0, 0, outer).stroke({ width: 2.5, color: pal.ring, alpha: 0.95 });
+        this.updateSelectionLabel(v, this.selectedCounts.get(p.id) ?? 0, outer, pal.ship);
+      } else if (v.selLabel?.visible) {
+        v.selLabel.visible = false;
       }
       // Incoming-attack warning: a slow amber pulse drawn OUTSIDE the orbit
       // band so it reads as a perimeter alert rather than getting lost in
@@ -637,6 +685,7 @@ export class PlanetLayer extends Container {
           .circle(0, 0, warnR * 0.92)
           .stroke({ width: 1.5, color: 0xff7a3c, alpha: 0.22 + 0.12 * wob });
       }
+      this.drawClaimArc(v, p, effRadius, dt);
 
       // Production detection: a sub-unit accumulator wrap means the sim just
       // spawned a ship this frame. Fire a production pulse even when the
@@ -651,10 +700,17 @@ export class PlanetLayer extends Container {
       // Orbiters: represent garrison (up to cap) as atom-symbol electrons.
       // Electron sprites move every frame (cheap transforms); the ghost
       // ellipse paths are Graphics and follow the 12 Hz rebuild cadence.
-      if (p.owner !== null) {
-        this.syncOrbiters(v, Math.min(p.garrison, orbiterCapFor(p.maxUnitCapacity)), p.owner);
+      // Neutral worlds show their defenders too, as a dim grey swarm — the
+      // price of a capture should be readable before you commit to it.
+      if (p.owner !== null || p.garrison > 0) {
+        this.syncOrbiters(
+          v,
+          Math.min(Math.max(0, p.garrison), orbiterCapFor(p.maxUnitCapacity)),
+          p.owner,
+        );
         this.tickOrbiters(v, dt);
         if (redrawHeavy) this.drawAtomPaths(v, pal.ring);
+        v.orbitRoot.alpha = p.owner === null ? NEUTRAL_SWARM_ALPHA : 1;
       } else {
         if (v.orbiters.length > 0) this.clearOrbiters(v);
         v.atomPaths.clear();
@@ -664,6 +720,78 @@ export class PlanetLayer extends Container {
       this.drawProductionPulses(v, dt, effRadius, pal);
       this.updateCostLabel(v, p, effRadius);
     }
+  }
+
+  /**
+   * Commitment readout above a selected planet: the number of units the
+   * next order will launch from it. Half-selection vs full is the core
+   * Auralux decision, so the number it resolves to is always on screen.
+   */
+  private updateSelectionLabel(v: PlanetView, count: number, ringR: number, tint: number): void {
+    if (!v.selLabel) {
+      const label = new Text({
+        text: '',
+        style: {
+          fontFamily: '-apple-system, "Segoe UI", Roboto, sans-serif',
+          fontSize: 14,
+          fontWeight: '600',
+          fill: 0xffffff,
+        },
+      });
+      label.resolution = 2;
+      label.anchor.set(0.5, 1);
+      v.container.addChild(label);
+      v.selLabel = label;
+    }
+    const label = v.selLabel;
+    if (count !== v.lastSelCount) {
+      label.text = String(count);
+      v.lastSelCount = count;
+    }
+    label.tint = tint;
+    label.visible = count > 0;
+    label.scale.set(this.labelScale);
+    label.x = 0;
+    label.y = -ringR - 4;
+  }
+
+  /**
+   * Neutral claim arc: while someone's landings are draining a neutral's
+   * defenders, an arc in the claimant's colour fills around the world —
+   * Auralux's capture ring. A rival erasing the claim visibly winds it back.
+   * Drawn into `v.ring`, which the caller clears every frame.
+   */
+  private drawClaimArc(
+    v: PlanetView,
+    p: import('../sim/Planet.js').Planet,
+    effRadius: number,
+    dt: number,
+  ): void {
+    const claiming = p.owner === null && p.captureOwner !== null && p.neutralCost > 0;
+    const target = claiming
+      ? Math.max(0, Math.min(1, (p.neutralCost - p.garrison) / p.neutralCost))
+      : 0;
+    if (claiming) v.claimOwner = p.captureOwner;
+    v.claimProgress += (target - v.claimProgress) * (1 - Math.exp(-dt * 8));
+    if (p.owner !== null || v.claimOwner === null || v.claimProgress < 0.005) {
+      if (p.owner !== null) v.claimProgress = 0;
+      return;
+    }
+    const pal = paletteFor(v.claimOwner);
+    const r = effRadius + Math.max(5, effRadius * 0.2);
+    const w = Math.max(2.5, effRadius * 0.12);
+    const start = -Math.PI / 2;
+    const end = start + Math.PI * 2 * v.claimProgress;
+    const g = v.ring;
+    g.circle(0, 0, r).stroke({ width: w * 0.6, color: 0x9aa3b8, alpha: 0.18 });
+    g.moveTo(Math.cos(start) * r, Math.sin(start) * r);
+    g.arc(0, 0, r, start, end).stroke({ width: w * 2.4, color: pal.glow, alpha: 0.3 });
+    g.moveTo(Math.cos(start) * r, Math.sin(start) * r);
+    g.arc(0, 0, r, start, end).stroke({ width: w, color: pal.core, alpha: 0.95 });
+    g.circle(Math.cos(end) * r, Math.sin(end) * r, w * 0.75).fill({
+      color: 0xffffff,
+      alpha: 0.85,
+    });
   }
 
   /**
@@ -710,6 +838,7 @@ export class PlanetLayer extends Container {
       v.lastCostText = text;
     }
     v.costLabel.visible = true;
+    v.costLabel.scale.set(this.labelScale);
     // Sits just below the health bar (bar bottom ≈ effRadius + height + 6).
     v.costLabel.x = 0;
     v.costLabel.y = effRadius + Math.max(3, effRadius * 0.1) + 12;
@@ -728,8 +857,13 @@ export class PlanetLayer extends Container {
     pal: import('../../util/color.js').PlayerPalette,
   ): void {
     const g = v.productionFx;
+    if (v.productionPulses.length === 0) {
+      if (v.pulsesDrawn) g.clear();
+      v.pulsesDrawn = false;
+      return;
+    }
     g.clear();
-    if (v.productionPulses.length === 0) return;
+    v.pulsesDrawn = true;
     // Cap history so a long match can't leak pulses; 16 concurrent is plenty
     // given how short each one lives.
     if (v.productionPulses.length > 16) v.productionPulses.splice(0, v.productionPulses.length - 16);
@@ -871,7 +1005,7 @@ export class PlanetLayer extends Container {
     }
   }
 
-  private syncOrbiters(v: PlanetView, target: number, owner: number): void {
+  private syncOrbiters(v: PlanetView, target: number, owner: number | null): void {
     const shipTint = paletteFor(owner).ship;
 
     for (const o of v.orbiters) {
@@ -1082,12 +1216,12 @@ export class PlanetLayer extends Container {
         }
         o.sprite.x = bx;
         o.sprite.y = by;
-        const birthScale = 0.36 * eased;
+        const birthScale = 0.36 * eased * this.unitScale;
         o.sprite.scale.set(birthScale);
       } else {
         o.sprite.x += (tx - o.sprite.x) * ease;
         o.sprite.y += (ty - o.sprite.y) * ease;
-        o.sprite.scale.set(0.36);
+        o.sprite.scale.set(0.36 * this.unitScale);
       }
 
       const a = 0.7 + 0.3 * Math.sin(this.time * 2.2 + o.phase);
@@ -1106,7 +1240,9 @@ export class PlanetLayer extends Container {
         1,
         0.55 * glowFlicker * breathe * glowAlphaBoost * (bp < 1 ? bp : 1),
       );
-      o.glow.scale.set(o.glowScale * glowScaleBoost * (bp < 1 ? 0.4 + 0.6 * bp : 1));
+      o.glow.scale.set(
+        o.glowScale * glowScaleBoost * this.unitScale * (bp < 1 ? 0.4 + 0.6 * bp : 1),
+      );
     }
   }
 

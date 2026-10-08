@@ -24,6 +24,8 @@ export class Hud {
   /** One planet-pip row per player; diffed against `lastCounts` each frame. */
   private pipRows: HTMLDivElement[] = [];
   private lastCounts: number[] = [];
+  /** Last width (%) written to each strength bar. */
+  private lastPct: number[] = [];
   private muteBtn: HTMLButtonElement;
   private pauseBtn: HTMLButtonElement;
   private speedBtn: HTMLButtonElement;
@@ -184,7 +186,12 @@ export class Hud {
     const strengths = world.players.map((p) => world.fleetStrength(p.id));
     const total = Math.max(1, strengths.reduce((a, b) => a + b, 0));
     for (let i = 0; i < this.bars.length; i++) {
-      this.bars[i].style.width = `${((strengths[i] ?? 0) / total) * 100}%`;
+      // Quantized to 0.1% and diffed: update() runs every frame, and an
+      // inline-style write per bar per frame forces needless style recalc.
+      const pct = Math.round(((strengths[i] ?? 0) / total) * 1000) / 10;
+      if (pct === this.lastPct[i]) continue;
+      this.lastPct[i] = pct;
+      this.bars[i].style.width = `${pct}%`;
     }
     for (let i = 0; i < world.players.length; i++) {
       const id = world.players[i].id;

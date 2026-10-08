@@ -37,9 +37,11 @@ export const BASE_PRODUCTION: Record<PlanetType, number> = {
 };
 
 /**
- * Soft cap on live orbit ships per size. Tightened at the top so late-game
- * wins come from production tempo and map control, not from one planet
- * hoarding an unbeatable stockpile.
+ * Capacity per size: production pauses once the garrison reaches it (a full
+ * world rests, as in Auralux), and it doubles as the cap on live orbit ships
+ * from native production. Tightened at the top so late-game wins come from
+ * production tempo and map control, not from one planet hoarding an
+ * unbeatable stockpile. Reinforcements may still stack past it.
  */
 export const BASE_UNIT_CAPACITY: Record<PlanetType, number> = {
   0: 40,
@@ -120,6 +122,20 @@ export interface Planet {
   /** HP for absorb-to-heal routing. */
   health: number;
   maxHealth: number;
+  /**
+   * Neutral planets only: full-strength neutral garrison — the number of
+   * landings a fresh claim must drain. Claim progress is
+   * `neutralCost - garrison`. Zero once a world has been neutralized by
+   * hull damage (the next ship to land takes it).
+   */
+  neutralCost: number;
+  /**
+   * Neutral planets only: whose claim is currently draining the garrison,
+   * or null. Auralux-style contest — a rival's landings first knock this
+   * claim back (refilling the garrison) before they can start their own,
+   * so a nearly-drained neutral can't be sniped by a single ship.
+   */
+  captureOwner: number | null;
   /**
    * Per-frame drift velocity in world units / second. Almost always 0; only
    * non-zero on the planet picked by the per-match `driftingPlanet` hazard,

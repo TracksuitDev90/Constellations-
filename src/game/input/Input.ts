@@ -24,7 +24,18 @@ export interface InputCallbacks {
   /** Called when the player taps empty space. `worldX/Y` are the tap point. */
   tapEmpty: (worldX: number, worldY: number) => void;
   dragCommit: (sourcePlanet: number, targetPlanet: number) => void;
-  dragPreview: (sourcePlanet: number | null, targetPlanet: number | null) => void;
+  /** Drag from an owned planet released over empty space (world coords). */
+  dragCommitPoint: (sourcePlanet: number, worldX: number, worldY: number) => void;
+  /**
+   * Live drag-to-send aim: source planet, the planet under the finger (if
+   * any), and the finger's world position. All-null clears the preview.
+   */
+  dragPreview: (
+    sourcePlanet: number | null,
+    targetPlanet: number | null,
+    worldX?: number,
+    worldY?: number,
+  ) => void;
   /** Called continuously while a lasso-drag is in progress (world-space coords). */
   lassoUpdate: (
     startX: number,
@@ -47,6 +58,10 @@ export interface InputCallbacks {
 
 const TAP_MOVE_THRESHOLD = 8; // px
 const TAP_TIME_THRESHOLD = 300; // ms
+/** Screen-space slop around a planet's body that still counts as a hit. */
+const TAP_SLOP_PX = 10;
+/** Minimum hit radius (px) for any planet — a ~48px fingertip target. */
+const MIN_TAP_RADIUS_PX = 24;
 
 export class Input {
   private el: HTMLElement;
@@ -96,10 +111,29 @@ export class Input {
     return { x: e.clientX - rect.left, y: e.clientY - rect.top };
   }
 
+  /**
+   * Planet under a screen point. Every planet answers within at least
+   * MIN_TAP_RADIUS_PX of its centre however far the camera is zoomed out —
+   * a small world on a phone is only a few pixels wide, far below a
+   * fingertip — and when reach areas overlap, the planet whose surface is
+   * closest wins instead of whichever happens to come first in the list.
+   */
   private planetAtScreen(sx: number, sy: number): number | null {
     const w = this.renderer.screenToWorld(sx, sy);
-    const hit = this.world.planetAt(w.x, w.y, 10 / this.renderer.viewScale);
-    return hit ? hit.id : null;
+    const scale = this.renderer.viewScale;
+    let best: number | null = null;
+    let bestGap = Infinity;
+    for (const p of this.world.planets) {
+      const d = Math.hypot(p.pos.x - w.x, p.pos.y - w.y) * scale;
+      const r = p.radius * scale;
+      if (d > Math.max(r + TAP_SLOP_PX, MIN_TAP_RADIUS_PX)) continue;
+      const gap = d - r;
+      if (gap < bestGap) {
+        bestGap = gap;
+        best = p.id;
+      }
+    }
+    return best;
   }
 
   private onDown = (e: PointerEvent): void => {
@@ -169,7 +203,8 @@ export class Input {
 
     if (p.sourcePlanet !== null && p.moved) {
       const hover = this.planetAtScreen(x, y);
-      this.cb.dragPreview(p.sourcePlanet, hover);
+      const w = this.renderer.screenToWorld(x, y);
+      this.cb.dragPreview(p.sourcePlanet, hover, w.x, w.y);
       return;
     }
 
@@ -218,6 +253,9 @@ export class Input {
       const hover = this.planetAtScreen(p.x, p.y);
       if (hover !== null && hover !== p.sourcePlanet) {
         this.cb.dragCommit(p.sourcePlanet, hover);
+      } else if (hover === null) {
+        const w = this.renderer.screenToWorld(p.x, p.y);
+        this.cb.dragCommitPoint(p.sourcePlanet, w.x, w.y);
       }
     } else if (this.lassoActive && this.lassoStart) {
       const end = this.renderer.screenToWorld(p.x, p.y);

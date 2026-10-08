@@ -157,6 +157,12 @@ export interface WorldEvents {
   onPlanetNeutralized?: (planetId: number, lostOwner: number) => void;
   /** Fired when a ship lands. `friendly` = arrived at an owned planet. */
   onShipArrive?: (planetId: number, owner: number, friendly: boolean) => void;
+  /**
+   * Fired when a hostile ship hits a planet it doesn't own — trading with a
+   * defender, chipping hull, or working a neutral claim. Carries the impact
+   * point so the renderer can flash exactly where the hit landed.
+   */
+  onShipImpact?: (planetId: number, owner: number, x: number, y: number) => void;
   /** Fired when a ship is consumed by absorb at its parent planet's center. */
   onShipAbsorbed?: (planetId: number, owner: number) => void;
   /** Fired when a neutral hostile is destroyed. Carries world-space death point. */
@@ -327,6 +333,8 @@ export class World {
   private neighborScratch: number[] = [];
   /** Reusable output vector for `orbitSeparation` (avoids per-ship allocs). */
   private sepScratch = { x: 0, y: 0 };
+  /** Reused per-tick set of ships killed in mid-flight combat. */
+  private combatDead = new Set<number>();
   /** Per-tick pursuit claims (ship idx → pursuer count) for pack-splitting. */
   private pursuerCounts = new Map<number, number>();
   /**
@@ -377,6 +385,8 @@ export class World {
         absorbFlushAcc: 0,
         health: maxHealth,
         maxHealth,
+        neutralCost: p.owner === null ? Math.max(0, p.garrison) : 0,
+        captureOwner: null,
         vx: 0,
         vy: 0,
       };
@@ -708,12 +718,19 @@ export class World {
         }
       }
 
+      // A full world rests (Auralux): production pauses at capacity, so
+      // strength comes from spending units — tempo and map control — never
+      // from one planet silently banking an unbounded reserve. Arriving
+      // reinforcements may still stack past the cap; the planet just won't
+      // add to the pile itself.
+      if (p.garrison >= p.maxUnitCapacity) continue;
       p.productionAcc += p.productionRate * dt;
       while (p.productionAcc >= 1) {
         p.productionAcc -= 1;
         p.garrison += 1;
         // Spawn a physical orbit unit if we have capacity headroom.
         this.spawnOrbiter(p);
+        if (p.garrison >= p.maxUnitCapacity) break;
       }
     }
 
@@ -1133,7 +1150,8 @@ export class World {
   private stepShipCombat(): void {
     const ships = this.ships.all;
     const r2 = SHIP_COLLIDE_RADIUS * SHIP_COLLIDE_RADIUS;
-    const dead = new Set<number>();
+    const dead = this.combatDead;
+    dead.clear();
     for (let i = 0; i < ships.length; i++) {
       const si = ships[i];
       if (dead.has(i)) continue;
@@ -1817,20 +1835,20 @@ export class World {
    * near-ties would make a wave dither between routes mid-flight.
    */
   private wormholeEntranceFor(x: number, y: number, tx: number, ty: number): Vec2 | null {
+    // Runs per transit ship per tick, so no tuple arrays — both mouths are
+    // priced inline (enter a → exit b, then enter b → exit a).
     let best: Vec2 | null = null;
     let bestCost = Math.hypot(tx - x, ty - y) - WORMHOLE_DETOUR_MARGIN;
     for (const wh of this.wormholes) {
-      const ends: Array<[Vec2, Vec2]> = [
-        [wh.a, wh.b],
-        [wh.b, wh.a],
-      ];
-      for (const [enter, exit] of ends) {
-        const c =
-          Math.hypot(enter.x - x, enter.y - y) + Math.hypot(tx - exit.x, ty - exit.y);
-        if (c < bestCost) {
-          bestCost = c;
-          best = enter;
-        }
+      const viaA = Math.hypot(wh.a.x - x, wh.a.y - y) + Math.hypot(tx - wh.b.x, ty - wh.b.y);
+      if (viaA < bestCost) {
+        bestCost = viaA;
+        best = wh.a;
+      }
+      const viaB = Math.hypot(wh.b.x - x, wh.b.y - y) + Math.hypot(tx - wh.a.x, ty - wh.a.y);
+      if (viaB < bestCost) {
+        bestCost = viaB;
+        best = wh.b;
       }
     }
     return best;
@@ -1844,23 +1862,19 @@ export class World {
   private applyWormholes(ship: Ship): boolean {
     if (ship.warpCooldown > 0) return false;
     for (const wh of this.wormholes) {
-      const ends: Array<[Vec2, Vec2]> = [
-        [wh.a, wh.b],
-        [wh.b, wh.a],
-      ];
-      for (const [enter, exit] of ends) {
-        const dx = ship.x - enter.x;
-        const dy = ship.y - enter.y;
-        if (dx * dx + dy * dy > wh.radius * wh.radius) continue;
-        const fromX = ship.x;
-        const fromY = ship.y;
-        const vm = Math.hypot(ship.vx, ship.vy) || 1;
-        ship.x = exit.x + (ship.vx / vm) * (wh.radius + WORMHOLE_EXIT_PAD);
-        ship.y = exit.y + (ship.vy / vm) * (wh.radius + WORMHOLE_EXIT_PAD);
-        ship.warpCooldown = WARP_COOLDOWN;
-        this.events.onShipWarp?.(ship.owner, fromX, fromY, ship.x, ship.y);
-        return true;
-      }
+      const r2 = wh.radius * wh.radius;
+      const inA = (ship.x - wh.a.x) ** 2 + (ship.y - wh.a.y) ** 2 <= r2;
+      const inB = !inA && (ship.x - wh.b.x) ** 2 + (ship.y - wh.b.y) ** 2 <= r2;
+      if (!inA && !inB) continue;
+      const exit = inA ? wh.b : wh.a;
+      const fromX = ship.x;
+      const fromY = ship.y;
+      const vm = Math.hypot(ship.vx, ship.vy) || 1;
+      ship.x = exit.x + (ship.vx / vm) * (wh.radius + WORMHOLE_EXIT_PAD);
+      ship.y = exit.y + (ship.vy / vm) * (wh.radius + WORMHOLE_EXIT_PAD);
+      ship.warpCooldown = WARP_COOLDOWN;
+      this.events.onShipWarp?.(ship.owner, fromX, fromY, ship.x, ship.y);
+      return true;
     }
     return false;
   }
@@ -1993,36 +2007,19 @@ export class World {
       // allowed past the native production cap (up to REINFORCEMENT_ORBIT_CAP)
       // so stacking more waves on a maxed planet visibly thickens the swarm.
       if (this.countOrbitersOf(planet.id) < REINFORCEMENT_ORBIT_CAP) {
-        ship.state = 'orbiting';
-        ship.parentPlanet = planet.id;
-        ship.sourcePlanet = -1;
-        ship.targetPlanet = -1;
-        ship.orbitRadius = planet.radius * ORBIT_RADIUS_MULT + (Math.random() - 0.5) * 6;
-        ship.orbitDir = Math.random() < 0.5 ? 1 : -1;
-        ship.wanderPhase = Math.random() * Math.PI * 2;
-        ship.isSelected = false;
-        // Seed velocity roughly tangential for a clean orbit entry.
-        const dx = ship.x - planet.pos.x;
-        const dy = ship.y - planet.pos.y;
-        const d = Math.hypot(dx, dy) || 1;
-        const tangentSpeed = SHIP_SPEED * 0.75 * ship.orbitDir;
-        ship.vx = (-dy / d) * tangentSpeed;
-        ship.vy = (dx / d) * tangentSpeed;
+        this.enterOrbit(ship, planet);
         this.events.onShipArrive?.(planet.id, ship.owner, friendly);
         return;
       }
     } else {
-      // Enemy arrival. Order of operations matters:
-      //   1. Burn through active defenders (garrison) first.
-      //   2. Once defenders are gone on an owned planet, chip at residual
-      //      planetary health — the structure that keeps it flagged as the
-      //      current owner's. When health hits zero the planet goes NEUTRAL,
-      //      not captured, so the attacker must still land a fresh wave to
-      //      take it. Strategically this means stripping a world of all its
-      //      units no longer gives the enemy a free capture — they have to
-      //      actually fight through the hull.
-      //   3. On a neutral planet, arrivals work the old way: drain the
-      //      neutral garrison then flip ownership.
+      // Hostile arrival. Order of operations matters:
+      //   1. Owned planet with defenders: one defender trades with the ship.
+      //   2. Owned planet without defenders: chip residual hull. At zero the
+      //      planet goes NEUTRAL, not captured, so the attacker must still
+      //      land a fresh ship to take it — stripping a world's units never
+      //      hands over a free capture.
+      //   3. Neutral planet: Auralux-style claim contest (see below).
+      this.events.onShipImpact?.(planet.id, ship.owner, ship.x, ship.y);
       if (planet.owner !== null && planet.garrison <= 0) {
         planet.garrison = 0;
         planet.health = Math.max(0, planet.health - 1);
@@ -2033,16 +2030,38 @@ export class World {
           planet.absorbing = false;
           planet.ringFillProgress = new Array(planet.ringCount).fill(0);
           planet.capturePulse = 0.55;
+          // A broken world has no neutral defense left: the next ship to
+          // land, from anyone, claims it.
+          planet.neutralCost = 0;
+          planet.captureOwner = null;
           // The old owner's leftover orbiters are displaced — the world is
           // briefly no-one's, ready to be claimed by the next arriving wave.
           this.evictOrbitersOf(planet.id, -1);
           this.events.onPlanetNeutralized?.(planet.id, lostOwner);
         }
+      } else if (planet.owner !== null) {
+        planet.garrison -= 1;
+        // A defender died blocking this ship. Remove its physical unit too —
+        // otherwise the garrison counter drops while the orbiting ship lives
+        // on, and the owner can later command more ships than they own.
+        this.trimLocalShipsTo(planet, ship.x, ship.y);
+      } else if (
+        planet.captureOwner !== null &&
+        planet.captureOwner !== ship.owner &&
+        planet.garrison < planet.neutralCost
+      ) {
+        // A rival's claim is underway: this landing knocks it back one step
+        // instead of advancing our own. Only once their progress is fully
+        // erased does the planet become claimable again.
+        planet.garrison += 1;
+        if (planet.garrison >= planet.neutralCost) planet.captureOwner = null;
       } else {
+        planet.captureOwner = ship.owner;
         planet.garrison -= 1;
         if (planet.garrison < 0) {
           planet.owner = ship.owner;
           planet.garrison = 1;
+          planet.captureOwner = null;
           planet.capturePulse = 0.6;
           // Reset ring fill — captured planets start with empty rings so the
           // new owner must invest absorb to keep the growth path.
@@ -2052,11 +2071,69 @@ export class World {
           // On capture, evict any leftover orbiters of the prior owner.
           this.evictOrbitersOf(planet.id, ship.owner);
           this.events.onPlanetCapture?.(planet.id, ship.owner);
+          // The ship that completed the claim is the new world's first
+          // defender (it is the garrison's 1), not a phantom.
+          this.enterOrbit(ship, planet);
+          this.events.onShipArrive?.(planet.id, ship.owner, friendly);
+          return;
         }
       }
     }
     this.events.onShipArrive?.(planet.id, ship.owner, friendly);
     this.ships.kill(shipIdx);
+  }
+
+  /** Convert a landed ship into an orbiter of `planet` with a clean entry. */
+  private enterOrbit(ship: Ship, planet: Planet): void {
+    ship.state = 'orbiting';
+    ship.parentPlanet = planet.id;
+    ship.sourcePlanet = -1;
+    ship.targetPlanet = -1;
+    ship.absorbOnArrive = false;
+    ship.orbitRadius = planet.radius * ORBIT_RADIUS_MULT + (Math.random() - 0.5) * 6;
+    ship.orbitDir = Math.random() < 0.5 ? 1 : -1;
+    ship.wanderPhase = Math.random() * Math.PI * 2;
+    ship.isSelected = false;
+    // Seed velocity roughly tangential for a clean orbit entry.
+    const dx = ship.x - planet.pos.x;
+    const dy = ship.y - planet.pos.y;
+    const d = Math.hypot(dx, dy) || 1;
+    const tangentSpeed = SHIP_SPEED * 0.75 * ship.orbitDir;
+    ship.vx = (-dy / d) * tangentSpeed;
+    ship.vy = (dx / d) * tangentSpeed;
+  }
+
+  /**
+   * Enforce the swarm invariant `local ships ≤ garrison` after the garrison
+   * shrank without a ship leaving (a defender traded with an attacker).
+   * Kills the excess, orbiters before absorbers, nearest the impact point
+   * first so the casualty is the defender that actually met the attacker.
+   */
+  private trimLocalShipsTo(planet: Planet, nearX: number, nearY: number): void {
+    const ships = this.ships.all;
+    let excess = this.countLocalShipsOf(planet.id) - Math.max(0, planet.garrison);
+    while (excess-- > 0) {
+      let best = -1;
+      let bestD2 = Infinity;
+      let bestOrbiting = false;
+      for (let i = 0; i < ships.length; i++) {
+        const s = ships[i];
+        if (!s.active || s.parentPlanet !== planet.id) continue;
+        const orbiting = s.state === 'orbiting';
+        if (!orbiting && s.state !== 'absorbing') continue;
+        if (bestOrbiting && !orbiting) continue;
+        const dx = s.x - nearX;
+        const dy = s.y - nearY;
+        const d2 = dx * dx + dy * dy;
+        if ((orbiting && !bestOrbiting) || d2 < bestD2) {
+          best = i;
+          bestD2 = d2;
+          bestOrbiting = orbiting;
+        }
+      }
+      if (best < 0) return;
+      this.ships.kill(best);
+    }
   }
 
   /** Kill every orbiter of `planetId` whose owner differs from `keepOwner`. */
@@ -2143,6 +2220,24 @@ export class World {
       if (s.state === 'transit' && s.targetPlanet === planetId) n++;
     }
     return n;
+  }
+
+  /**
+   * Landings `owner` still needs to take `planetId`, under the real rules:
+   * an enemy world's defenders, then its hull, then one ship to claim the
+   * broken world; a neutral's garrison plus one — and, if a rival's claim is
+   * underway, the landings it takes to erase that claim first. Zero for a
+   * planet `owner` already holds.
+   */
+  shipsToTake(planetId: number, owner: number): number {
+    const p = this.planets[planetId];
+    if (!p || p.owner === owner) return 0;
+    if (p.owner !== null) return Math.max(0, p.garrison) + p.health + 1;
+    const rivalProgress =
+      p.captureOwner !== null && p.captureOwner !== owner
+        ? Math.max(0, p.neutralCost - p.garrison)
+        : 0;
+    return Math.max(0, p.garrison) + 2 * rivalProgress + 1;
   }
 
   totalGarrison(owner: number): number {
